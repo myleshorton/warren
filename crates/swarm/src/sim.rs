@@ -204,10 +204,13 @@ impl Sim {
         self.nodes[i].dht.lookup(topic, now)
     }
 
-    /// Connect node `i` to `target`, coordinated through the DHT.
+    /// Connect node `i` to `target`, coordinated through the DHT. The sim has no
+    /// separate data sockets, so a node advertises its own DHT address as its
+    /// data address, and auto-accepts inbound connects as they surface.
     pub fn connect(&mut self, i: usize, target: NodeId) -> QueryId {
         let now = self.now;
-        self.nodes[i].dht.connect(target, now)
+        let data_addr = self.nodes[i].addr;
+        self.nodes[i].dht.connect(target, data_addr, now)
     }
 
     /// The NAT a node sits behind.
@@ -324,6 +327,17 @@ impl Sim {
     fn collect_events(&mut self) {
         for i in 0..self.nodes.len() {
             while let Some(e) = self.nodes[i].dht.poll_event() {
+                // Auto-accept incoming connects, advertising the node's own DHT
+                // address as its data address (the sim has no separate data
+                // sockets). This models a node that always accepts and lets
+                // connect signaling complete; the event is still recorded so
+                // tests can inspect it.
+                if let Event::IncomingConnect { initiator, .. } = &e {
+                    let initiator = *initiator;
+                    let data_addr = self.nodes[i].addr;
+                    let now = self.now;
+                    self.nodes[i].dht.accept_connect(initiator, data_addr, now);
+                }
                 self.events.push((i, e));
             }
         }
@@ -336,8 +350,13 @@ impl Sim {
     pub fn run(&mut self, max_steps: usize) -> usize {
         let mut steps = 0;
         loop {
-            self.drain_outboxes();
+            // Collect events before draining: handling an `IncomingConnect` here
+            // auto-accepts and queues the reply into the node's outbox, so the
+            // drain must run *after* to schedule it — otherwise the reply strands
+            // in the outbox and the loop advances time straight to the connect's
+            // deadline, timing it out.
             self.collect_events();
+            self.drain_outboxes();
 
             if steps >= max_steps {
                 return steps;

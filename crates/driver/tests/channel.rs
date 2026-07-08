@@ -1,12 +1,12 @@
-//! Data channels over real UDP: discover + coordinate via the DHT, then punch a
-//! live channel and exchange application bytes.
+//! Data channels over real UDP, at two layers.
 //!
-//! This closes the loop from "connect reports an outcome" to "connect yields a
-//! usable connection". On loopback every node is reachable, so the DHT connect
-//! resolves `Direct` and the channel is a direct dial; the data-socket address
-//! is exchanged here in-test (carrying it through the DHT signaling so a bare
-//! `connect(id)` returns the channel for arbitrary NATed peers is the remaining
-//! glue).
+//! `data_channel_over_real_udp` drives the standalone puncher API directly
+//! (`open_channel` / `DataListener`). `connect_yields_a_live_channel` drives the
+//! full path: a single `connect(id)` discovers the peer, coordinates
+//! reachability through a DHT coordinator, and punches a live channel — with no
+//! out-of-band address exchange (the data-socket addresses ride the DHT
+//! signaling). On loopback every node is reachable, so the connect resolves
+//! `Direct`.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -58,9 +58,10 @@ async fn data_channel_over_real_udp() {
 }
 
 #[tokio::test]
-async fn discover_coordinate_then_open_channel() {
-    // Full path: A discovers B and coordinates reachability over the DHT, then
-    // opens a real data channel to B and exchanges bytes.
+async fn connect_yields_a_live_channel() {
+    // The whole path in a single call: A discovers B, coordinates reachability
+    // through a DHT coordinator, punches a data channel, and exchanges bytes —
+    // no out-of-band address exchange. B receives its side via `next_incoming`.
     let lo = LO.parse().unwrap();
     let mut rng = Rng::new(0xC0FFEE);
     let boot = Node::bind(lo, rng.node_id()).await.unwrap();
@@ -75,40 +76,41 @@ async fn discover_coordinate_then_open_channel() {
     let server = &peers[0];
     let client = &peers[1];
 
-    // B announces and stands up a data listener; A discovers B and confirms it
-    // is reachable via the DHT.
+    // B announces so A can find it, and awaits an inbound channel.
     timeout(T, server.announce(server.id()))
         .await
         .unwrap()
         .unwrap();
-    let listener = DataListener::bind(lo).await.unwrap();
-    let server_data = listener.local_addr().unwrap();
-    // Single config for both sides (see note in `data_channel_over_real_udp`).
-    let cfg = PunchConfig::default();
-    // peer_host is the dialer's host — the client opens the channel from `lo`.
-    let peer_host = lo.ip();
-    let accept = tokio::spawn(async move { listener.accept(peer_host, &cfg).await });
+    let server_id = server.id();
+    let server_handle = server.clone();
+    let incoming = tokio::spawn(async move { server_handle.next_incoming().await });
 
-    let outcome = timeout(T, client.connect(server.id()))
+    // One connect: discover + coordinate + punch → a live channel.
+    let conn = timeout(T, client.connect(server_id))
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(outcome, ConnectOutcome::Direct);
-
-    // Reachability confirmed over the DHT — now open the actual data channel.
-    let a = open_channel(lo, server_data, &cfg)
-        .await
-        .unwrap()
-        .expect("client channel");
-    let b = timeout(T, accept)
+    assert_eq!(conn.outcome, ConnectOutcome::Direct);
+    let client_chan = conn.channel.expect("connect should yield a channel");
+    let server_chan = timeout(T, incoming)
         .await
         .unwrap()
         .unwrap()
-        .unwrap()
-        .expect("server channel");
+        .expect("server should receive an inbound channel");
 
-    a.send(b"ping").await.unwrap();
+    // Application bytes flow both ways over the punched channel.
+    client_chan.send(b"ping").await.unwrap();
     let mut buf = [0u8; 32];
-    let n = timeout(T, b.recv(&mut buf)).await.unwrap().unwrap();
+    let n = timeout(T, server_chan.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(&buf[..n], b"ping");
+
+    server_chan.send(b"pong").await.unwrap();
+    let n = timeout(T, client_chan.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"pong");
 }

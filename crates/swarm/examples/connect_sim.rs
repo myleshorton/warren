@@ -59,9 +59,9 @@ fn main() {
             .take_events()
             .into_iter()
             .find_map(|(node, ev)| match ev {
-                Event::Connected { target, outcome } if node == client && target == server_id => {
-                    Some(outcome)
-                }
+                Event::Connected {
+                    target, outcome, ..
+                } if node == client && target == server_id => Some(outcome),
                 _ => None,
             })
             .expect("connect finished");

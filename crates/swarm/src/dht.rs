@@ -25,6 +25,11 @@ pub const NAT_SAMPLE_COUNT: usize = 5;
 /// How many recent connect initiators a coordinator remembers (bounded FIFO).
 const MAX_SEEN_INITIATORS: usize = 1024;
 
+/// Cap on pending incoming connects awaiting a [`Dht::accept_connect`], so a
+/// flood of connect requests can't grow the target's state unboundedly. Beyond
+/// this, new requests are dropped (the initiator simply times out).
+const MAX_PENDING_INCOMING: usize = 256;
+
 /// Absolute cap on distinct announce topics a node stores, bounding memory even
 /// when the routing table is too small for [`Dht::responsible_for`] to bite.
 const MAX_ANNOUNCE_TOPICS: usize = 65_536;
@@ -100,6 +105,22 @@ pub enum Event {
         target: NodeId,
         /// How the connection was established.
         outcome: ConnectOutcome,
+        /// The target's data-socket address to punch the channel to, if the
+        /// target accepted (`None` for `NotFound`/`TimedOut`, where there is no
+        /// peer to punch to).
+        peer_data_addr: Option<SocketAddr>,
+    },
+    /// A peer wants to connect to us (we are the target). The caller stands up a
+    /// data socket, starts accepting a punch from `initiator_data_addr`, and
+    /// calls [`Dht::accept_connect`] with that socket's address to complete the
+    /// signaling. Ignore the event to decline.
+    IncomingConnect {
+        /// The peer initiating the connection.
+        initiator: NodeId,
+        /// The initiator's data-socket address — the host to accept a punch from.
+        initiator_data_addr: SocketAddr,
+        /// The initiator's firewall type (drives the punch strategy).
+        nat: Firewall,
     },
 }
 
@@ -176,6 +197,22 @@ struct ConnectState {
     /// The coordinator we sent the request to; a reply is accepted only from it,
     /// so another host can't spoof a reply and force a wrong outcome.
     coordinator: Option<SocketAddr>,
+    /// Our own data-socket address, sent in the request so the target learns
+    /// where to punch back.
+    data_addr: SocketAddr,
+}
+
+/// The target side of an in-flight connect: a request arrived for us, and we
+/// wait for the caller to supply our data-socket address via
+/// [`Dht::accept_connect`] before replying to the initiator.
+struct IncomingState {
+    /// The coordinator that relayed the request; the reply goes back through it.
+    coordinator: SocketAddr,
+    /// The initiator's observed control address, echoed in the reply so the
+    /// coordinator can match it to the initiator it remembered.
+    initiator_addr: SocketAddr,
+    /// When this pending incoming connect is discarded if never accepted.
+    deadline: Millis,
 }
 
 /// A Kademlia DHT node.
@@ -200,6 +237,9 @@ pub struct Dht {
     /// redirect the relayed reply to an arbitrary victim (nor to an initiator of
     /// some other connect).
     seen_initiators: VecDeque<(NodeId, SocketAddr)>,
+    /// Initiators (by id) whose connect request reached us as the target and
+    /// awaits an [`Dht::accept_connect`] to complete the reply.
+    pending_incoming: HashMap<NodeId, IncomingState>,
     outbox: VecDeque<Transmit>,
     events: VecDeque<Event>,
     next_rid: u64,
@@ -221,6 +261,7 @@ impl Dht {
             announces: HashMap::new(),
             connecting: HashMap::new(),
             seen_initiators: VecDeque::new(),
+            pending_incoming: HashMap::new(),
             outbox: VecDeque::new(),
             events: VecDeque::new(),
             next_rid: 1,
@@ -315,17 +356,47 @@ impl Dht {
     }
 
     /// Connect to `target` by id: discover it on the DHT, then coordinate a hole
-    /// punch through a node that holds its announce record. Completion is
-    /// reported as an [`Event::Connected`].
-    pub fn connect(&mut self, target: NodeId, now: Millis) -> QueryId {
+    /// punch through a node that holds its announce record. `data_addr` is our
+    /// own data socket, sent to the target so it knows where to punch back.
+    /// Completion is reported as an [`Event::Connected`] carrying the target's
+    /// data address to punch to.
+    pub fn connect(&mut self, target: NodeId, data_addr: SocketAddr, now: Millis) -> QueryId {
         self.connecting.insert(
             target,
             ConnectState {
                 deadline: now + CONNECT_TIMEOUT_MS,
                 coordinator: None,
+                data_addr,
             },
         );
         self.start_query(target, QueryKind::Connect, now)
+    }
+
+    /// Accept an incoming connect surfaced by [`Event::IncomingConnect`]: reply
+    /// to `initiator` (through the coordinator that relayed the request) with our
+    /// `data_addr`, so it can punch a channel to us. A no-op if the request is no
+    /// longer pending — already accepted, or past its deadline (the initiator has
+    /// itself timed out, so a reply would be ignored).
+    pub fn accept_connect(&mut self, initiator: NodeId, data_addr: SocketAddr, now: Millis) {
+        if let Some(inc) = self.pending_incoming.remove(&initiator) {
+            if inc.deadline <= now {
+                return; // expired before we accepted; the initiator has given up
+            }
+            let rid = self.alloc_rid();
+            let fw = self.signaling_firewall();
+            self.send(
+                inc.coordinator,
+                rid,
+                Message::Signal {
+                    target: self.id,
+                    initiator,
+                    initiator_addr: inc.initiator_addr,
+                    data_addr,
+                    nat: fw,
+                    is_reply: true,
+                },
+            );
+        }
     }
 
     fn start_query(&mut self, target: NodeId, kind: QueryKind, now: Millis) -> QueryId {
@@ -389,10 +460,20 @@ impl Dht {
                 target,
                 initiator,
                 initiator_addr,
+                data_addr,
                 nat,
                 is_reply,
             } => {
-                self.on_signal(from, target, initiator, initiator_addr, nat, is_reply);
+                self.on_signal(
+                    from,
+                    target,
+                    initiator,
+                    initiator_addr,
+                    data_addr,
+                    nat,
+                    is_reply,
+                    now,
+                );
             }
         }
     }
@@ -435,8 +516,13 @@ impl Dht {
             self.events.push_back(Event::Connected {
                 target,
                 outcome: ConnectOutcome::TimedOut,
+                peer_data_addr: None,
             });
         }
+
+        // Discard incoming connect requests the caller never accepted, so an
+        // unaccepted (or abandoned) request can't pin target-side state forever.
+        self.pending_incoming.retain(|_, inc| inc.deadline > now);
     }
 
     /// The earliest pending deadline, if any request or connect is in flight.
@@ -446,6 +532,7 @@ impl Dht {
             .map(|p| p.deadline)
             .chain(self.nat_pending.values().copied())
             .chain(self.connecting.values().map(|cs| cs.deadline))
+            .chain(self.pending_incoming.values().map(|inc| inc.deadline))
             .min()
     }
 
@@ -686,9 +773,13 @@ impl Dht {
                     // our signal. It overwrites initiator_addr with the address it
                     // observes, so we needn't know our own external address.
                     // Record the coordinator so we accept the reply only from it.
-                    if let Some(cs) = self.connecting.get_mut(&target) {
-                        cs.coordinator = Some(coord.addr);
-                    }
+                    let data_addr = match self.connecting.get_mut(&target) {
+                        Some(cs) => {
+                            cs.coordinator = Some(coord.addr);
+                            cs.data_addr
+                        }
+                        None => return, // connect already resolved/expired
+                    };
                     let rid = self.alloc_rid();
                     let fw = self.signaling_firewall();
                     self.send(
@@ -698,6 +789,7 @@ impl Dht {
                             target,
                             initiator: self.id,
                             initiator_addr: coord.addr, // placeholder; coordinator overwrites
+                            data_addr,
                             nat: fw,
                             is_reply: false,
                         },
@@ -708,37 +800,58 @@ impl Dht {
                     self.events.push_back(Event::Connected {
                         target,
                         outcome: ConnectOutcome::NotFound,
+                        peer_data_addr: None,
                     });
                 }
             },
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn on_signal(
         &mut self,
         from: SocketAddr,
         target: NodeId,
         initiator: NodeId,
         initiator_addr: SocketAddr,
+        data_addr: SocketAddr,
         nat: Firewall,
         is_reply: bool,
+        now: Millis,
     ) {
         if !is_reply {
             if target == self.id {
-                // We are the target: reply with our firewall via the coordinator.
-                let rid = self.alloc_rid();
-                let fw = self.signaling_firewall();
-                self.send(
-                    from,
-                    rid,
-                    Message::Signal {
-                        target,
+                // We are the target. We can't reply yet: the reply must carry our
+                // data-socket address, which the caller supplies once it stands up
+                // the socket. Record the request and surface it; `accept_connect`
+                // sends the reply. `data_addr` here is the initiator's data socket
+                // — the host we'll accept a punch from.
+                //
+                // Emit `IncomingConnect` only the *first* time an initiator becomes
+                // pending: each event makes the caller bind a socket and start a
+                // punch, so re-emitting on duplicate (or replayed) requests would
+                // drive unbounded churn.
+                if let Some(inc) = self.pending_incoming.get_mut(&initiator) {
+                    // Duplicate/replay: refresh only the deadline. Keep the first
+                    // coordinator and control address, so a replay with the same
+                    // (unauthenticated) initiator id can't redirect where
+                    // `accept_connect` sends the reply.
+                    inc.deadline = now + CONNECT_TIMEOUT_MS;
+                } else if self.pending_incoming.len() < MAX_PENDING_INCOMING {
+                    self.pending_incoming.insert(
                         initiator,
-                        initiator_addr,
-                        nat: fw,
-                        is_reply: true,
-                    },
-                );
+                        IncomingState {
+                            coordinator: from,
+                            initiator_addr,
+                            deadline: now + CONNECT_TIMEOUT_MS,
+                        },
+                    );
+                    self.events.push_back(Event::IncomingConnect {
+                        initiator,
+                        initiator_data_addr: data_addr,
+                        nat,
+                    });
+                }
             } else if let Some(target_addr) = self
                 .announces
                 .get(&target)
@@ -747,7 +860,9 @@ impl Dht {
             {
                 // We are a coordinator: forward to the target's own record (the
                 // announcer whose id is the target), over the mapping it opened
-                // by announcing to us, filling in the observed initiator addr.
+                // by announcing to us, filling in the observed initiator addr. The
+                // initiator's `data_addr` passes through unchanged — we can't
+                // observe its data socket, only its control source `from`.
                 // Remember the initiator so we'll only relay the reply back to an
                 // address that actually initiated.
                 self.remember_initiator(target, from);
@@ -759,15 +874,17 @@ impl Dht {
                         target,
                         initiator,
                         initiator_addr: from,
+                        data_addr,
                         nat,
                         is_reply: false,
                     },
                 );
             }
         } else if initiator == self.id {
-            // We are the initiator: the reply carries the target's firewall — but
-            // accept it only from the coordinator we actually sent the request to,
-            // so another host can't spoof a reply and force a wrong outcome.
+            // We are the initiator: the reply carries the target's firewall and
+            // data address — but accept it only from the coordinator we actually
+            // sent the request to, so another host can't spoof a reply and force a
+            // wrong outcome (or feed us a bogus punch target).
             let from_coordinator = self
                 .connecting
                 .get(&target)
@@ -775,7 +892,11 @@ impl Dht {
             if from_coordinator {
                 self.connecting.remove(&target);
                 let outcome = outcome_for(self.signaling_firewall(), nat);
-                self.events.push_back(Event::Connected { target, outcome });
+                self.events.push_back(Event::Connected {
+                    target,
+                    outcome,
+                    peer_data_addr: Some(data_addr),
+                });
             }
         } else if self.seen_initiators.contains(&(target, initiator_addr))
             && self
@@ -786,7 +907,8 @@ impl Dht {
             // We are the coordinator relaying the reply — but only to an address
             // that actually initiated (so the target can't redirect it to a
             // victim), and only if the reply truly came from the target's own
-            // record (id == target, at that address).
+            // record (id == target, at that address). The target's `data_addr`
+            // passes through unchanged.
             // Otherwise an arbitrary announcer under the same topic could spoof a
             // reply to use us as a reflector or feed the initiator a bogus
             // firewall type. (Full authentication — a Noise handshake and
@@ -800,6 +922,7 @@ impl Dht {
                     target,
                     initiator,
                     initiator_addr,
+                    data_addr,
                     nat,
                     is_reply: true,
                 },
@@ -818,5 +941,77 @@ fn outcome_for(local: Firewall, remote: Firewall) -> ConnectOutcome {
             ConnectOutcome::Punched
         }
         crate::punch::Strategy::Relay => ConnectOutcome::Relayed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msg::Packet;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn id(b: u8) -> NodeId {
+        NodeId::from_bytes([b; 32])
+    }
+
+    fn signal_request(initiator: NodeId, target: NodeId, data_addr: SocketAddr) -> Vec<u8> {
+        Packet {
+            sender: id(9),
+            rid: 1,
+            msg: Message::Signal {
+                target,
+                initiator,
+                initiator_addr: addr("10.0.0.2:100"),
+                data_addr,
+                nat: Firewall::Consistent,
+                is_reply: false,
+            },
+        }
+        .encode()
+    }
+
+    /// A connect request replayed for the same initiator must surface
+    /// `IncomingConnect` only once — each event drives the caller to bind a
+    /// socket and start a punch, so re-emitting on duplicates (which an
+    /// unauthenticated peer can replay) would be an amplification vector — and a
+    /// replay via a *different* coordinator must not redirect where the reply is
+    /// later sent.
+    #[test]
+    fn duplicate_incoming_requests_emit_once_and_dont_redirect() {
+        let me = id(1);
+        let initiator = id(2);
+        let mut dht = Dht::new(me);
+        let coord_a = addr("10.0.0.9:900");
+        let coord_b = addr("10.0.0.8:800"); // a replay's (spoofed) coordinator
+
+        let request = signal_request(initiator, me, addr("10.0.0.2:200"));
+        dht.handle_input(coord_a, &request, 0);
+        dht.handle_input(coord_b, &request, 0); // replay via a different coordinator
+
+        let incoming = std::iter::from_fn(|| dht.poll_event())
+            .filter(|e| matches!(e, Event::IncomingConnect { .. }))
+            .count();
+        assert_eq!(
+            incoming, 1,
+            "duplicate requests must emit exactly one event"
+        );
+
+        // Accepting sends the reply back through the *first* coordinator, never
+        // the replay's — the replay can't redirect it.
+        dht.accept_connect(initiator, addr("10.0.0.1:50"), 1);
+        let reply_dests: Vec<SocketAddr> = std::iter::from_fn(|| dht.poll_transmit())
+            .map(|t| t.to)
+            .collect();
+        assert!(
+            reply_dests.contains(&coord_a),
+            "reply must go to the first coordinator, got {reply_dests:?}"
+        );
+        assert!(
+            !reply_dests.contains(&coord_b),
+            "a replay must not redirect the reply to its coordinator"
+        );
     }
 }

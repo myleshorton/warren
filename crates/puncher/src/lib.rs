@@ -32,6 +32,12 @@ pub const PROBE: u8 = 1;
 /// Acknowledges a [`PROBE`]; its receipt confirms the reverse path.
 pub const ACK: u8 = 2;
 
+/// Whether a received byte is a punch control message. Establishment only ever
+/// keys on these, so stray application traffic can't be mistaken for a punch.
+fn is_control(b: u8) -> bool {
+    b == PROBE || b == ACK
+}
+
 /// A punched path: a socket with a working route to `peer`.
 #[derive(Debug)]
 pub struct Established {
@@ -83,13 +89,13 @@ pub async fn connect_to(
     while Instant::now() < deadline {
         socket.send_to(&[PROBE], peer).await?;
         match timeout(cfg.probe_interval, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) if n >= 1 && from == peer => {
+            Ok(Ok((n, from))) if n >= 1 && from == peer && is_control(buf[0]) => {
                 if buf[0] == PROBE {
                     socket.send_to(&[ACK], from).await?;
                 }
                 return Ok(Some(Established { socket, peer }));
             }
-            _ => {} // timeout or spurious source: keep probing
+            _ => {} // timeout, stray traffic, or spurious source: keep probing
         }
     }
     Ok(None)
@@ -98,15 +104,25 @@ pub async fn connect_to(
 /// Wait for a peer to reach us on `socket`, ACK it, and return the path. The
 /// reachable side of a dial.
 pub async fn accept(socket: UdpSocket, cfg: &Config) -> io::Result<Option<Established>> {
+    let deadline = Instant::now() + cfg.overall;
     let mut buf = [0u8; 64];
-    match timeout(cfg.overall, socket.recv_from(&mut buf)).await {
-        Ok(Ok((n, from))) if n >= 1 && buf[0] == PROBE => {
-            socket.send_to(&[ACK], from).await?;
-            Ok(Some(Established { socket, peer: from }))
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
         }
-        Ok(Ok(_)) => Ok(None),
-        Ok(Err(e)) => Err(e),
-        Err(_) => Ok(None),
+        match timeout(remaining, socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) if n >= 1 && is_control(buf[0]) => {
+                // A PROBE needs an ACK back; an ACK already confirms the path.
+                if buf[0] == PROBE {
+                    socket.send_to(&[ACK], from).await?;
+                }
+                return Ok(Some(Established { socket, peer: from }));
+            }
+            Ok(Ok(_)) => {} // stray datagram: keep listening
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Ok(None), // timed out
+        }
     }
 }
 
@@ -121,6 +137,10 @@ pub async fn open_birthday_sockets(
     seed: u64,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    assert!(
+        range.0 >= 1 && range.0 < range.1,
+        "invalid port range {range:?}: need 1 <= start < end"
+    );
     let mut rng = Rng::new(seed);
     let span = (range.1 - range.0) as u64;
     let mut set = JoinSet::new();
@@ -172,20 +192,28 @@ pub async fn spray(
     seed: u64,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    assert!(
+        range.0 >= 1 && range.0 < range.1,
+        "invalid port range {range:?}: need 1 <= start < end"
+    );
     let socket = UdpSocket::bind(bind).await?;
     let own_port = socket.local_addr()?.port();
+    let deadline = Instant::now() + cfg.overall;
     let mut rng = Rng::new(seed);
     let span = (range.1 - range.0) as u64;
     let mut buf = [0u8; 64];
 
     for _ in 0..probes {
+        if Instant::now() >= deadline {
+            break; // respect the overall deadline even if probes remain
+        }
         let port = range.0 + (rng.next_u64() % span) as u16;
         if port == own_port {
-            continue;
+            continue; // never spray our own socket (would self-hit)
         }
         socket.send_to(&[PROBE], (peer_host, port)).await?;
         if let Ok(Ok((n, from))) = timeout(cfg.probe_interval, socket.recv_from(&mut buf)).await {
-            if n >= 1 {
+            if n >= 1 && is_control(buf[0]) {
                 return Ok(Some(Established { socket, peer: from }));
             }
         }

@@ -683,11 +683,12 @@ impl Dht {
             } else if let Some(target_addr) = self
                 .announces
                 .get(&target)
-                .and_then(|r| r.first())
+                .and_then(|r| r.iter().find(|c| c.id == target))
                 .map(|c| c.addr)
             {
-                // We are a coordinator: forward to the target over the mapping it
-                // opened by announcing to us, filling in the observed initiator addr.
+                // We are a coordinator: forward to the target's own record (the
+                // announcer whose id is the target), over the mapping it opened
+                // by announcing to us, filling in the observed initiator addr.
                 let rid = self.alloc_rid();
                 self.send(
                     target_addr,
@@ -710,13 +711,15 @@ impl Dht {
         } else if self
             .announces
             .get(&target)
-            .is_some_and(|recs| recs.iter().any(|c| c.addr == from))
+            .is_some_and(|recs| recs.iter().any(|c| c.id == target && c.addr == from))
         {
             // We are the coordinator relaying the reply — but only if it truly
-            // came from a recorded target address. Otherwise an arbitrary host
-            // could spoof a reply to use us as a reflector or feed the initiator
-            // a bogus firewall type. (Full authentication — a Noise handshake and
-            // capability tokens, as in HyperDHT — is future work.)
+            // came from the target's own record (id == target, at that address).
+            // Otherwise an arbitrary announcer under the same topic could spoof a
+            // reply to use us as a reflector or feed the initiator a bogus
+            // firewall type. (Full authentication — a Noise handshake and
+            // capability tokens, as in HyperDHT — is future work; it would also
+            // stop a peer from announcing under another peer's id at all.)
             let rid = self.alloc_rid();
             self.send(
                 initiator_addr,

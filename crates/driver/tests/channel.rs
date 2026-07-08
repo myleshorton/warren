@@ -28,7 +28,9 @@ async fn data_channel_over_real_udp() {
     // One config drives both sides so dial and accept can't diverge; `Config` is
     // `Copy`, so the accept task takes its own copy and we still borrow it below.
     let cfg = PunchConfig::default();
-    let accept = tokio::spawn(async move { listener.accept(&cfg).await });
+    // The client dials from loopback, so the listener expects that host.
+    let peer_host = server_data.ip();
+    let accept = tokio::spawn(async move { listener.accept(peer_host, &cfg).await });
 
     let client = open_channel(LO.parse().unwrap(), server_data, &cfg)
         .await
@@ -80,7 +82,8 @@ async fn discover_coordinate_then_open_channel() {
     let server_data = listener.local_addr().unwrap();
     // Single config for both sides (see note in `data_channel_over_real_udp`).
     let cfg = PunchConfig::default();
-    let accept = tokio::spawn(async move { listener.accept(&cfg).await });
+    let peer_host = server_data.ip();
+    let accept = tokio::spawn(async move { listener.accept(peer_host, &cfg).await });
 
     let outcome = timeout(T, client.connect(server.id()))
         .await

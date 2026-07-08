@@ -137,9 +137,21 @@ pub async fn connect_to(
     Ok(None)
 }
 
-/// Wait for a peer to reach us on `socket`, ACK it, and return the path. The
-/// reachable side of a dial.
-pub async fn accept(socket: UdpSocket, cfg: &Config) -> io::Result<Option<Established>> {
+/// Wait for a peer at `peer_host` to reach us on `socket`, ACK its probe, and
+/// return the path. The reachable side of a dial.
+///
+/// Only a `PROBE` from `peer_host` establishes. We match on IP, not the full
+/// address, because a NAT may remap the peer's source port — the coordinator
+/// knows the peer's host, not the port its data socket will surface behind a
+/// NAT. This stops an *off-path* host that learns the (advertised) socket
+/// address from racing the intended peer with a stray probe; it is not
+/// authentication (a spoofed source IP or on-path attacker needs the
+/// cryptographic handshake that is future work).
+pub async fn accept(
+    socket: UdpSocket,
+    peer_host: IpAddr,
+    cfg: &Config,
+) -> io::Result<Option<Established>> {
     let deadline = Instant::now() + cfg.overall;
     let mut buf = [0u8; 64];
     loop {
@@ -150,14 +162,14 @@ pub async fn accept(socket: UdpSocket, cfg: &Config) -> io::Result<Option<Establ
         match timeout(remaining, socket.recv_from(&mut buf)).await {
             // The reachable side of a dial only ever leads with a PROBE: we never
             // sent one, so no honest peer would answer us with an ACK. Requiring a
-            // PROBE (and replying ACK) means a lone `[ACK]` byte can't spoof an
-            // inbound channel or race the real peer's probe — matching the
-            // PROBE-only discipline of `open_birthday_sockets`.
-            Ok(Ok((n, from))) if matches!(&buf[..n], [PROBE]) => {
+            // PROBE from the expected host (and replying ACK) means neither a lone
+            // `[ACK]` byte nor a probe from an unrelated host can spoof or race an
+            // inbound channel — matching the discipline of `open_birthday_sockets`.
+            Ok(Ok((n, from))) if from.ip() == peer_host && matches!(&buf[..n], [PROBE]) => {
                 socket.send_to(&[ACK], from).await?;
                 return Ok(Some(Established { socket, peer: from }));
             }
-            Ok(Ok(_)) => {} // stray / ACK / non-control datagram: keep listening
+            Ok(Ok(_)) => {} // wrong source / ACK / non-control: keep listening
             Ok(Err(e)) => return Err(e),
             Err(_) => return Ok(None), // timed out
         }

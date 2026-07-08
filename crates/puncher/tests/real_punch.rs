@@ -69,8 +69,12 @@ async fn dial_a_reachable_peer() {
     let client = UdpSocket::bind(addr(0)).await.unwrap();
     let cfg = Config::default();
 
-    // The reachable server listens; the client dials it.
-    let (rs, rc) = tokio::join!(accept(server, &cfg), connect_to(client, server_addr, &cfg));
+    // The reachable server listens (expecting the client's loopback host); the
+    // client dials it.
+    let (rs, rc) = tokio::join!(
+        accept(server, LO, &cfg),
+        connect_to(client, server_addr, &cfg)
+    );
     let s = rs.unwrap().expect("server should accept");
     let c = rc.unwrap().expect("client should connect");
     assert_eq!(c.peer, server_addr);
@@ -93,16 +97,45 @@ async fn accept_ignores_spoofed_ack() {
 
     // Queue a spoofed ACK before accept even starts reading; loopback buffers it,
     // so accept is guaranteed to see (and reject) it rather than never observe it.
+    // The attacker is on loopback (same host we expect), so this isolates the
+    // PROBE-vs-ACK check from the source-host check.
     let attacker = UdpSocket::bind(addr(0)).await.unwrap();
     attacker
         .send_to(&[puncher::ACK], server_addr)
         .await
         .unwrap();
 
-    let outcome = accept(server, &cfg).await.unwrap();
+    let outcome = accept(server, LO, &cfg).await.unwrap();
     assert!(
         outcome.is_none(),
         "a lone ACK must not establish an inbound channel"
+    );
+}
+
+#[tokio::test]
+async fn accept_ignores_probe_from_wrong_host() {
+    // A PROBE from a host other than the expected peer must not establish: an
+    // off-path host that learns the advertised address can't race the peer.
+    let server = UdpSocket::bind(addr(0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let cfg = Config {
+        overall: Duration::from_millis(300),
+        probe_interval: Duration::from_millis(50),
+    };
+
+    // We expect a peer at a non-loopback host (TEST-NET-1, never routable), but
+    // the probe arrives from loopback — a source mismatch that must be ignored.
+    let expected = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+    let stranger = UdpSocket::bind(addr(0)).await.unwrap();
+    stranger
+        .send_to(&[puncher::PROBE], server_addr)
+        .await
+        .unwrap();
+
+    let outcome = accept(server, expected, &cfg).await.unwrap();
+    assert!(
+        outcome.is_none(),
+        "a PROBE from an unexpected host must not establish a channel"
     );
 }
 

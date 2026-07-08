@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
 use swarm::dht::{Dht, Event};
@@ -112,9 +112,11 @@ impl DataListener {
         self.socket.local_addr()
     }
 
-    /// Accept one inbound channel. `Ok(None)` means none arrived in time.
-    pub async fn accept(self, cfg: &PunchConfig) -> io::Result<Option<Channel>> {
-        connect_channel(puncher::accept(self.socket, cfg).await?).await
+    /// Accept one inbound channel from a peer at `peer_host`. `Ok(None)` means
+    /// none arrived in time. Only a punch from `peer_host` is accepted, so an
+    /// off-path host that learns the advertised address can't race the peer.
+    pub async fn accept(self, peer_host: IpAddr, cfg: &PunchConfig) -> io::Result<Option<Channel>> {
+        connect_channel(puncher::accept(self.socket, peer_host, cfg).await?).await
     }
 }
 

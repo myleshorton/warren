@@ -43,10 +43,23 @@ pub struct Transmit {
     pub data: Vec<u8>,
 }
 
+/// How a coordinated connection was (or wasn't) established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    /// A reachable (Open) peer, or two predictable peers: a plain direct path.
+    Direct,
+    /// A hole was punched (one-sided-random birthday strategy).
+    Punched,
+    /// Neither side is directly reachable (both symmetric): via the coordinator.
+    Relayed,
+    /// The target could not be found on the DHT (not announced).
+    NotFound,
+}
+
 /// Something the DHT wants the caller to know about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// A lookup completed.
+    /// A `find_node` lookup completed.
     QueryFinished {
         /// Which lookup.
         query: QueryId,
@@ -55,6 +68,33 @@ pub enum Event {
         /// The closest live contacts found, nearest first.
         closest: Vec<Contact>,
     },
+    /// A `lookup` completed, returning any announce records found for the topic.
+    LookupFinished {
+        /// The topic searched for.
+        topic: NodeId,
+        /// Peers that announced under the topic.
+        peers: Vec<Contact>,
+    },
+    /// An `announce` completed (records were pushed to the closest nodes).
+    AnnounceFinished {
+        /// The topic announced under.
+        topic: NodeId,
+    },
+    /// A `connect` completed, coordinated through the DHT.
+    Connected {
+        /// The peer connected to.
+        target: NodeId,
+        /// How the connection was established.
+        outcome: ConnectOutcome,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryKind {
+    FindNode,
+    Lookup,
+    Announce,
+    Connect,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,7 +112,13 @@ struct QueryContact {
 
 struct Query {
     target: NodeId,
+    kind: QueryKind,
     contacts: Vec<QueryContact>,
+    /// Nodes that returned an announce record for the target (potential
+    /// coordinators for a connect).
+    coordinators: Vec<Contact>,
+    /// Announce records accumulated for the target during the search.
+    peers: Vec<Contact>,
 }
 
 impl Query {
@@ -119,6 +165,12 @@ pub struct Dht {
     nat: NatSampler,
     nat_pending: HashMap<u64, Millis>,
     self_reachable: bool,
+    /// This node's own firewall type, shared with peers during connect signaling.
+    local_firewall: Firewall,
+    /// topic -> peers that have announced under it (records this node stores).
+    announces: HashMap<NodeId, Vec<Contact>>,
+    /// Targets we are mid-connect to, awaiting a signaling reply.
+    connecting: std::collections::HashSet<NodeId>,
     outbox: Vec<Transmit>,
     events: Vec<Event>,
     next_rid: u64,
@@ -136,6 +188,9 @@ impl Dht {
             nat: NatSampler::new(),
             nat_pending: HashMap::new(),
             self_reachable: false,
+            local_firewall: Firewall::Open,
+            announces: HashMap::new(),
+            connecting: std::collections::HashSet::new(),
             outbox: Vec::new(),
             events: Vec::new(),
             next_rid: 1,
@@ -201,6 +256,12 @@ impl Dht {
         self.nat.len()
     }
 
+    /// Set this node's own firewall type (shared with peers during connect
+    /// signaling). Normally derived from [`Dht::firewall`] after sampling.
+    pub fn set_firewall(&mut self, fw: Firewall) {
+        self.local_firewall = fw;
+    }
+
     /// Begin a lookup for the nodes closest to our own id — the standard way to
     /// populate the routing table after learning a bootstrap peer.
     pub fn bootstrap(&mut self, now: Millis) -> QueryId {
@@ -209,12 +270,38 @@ impl Dht {
 
     /// Begin a lookup for the nodes closest to `target`.
     pub fn find_node(&mut self, target: NodeId, now: Millis) -> QueryId {
+        self.start_query(target, QueryKind::FindNode, now)
+    }
+
+    /// Announce this node under `topic`: find the closest nodes and register
+    /// ourselves with them, so peers looking up `topic` can discover us.
+    pub fn announce(&mut self, topic: NodeId, now: Millis) -> QueryId {
+        self.start_query(topic, QueryKind::Announce, now)
+    }
+
+    /// Look up peers that have announced under `topic`.
+    pub fn lookup(&mut self, topic: NodeId, now: Millis) -> QueryId {
+        self.start_query(topic, QueryKind::Lookup, now)
+    }
+
+    /// Connect to `target` by id: discover it on the DHT, then coordinate a hole
+    /// punch through a node that holds its announce record. Completion is
+    /// reported as an [`Event::Connected`].
+    pub fn connect(&mut self, target: NodeId, now: Millis) -> QueryId {
+        self.connecting.insert(target);
+        self.start_query(target, QueryKind::Connect, now)
+    }
+
+    fn start_query(&mut self, target: NodeId, kind: QueryKind, now: Millis) -> QueryId {
         let qid = self.next_qid;
         self.next_qid += 1;
 
         let mut query = Query {
             target,
+            kind,
             contacts: Vec::new(),
+            coordinators: Vec::new(),
+            peers: Vec::new(),
         };
         for c in self.table.closest(&target, K) {
             query.add_if_new(c);
@@ -247,10 +334,27 @@ impl Dht {
             }
             Message::FindNode { target } => {
                 let contacts = self.table.closest(&target, K);
-                self.send(from, packet.rid, Message::Nodes { contacts });
+                // Include any announce records we hold for the queried target,
+                // so a lookup discovers announcers as it converges.
+                let peers = self.announces.get(&target).cloned().unwrap_or_default();
+                self.send(from, packet.rid, Message::Nodes { contacts, peers });
             }
-            Message::Nodes { contacts } => {
-                self.on_nodes_response(packet.rid, contacts, now);
+            Message::Nodes { contacts, peers } => {
+                self.on_nodes_response(packet.rid, packet.sender, from, contacts, peers, now);
+            }
+            Message::Announce { topic } => {
+                self.store_announce(topic, Contact::new(packet.sender, from));
+                self.send(from, packet.rid, Message::AnnounceOk);
+            }
+            Message::AnnounceOk => {}
+            Message::Signal {
+                target,
+                initiator,
+                initiator_addr,
+                nat,
+                is_reply,
+            } => {
+                self.on_signal(from, target, initiator, initiator_addr, nat, is_reply);
             }
         }
     }
@@ -316,7 +420,15 @@ impl Dht {
         self.outbox.push(Transmit { to, data });
     }
 
-    fn on_nodes_response(&mut self, rid: u64, contacts: Vec<Contact>, now: Millis) {
+    fn on_nodes_response(
+        &mut self,
+        rid: u64,
+        responder: NodeId,
+        responder_addr: SocketAddr,
+        contacts: Vec<Contact>,
+        peers: Vec<Contact>,
+        now: Millis,
+    ) {
         let Some(p) = self.pending.remove(&rid) else {
             return;
         };
@@ -331,17 +443,45 @@ impl Dht {
                 q.add_if_new(c);
             }
         }
+        // A responder that holds announce records for the target is a candidate
+        // coordinator; remember it and the records it returned.
+        if !peers.is_empty() {
+            let coord = Contact::new(responder, responder_addr);
+            if !q.coordinators.iter().any(|c| c.id == coord.id) {
+                q.coordinators.push(coord);
+            }
+            for peer in peers {
+                if !q.peers.iter().any(|c| c.id == peer.id) {
+                    q.peers.push(peer);
+                }
+            }
+        }
         self.drive_query(p.query, now);
     }
 
+    fn store_announce(&mut self, topic: NodeId, announcer: Contact) {
+        let records = self.announces.entry(topic).or_default();
+        if let Some(existing) = records.iter_mut().find(|c| c.id == announcer.id) {
+            existing.addr = announcer.addr; // refresh the mapping
+        } else if records.len() < K {
+            records.push(announcer);
+        }
+    }
+
+    fn alloc_rid(&mut self) -> u64 {
+        let rid = self.next_rid;
+        self.next_rid += 1;
+        rid
+    }
+
+    #[allow(clippy::type_complexity)]
     fn drive_query(&mut self, qid: QueryId, now: Millis) {
         // Decide what to send, but collect first to avoid borrow conflicts.
         let mut to_send: Vec<(NodeId, SocketAddr)> = Vec::new();
-        let mut finished: Option<Vec<Contact>> = None;
-        let mut target = None;
+        // On completion: (kind, target, closest, coordinators, peers).
+        let mut done: Option<(QueryKind, NodeId, Vec<Contact>, Vec<Contact>, Vec<Contact>)> = None;
 
         if let Some(q) = self.queries.get_mut(&qid) {
-            target = Some(q.target);
             let order = q.sorted_indices();
             let topk: Vec<usize> = order.iter().take(K).copied().collect();
 
@@ -364,13 +504,20 @@ impl Dht {
                     .filter(|&&i| q.contacts[i].status == Status::Done)
                     .map(|&i| q.contacts[i].contact)
                     .collect();
-                finished = Some(closest);
+                done = Some((
+                    q.kind,
+                    q.target,
+                    closest,
+                    q.coordinators.clone(),
+                    q.peers.clone(),
+                ));
             }
         }
 
+        // The iterative search phase is FindNode for every query kind.
+        let query_target = self.queries.get(&qid).map(|q| q.target);
         for (contact_id, addr) in to_send {
-            let rid = self.next_rid;
-            self.next_rid += 1;
+            let rid = self.alloc_rid();
             self.pending.insert(
                 rid,
                 Pending {
@@ -379,17 +526,157 @@ impl Dht {
                     deadline: now + REQUEST_TIMEOUT_MS,
                 },
             );
-            let target = target.expect("query exists");
+            let target = query_target.expect("query exists");
             self.send(addr, rid, Message::FindNode { target });
         }
 
-        if let Some(closest) = finished {
+        if let Some((kind, target, closest, coordinators, peers)) = done {
             self.queries.remove(&qid);
-            self.events.push(Event::QueryFinished {
-                query: qid,
-                target: target.expect("query existed"),
-                closest,
-            });
+            self.finish_query(qid, kind, target, closest, coordinators, peers);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_query(
+        &mut self,
+        qid: QueryId,
+        kind: QueryKind,
+        target: NodeId,
+        closest: Vec<Contact>,
+        coordinators: Vec<Contact>,
+        peers: Vec<Contact>,
+    ) {
+        match kind {
+            QueryKind::FindNode => {
+                self.events.push(Event::QueryFinished {
+                    query: qid,
+                    target,
+                    closest,
+                });
+            }
+            QueryKind::Lookup => {
+                self.events.push(Event::LookupFinished {
+                    topic: target,
+                    peers,
+                });
+            }
+            QueryKind::Announce => {
+                // Register ourselves with the closest nodes we found.
+                for c in &closest {
+                    let rid = self.alloc_rid();
+                    self.send(c.addr, rid, Message::Announce { topic: target });
+                }
+                self.events.push(Event::AnnounceFinished { topic: target });
+            }
+            QueryKind::Connect => match coordinators.first().copied() {
+                Some(coord) => {
+                    // Ask a coordinator (which holds the target's record) to relay
+                    // our signal. It overwrites initiator_addr with the address it
+                    // observes, so we needn't know our own external address.
+                    let rid = self.alloc_rid();
+                    let fw = self.local_firewall;
+                    self.send(
+                        coord.addr,
+                        rid,
+                        Message::Signal {
+                            target,
+                            initiator: self.id,
+                            initiator_addr: coord.addr, // placeholder; coordinator overwrites
+                            nat: fw,
+                            is_reply: false,
+                        },
+                    );
+                }
+                None => {
+                    self.connecting.remove(&target);
+                    self.events.push(Event::Connected {
+                        target,
+                        outcome: ConnectOutcome::NotFound,
+                    });
+                }
+            },
+        }
+    }
+
+    fn on_signal(
+        &mut self,
+        from: SocketAddr,
+        target: NodeId,
+        initiator: NodeId,
+        initiator_addr: SocketAddr,
+        nat: Firewall,
+        is_reply: bool,
+    ) {
+        if !is_reply {
+            if target == self.id {
+                // We are the target: reply with our firewall via the coordinator.
+                let rid = self.alloc_rid();
+                let fw = self.local_firewall;
+                self.send(
+                    from,
+                    rid,
+                    Message::Signal {
+                        target,
+                        initiator,
+                        initiator_addr,
+                        nat: fw,
+                        is_reply: true,
+                    },
+                );
+            } else if let Some(target_addr) = self
+                .announces
+                .get(&target)
+                .and_then(|r| r.first())
+                .map(|c| c.addr)
+            {
+                // We are a coordinator: forward to the target over the mapping it
+                // opened by announcing to us, filling in the observed initiator addr.
+                let rid = self.alloc_rid();
+                self.send(
+                    target_addr,
+                    rid,
+                    Message::Signal {
+                        target,
+                        initiator,
+                        initiator_addr: from,
+                        nat,
+                        is_reply: false,
+                    },
+                );
+            }
+        } else if initiator == self.id {
+            // We are the initiator: the reply carries the target's firewall.
+            if self.connecting.remove(&target) {
+                let outcome = outcome_for(self.local_firewall, nat);
+                self.events.push(Event::Connected { target, outcome });
+            }
+        } else if self.announces.contains_key(&target) {
+            // We are the coordinator relaying the reply back to the initiator.
+            let rid = self.alloc_rid();
+            self.send(
+                initiator_addr,
+                rid,
+                Message::Signal {
+                    target,
+                    initiator,
+                    initiator_addr,
+                    nat,
+                    is_reply: true,
+                },
+            );
+        }
+    }
+}
+
+/// Map a pair of firewall types to the connection outcome. The strategy comes
+/// from [`crate::punch::plan`]; the punch's success probability for the
+/// one-sided-random cases is verified separately in `punch`.
+fn outcome_for(local: Firewall, remote: Firewall) -> ConnectOutcome {
+    match crate::punch::plan(local, remote) {
+        crate::punch::Strategy::Direct => ConnectOutcome::Direct,
+        crate::punch::Strategy::SprayRandomPorts | crate::punch::Strategy::OpenBirthdaySockets => {
+            ConnectOutcome::Punched
+        }
+        crate::punch::Strategy::Relay => ConnectOutcome::Relayed,
     }
 }

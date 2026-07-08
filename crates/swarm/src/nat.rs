@@ -32,6 +32,27 @@ pub enum Firewall {
     Random,
 }
 
+impl Firewall {
+    /// Compact wire tag.
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Firewall::Open => 0,
+            Firewall::Consistent => 1,
+            Firewall::Random => 2,
+        }
+    }
+
+    /// Parse a wire tag.
+    pub fn from_u8(tag: u8) -> Option<Firewall> {
+        match tag {
+            0 => Some(Firewall::Open),
+            1 => Some(Firewall::Consistent),
+            2 => Some(Firewall::Random),
+            _ => None,
+        }
+    }
+}
+
 /// Accumulates observed external addresses to classify the local firewall.
 ///
 /// Each observation is the source address a distinct remote node reported

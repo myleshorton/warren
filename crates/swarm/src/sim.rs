@@ -8,6 +8,7 @@
 
 use crate::dht::{Dht, Event, Millis, QueryId};
 use crate::id::{NodeId, ID_LEN};
+use crate::nat::Firewall;
 use crate::routing::Contact;
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
@@ -168,8 +169,35 @@ impl Sim {
     }
 
     /// Set the NAT a node sits behind (default [`NatKind::Open`]).
+    ///
+    /// Also updates the node's declared firewall so connect signaling reports
+    /// the same type the sim routes it as.
     pub fn set_nat(&mut self, i: usize, kind: NatKind) {
         self.nodes[i].nat = kind;
+        let fw = match kind {
+            NatKind::Open => Firewall::Open,
+            NatKind::Consistent => Firewall::Consistent,
+            NatKind::Random => Firewall::Random,
+        };
+        self.nodes[i].dht.set_firewall(fw);
+    }
+
+    /// Announce node `i` under `topic`.
+    pub fn announce(&mut self, i: usize, topic: NodeId) -> QueryId {
+        let now = self.now;
+        self.nodes[i].dht.announce(topic, now)
+    }
+
+    /// Look up announcers of `topic` from node `i`.
+    pub fn lookup(&mut self, i: usize, topic: NodeId) -> QueryId {
+        let now = self.now;
+        self.nodes[i].dht.lookup(topic, now)
+    }
+
+    /// Connect node `i` to `target`, coordinated through the DHT.
+    pub fn connect(&mut self, i: usize, target: NodeId) -> QueryId {
+        let now = self.now;
+        self.nodes[i].dht.connect(target, now)
     }
 
     /// The NAT a node sits behind.

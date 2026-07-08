@@ -22,3 +22,6 @@ name = "punch_sim"
 
 [[example]]
 name = "nat_sim"
+
+[[example]]
+name = "connect_sim"

@@ -8,9 +8,10 @@
 
 use crate::dht::{Dht, Event, Millis, QueryId};
 use crate::id::{NodeId, ID_LEN};
+use crate::nat::Firewall;
 use crate::routing::Contact;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 /// Small, fast, seedable PRNG (SplitMix64). Deterministic across platforms.
@@ -115,6 +116,8 @@ pub struct Sim {
     loss: f64,
     seed: u64,
     rng: Rng,
+    /// Nodes that have gone "offline": packets to them are dropped.
+    disabled: HashSet<usize>,
     events: Vec<(usize, Event)>,
 }
 
@@ -132,6 +135,7 @@ impl Sim {
             loss: 0.0,
             seed,
             rng: Rng::new(seed),
+            disabled: HashSet::new(),
             events: Vec::new(),
         }
     }
@@ -139,6 +143,13 @@ impl Sim {
     /// Set the packet loss probability in `[0, 1)`.
     pub fn set_loss(&mut self, loss: f64) {
         self.loss = loss;
+    }
+
+    /// Take a node fully offline: packets both to and from it are dropped,
+    /// modeling a peer that has left the network. (Its internal timers may still
+    /// fire, but nothing it produces reaches the wire.)
+    pub fn disable_node(&mut self, i: usize) {
+        self.disabled.insert(i);
     }
 
     /// Borrow the simulator's PRNG (e.g. to mint node ids).
@@ -168,8 +179,35 @@ impl Sim {
     }
 
     /// Set the NAT a node sits behind (default [`NatKind::Open`]).
+    ///
+    /// Also updates the node's declared firewall so connect signaling reports
+    /// the same type the sim routes it as.
     pub fn set_nat(&mut self, i: usize, kind: NatKind) {
         self.nodes[i].nat = kind;
+        let fw = match kind {
+            NatKind::Open => Firewall::Open,
+            NatKind::Consistent => Firewall::Consistent,
+            NatKind::Random => Firewall::Random,
+        };
+        self.nodes[i].dht.set_firewall(fw);
+    }
+
+    /// Announce node `i` under `topic`.
+    pub fn announce(&mut self, i: usize, topic: NodeId) -> QueryId {
+        let now = self.now;
+        self.nodes[i].dht.announce(topic, now)
+    }
+
+    /// Look up announcers of `topic` from node `i`.
+    pub fn lookup(&mut self, i: usize, topic: NodeId) -> QueryId {
+        let now = self.now;
+        self.nodes[i].dht.lookup(topic, now)
+    }
+
+    /// Connect node `i` to `target`, coordinated through the DHT.
+    pub fn connect(&mut self, i: usize, target: NodeId) -> QueryId {
+        let now = self.now;
+        self.nodes[i].dht.connect(target, now)
     }
 
     /// The NAT a node sits behind.
@@ -247,10 +285,19 @@ impl Sim {
 
     fn drain_outboxes(&mut self) {
         for i in 0..self.nodes.len() {
+            // An offline node's outbound is drained and discarded, so it neither
+            // sends nor receives.
+            let sender_offline = self.disabled.contains(&i);
             while let Some(t) = self.nodes[i].dht.poll_transmit() {
+                if sender_offline {
+                    continue;
+                }
                 let Some(to) = self.resolve(&t.to) else {
                     continue; // unknown destination: dropped, as on a real net
                 };
+                if self.disabled.contains(&to) {
+                    continue; // recipient is offline
+                }
                 if self.loss > 0.0 && self.rng.unit() < self.loss {
                     continue; // simulated packet loss
                 }
@@ -323,6 +370,9 @@ impl Sim {
                 }
                 let Reverse(slot) = self.queue.pop().unwrap();
                 let Scheduled::Deliver { to, from, data } = slot.item;
+                if self.disabled.contains(&to) {
+                    continue; // recipient went offline after this was scheduled
+                }
                 let now = self.now;
                 self.nodes[to].dht.handle_input(from, &data, now);
             }

@@ -16,17 +16,28 @@ use crate::id::NodeId;
 use crate::msg::{Message, Packet};
 use crate::nat::{Firewall, NatSampler};
 use crate::routing::{Contact, RoutingTable, K};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 /// Peers to probe when sampling the local NAT.
 pub const NAT_SAMPLE_COUNT: usize = 5;
+
+/// How many recent connect initiators a coordinator remembers (bounded FIFO).
+const MAX_SEEN_INITIATORS: usize = 1024;
+
+/// Absolute cap on distinct announce topics a node stores, bounding memory even
+/// when the routing table is too small for [`Dht::responsible_for`] to bite.
+const MAX_ANNOUNCE_TOPICS: usize = 65_536;
 
 /// Concurrency parameter: how many lookup requests may be in flight at once.
 pub const ALPHA: usize = 3;
 
 /// How long (ms) to wait for a response before treating a request as failed.
 pub const REQUEST_TIMEOUT_MS: u64 = 1_000;
+
+/// Overall deadline (ms) for a connect — covering both discovery and the
+/// coordinator-brokered signaling — after which it gives up.
+pub const CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// Milliseconds since an arbitrary epoch chosen by the caller.
 pub type Millis = u64;
@@ -43,10 +54,26 @@ pub struct Transmit {
     pub data: Vec<u8>,
 }
 
+/// How a coordinated connection was (or wasn't) established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOutcome {
+    /// A reachable (Open) peer, or two predictable peers: a plain direct path.
+    Direct,
+    /// A hole was punched (one-sided-random birthday strategy).
+    Punched,
+    /// Neither side is directly reachable (both symmetric): via the coordinator.
+    Relayed,
+    /// The target could not be found on the DHT (not announced).
+    NotFound,
+    /// The connect did not complete before its deadline — discovery or the
+    /// coordinator-brokered signaling did not finish in time.
+    TimedOut,
+}
+
 /// Something the DHT wants the caller to know about.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// A lookup completed.
+    /// A `find_node` lookup completed.
     QueryFinished {
         /// Which lookup.
         query: QueryId,
@@ -55,6 +82,33 @@ pub enum Event {
         /// The closest live contacts found, nearest first.
         closest: Vec<Contact>,
     },
+    /// A `lookup` completed, returning any announce records found for the topic.
+    LookupFinished {
+        /// The topic searched for.
+        topic: NodeId,
+        /// Peers that announced under the topic.
+        peers: Vec<Contact>,
+    },
+    /// An `announce` completed (records were pushed to the closest nodes).
+    AnnounceFinished {
+        /// The topic announced under.
+        topic: NodeId,
+    },
+    /// A `connect` completed, coordinated through the DHT.
+    Connected {
+        /// The peer connected to.
+        target: NodeId,
+        /// How the connection was established.
+        outcome: ConnectOutcome,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryKind {
+    FindNode,
+    Lookup,
+    Announce,
+    Connect,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -72,7 +126,13 @@ struct QueryContact {
 
 struct Query {
     target: NodeId,
+    kind: QueryKind,
     contacts: Vec<QueryContact>,
+    /// Nodes that returned an announce record for the target (potential
+    /// coordinators for a connect).
+    coordinators: Vec<Contact>,
+    /// Announce records accumulated for the target during the search.
+    peers: Vec<Contact>,
 }
 
 impl Query {
@@ -110,6 +170,14 @@ struct Pending {
     deadline: Millis,
 }
 
+struct ConnectState {
+    /// When this connect gives up if signaling hasn't completed.
+    deadline: Millis,
+    /// The coordinator we sent the request to; a reply is accepted only from it,
+    /// so another host can't spoof a reply and force a wrong outcome.
+    coordinator: Option<SocketAddr>,
+}
+
 /// A Kademlia DHT node.
 pub struct Dht {
     id: NodeId,
@@ -119,6 +187,19 @@ pub struct Dht {
     nat: NatSampler,
     nat_pending: HashMap<u64, Millis>,
     self_reachable: bool,
+    /// This node's own firewall type, shared with peers during connect signaling.
+    local_firewall: Firewall,
+    /// topic -> peers that have announced under it (records this node stores).
+    announces: HashMap<NodeId, Vec<Contact>>,
+    /// Targets we are mid-connect to -> the connect's state (deadline + the
+    /// coordinator we're expecting the reply from).
+    connecting: HashMap<NodeId, ConnectState>,
+    /// Recently observed (target id, initiator address) connect pairs
+    /// (coordinator side), bounded FIFO. We relay a reply only to an address
+    /// that actually initiated a connect *to that target*, so a target can't
+    /// redirect the relayed reply to an arbitrary victim (nor to an initiator of
+    /// some other connect).
+    seen_initiators: VecDeque<(NodeId, SocketAddr)>,
     outbox: Vec<Transmit>,
     events: Vec<Event>,
     next_rid: u64,
@@ -136,6 +217,10 @@ impl Dht {
             nat: NatSampler::new(),
             nat_pending: HashMap::new(),
             self_reachable: false,
+            local_firewall: Firewall::Open,
+            announces: HashMap::new(),
+            connecting: HashMap::new(),
+            seen_initiators: VecDeque::new(),
             outbox: Vec::new(),
             events: Vec::new(),
             next_rid: 1,
@@ -201,6 +286,12 @@ impl Dht {
         self.nat.len()
     }
 
+    /// Set this node's own firewall type (shared with peers during connect
+    /// signaling). Normally derived from [`Dht::firewall`] after sampling.
+    pub fn set_firewall(&mut self, fw: Firewall) {
+        self.local_firewall = fw;
+    }
+
     /// Begin a lookup for the nodes closest to our own id — the standard way to
     /// populate the routing table after learning a bootstrap peer.
     pub fn bootstrap(&mut self, now: Millis) -> QueryId {
@@ -209,12 +300,44 @@ impl Dht {
 
     /// Begin a lookup for the nodes closest to `target`.
     pub fn find_node(&mut self, target: NodeId, now: Millis) -> QueryId {
+        self.start_query(target, QueryKind::FindNode, now)
+    }
+
+    /// Announce this node under `topic`: find the closest nodes and register
+    /// ourselves with them, so peers looking up `topic` can discover us.
+    pub fn announce(&mut self, topic: NodeId, now: Millis) -> QueryId {
+        self.start_query(topic, QueryKind::Announce, now)
+    }
+
+    /// Look up peers that have announced under `topic`.
+    pub fn lookup(&mut self, topic: NodeId, now: Millis) -> QueryId {
+        self.start_query(topic, QueryKind::Lookup, now)
+    }
+
+    /// Connect to `target` by id: discover it on the DHT, then coordinate a hole
+    /// punch through a node that holds its announce record. Completion is
+    /// reported as an [`Event::Connected`].
+    pub fn connect(&mut self, target: NodeId, now: Millis) -> QueryId {
+        self.connecting.insert(
+            target,
+            ConnectState {
+                deadline: now + CONNECT_TIMEOUT_MS,
+                coordinator: None,
+            },
+        );
+        self.start_query(target, QueryKind::Connect, now)
+    }
+
+    fn start_query(&mut self, target: NodeId, kind: QueryKind, now: Millis) -> QueryId {
         let qid = self.next_qid;
         self.next_qid += 1;
 
         let mut query = Query {
             target,
+            kind,
             contacts: Vec::new(),
+            coordinators: Vec::new(),
+            peers: Vec::new(),
         };
         for c in self.table.closest(&target, K) {
             query.add_if_new(c);
@@ -247,10 +370,29 @@ impl Dht {
             }
             Message::FindNode { target } => {
                 let contacts = self.table.closest(&target, K);
-                self.send(from, packet.rid, Message::Nodes { contacts });
+                // Include any announce records we hold for the queried target,
+                // so a lookup discovers announcers as it converges.
+                let peers = self.announces.get(&target).cloned().unwrap_or_default();
+                self.send(from, packet.rid, Message::Nodes { contacts, peers });
             }
-            Message::Nodes { contacts } => {
-                self.on_nodes_response(packet.rid, contacts, now);
+            Message::Nodes { contacts, peers } => {
+                self.on_nodes_response(packet.rid, packet.sender, from, contacts, peers, now);
+            }
+            Message::Announce { topic } => {
+                // Only store if we're plausibly responsible for the topic, so a
+                // remote can't grow our store with announces for arbitrary keys.
+                if self.responsible_for(&topic) {
+                    self.store_announce(topic, Contact::new(packet.sender, from));
+                }
+            }
+            Message::Signal {
+                target,
+                initiator,
+                initiator_addr,
+                nat,
+                is_reply,
+            } => {
+                self.on_signal(from, target, initiator, initiator_addr, nat, is_reply);
             }
         }
     }
@@ -277,14 +419,33 @@ impl Dht {
 
         // Expire NAT probes; a lost Pong simply yields one fewer sample.
         self.nat_pending.retain(|_, deadline| *deadline > now);
+
+        // Fail connects whose signaling never completed, so they can't hang.
+        let stale: Vec<NodeId> = self
+            .connecting
+            .iter()
+            .filter(|(_, cs)| cs.deadline <= now)
+            .map(|(target, _)| *target)
+            .collect();
+        for target in stale {
+            self.connecting.remove(&target);
+            // Stop any still-running discovery for this target so it can't emit
+            // a late Signal after we've already reported TimedOut.
+            self.cancel_connect_queries(&target);
+            self.events.push(Event::Connected {
+                target,
+                outcome: ConnectOutcome::TimedOut,
+            });
+        }
     }
 
-    /// The earliest pending deadline, if any request is in flight.
+    /// The earliest pending deadline, if any request or connect is in flight.
     pub fn poll_timeout(&self) -> Option<Millis> {
         self.pending
             .values()
             .map(|p| p.deadline)
             .chain(self.nat_pending.values().copied())
+            .chain(self.connecting.values().map(|cs| cs.deadline))
             .min()
     }
 
@@ -316,7 +477,15 @@ impl Dht {
         self.outbox.push(Transmit { to, data });
     }
 
-    fn on_nodes_response(&mut self, rid: u64, contacts: Vec<Contact>, now: Millis) {
+    fn on_nodes_response(
+        &mut self,
+        rid: u64,
+        responder: NodeId,
+        responder_addr: SocketAddr,
+        contacts: Vec<Contact>,
+        peers: Vec<Contact>,
+        now: Millis,
+    ) {
         let Some(p) = self.pending.remove(&rid) else {
             return;
         };
@@ -331,17 +500,106 @@ impl Dht {
                 q.add_if_new(c);
             }
         }
+        // A responder is a candidate coordinator only if it holds the target's
+        // own self-announce (a record whose id is the target); a non-empty peers
+        // list under the topic that lacks it doesn't help a connect-by-id.
+        if !peers.is_empty() {
+            if peers.iter().any(|p| p.id == q.target) {
+                let coord = Contact::new(responder, responder_addr);
+                if !q.coordinators.iter().any(|c| c.id == coord.id) {
+                    q.coordinators.push(coord);
+                }
+            }
+            for peer in peers {
+                // Last-reported address wins, so a re-announce (or a fresher
+                // report from another coordinator) refreshes a known peer.
+                if let Some(existing) = q.peers.iter_mut().find(|c| c.id == peer.id) {
+                    existing.addr = peer.addr;
+                } else {
+                    q.peers.push(peer);
+                }
+            }
+        }
         self.drive_query(p.query, now);
     }
 
+    fn remember_initiator(&mut self, target: NodeId, addr: SocketAddr) {
+        let key = (target, addr);
+        if self.seen_initiators.contains(&key) {
+            return;
+        }
+        if self.seen_initiators.len() >= MAX_SEEN_INITIATORS {
+            self.seen_initiators.pop_front();
+        }
+        self.seen_initiators.push_back(key);
+    }
+
+    /// The firewall type to advertise in signaling: the sampler's classification
+    /// once available, else the explicitly set value (default Open). This means a
+    /// node that has sampled its NAT reports the right type without every caller
+    /// having to remember to sync it.
+    fn signaling_firewall(&self) -> Firewall {
+        self.firewall().unwrap_or(self.local_firewall)
+    }
+
+    fn store_announce(&mut self, topic: NodeId, announcer: Contact) {
+        // Don't create a new topic entry past the absolute cap (existing topics
+        // still accept updates), so memory stays bounded even in small networks.
+        if !self.announces.contains_key(&topic) && self.announces.len() >= MAX_ANNOUNCE_TOPICS {
+            return;
+        }
+        let records = self.announces.entry(topic).or_default();
+        if let Some(existing) = records.iter_mut().find(|c| c.id == announcer.id) {
+            existing.addr = announcer.addr; // refresh the mapping
+        } else if records.len() < K {
+            records.push(announcer);
+        }
+    }
+
+    /// Whether we are plausibly among the K closest nodes to `topic` — i.e.
+    /// fewer than K known contacts are closer to it than we are. Announce
+    /// records should live near their topic, so this bounds what we store.
+    fn responsible_for(&self, topic: &NodeId) -> bool {
+        let my_dist = self.id.distance(topic);
+        let closer = self
+            .table
+            .closest(topic, K)
+            .into_iter()
+            .filter(|c| c.id.distance(topic) < my_dist)
+            .count();
+        closer < K
+    }
+
+    /// Drop any in-flight connect query (and its pending requests) for `target`,
+    /// so a query that finishes after the connect already resolved can't send a
+    /// stray `Signal`.
+    fn cancel_connect_queries(&mut self, target: &NodeId) {
+        let qids: Vec<QueryId> = self
+            .queries
+            .iter()
+            .filter(|(_, q)| q.kind == QueryKind::Connect && q.target == *target)
+            .map(|(id, _)| *id)
+            .collect();
+        for qid in &qids {
+            self.queries.remove(qid);
+        }
+        self.pending.retain(|_, p| !qids.contains(&p.query));
+    }
+
+    fn alloc_rid(&mut self) -> u64 {
+        let rid = self.next_rid;
+        self.next_rid += 1;
+        rid
+    }
+
+    #[allow(clippy::type_complexity)]
     fn drive_query(&mut self, qid: QueryId, now: Millis) {
         // Decide what to send, but collect first to avoid borrow conflicts.
         let mut to_send: Vec<(NodeId, SocketAddr)> = Vec::new();
-        let mut finished: Option<Vec<Contact>> = None;
-        let mut target = None;
+        // On completion: (kind, target, closest, coordinators, peers).
+        let mut done: Option<(QueryKind, NodeId, Vec<Contact>, Vec<Contact>, Vec<Contact>)> = None;
 
         if let Some(q) = self.queries.get_mut(&qid) {
-            target = Some(q.target);
             let order = q.sorted_indices();
             let topk: Vec<usize> = order.iter().take(K).copied().collect();
 
@@ -364,13 +622,20 @@ impl Dht {
                     .filter(|&&i| q.contacts[i].status == Status::Done)
                     .map(|&i| q.contacts[i].contact)
                     .collect();
-                finished = Some(closest);
+                done = Some((
+                    q.kind,
+                    q.target,
+                    closest,
+                    q.coordinators.clone(),
+                    q.peers.clone(),
+                ));
             }
         }
 
+        // The iterative search phase is FindNode for every query kind.
+        let query_target = self.queries.get(&qid).map(|q| q.target);
         for (contact_id, addr) in to_send {
-            let rid = self.next_rid;
-            self.next_rid += 1;
+            let rid = self.alloc_rid();
             self.pending.insert(
                 rid,
                 Pending {
@@ -379,17 +644,185 @@ impl Dht {
                     deadline: now + REQUEST_TIMEOUT_MS,
                 },
             );
-            let target = target.expect("query exists");
+            let target = query_target.expect("query exists");
             self.send(addr, rid, Message::FindNode { target });
         }
 
-        if let Some(closest) = finished {
+        if let Some((kind, target, closest, coordinators, peers)) = done {
             self.queries.remove(&qid);
-            self.events.push(Event::QueryFinished {
-                query: qid,
-                target: target.expect("query existed"),
-                closest,
-            });
+            self.finish_query(qid, kind, target, closest, coordinators, peers);
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_query(
+        &mut self,
+        qid: QueryId,
+        kind: QueryKind,
+        target: NodeId,
+        closest: Vec<Contact>,
+        coordinators: Vec<Contact>,
+        peers: Vec<Contact>,
+    ) {
+        match kind {
+            QueryKind::FindNode => {
+                self.events.push(Event::QueryFinished {
+                    query: qid,
+                    target,
+                    closest,
+                });
+            }
+            QueryKind::Lookup => {
+                self.events.push(Event::LookupFinished {
+                    topic: target,
+                    peers,
+                });
+            }
+            QueryKind::Announce => {
+                // Register ourselves with the closest nodes we found.
+                for c in &closest {
+                    let rid = self.alloc_rid();
+                    self.send(c.addr, rid, Message::Announce { topic: target });
+                }
+                self.events.push(Event::AnnounceFinished { topic: target });
+            }
+            QueryKind::Connect => match coordinators.first().copied() {
+                Some(coord) => {
+                    // Ask a coordinator (which holds the target's record) to relay
+                    // our signal. It overwrites initiator_addr with the address it
+                    // observes, so we needn't know our own external address.
+                    // Record the coordinator so we accept the reply only from it.
+                    if let Some(cs) = self.connecting.get_mut(&target) {
+                        cs.coordinator = Some(coord.addr);
+                    }
+                    let rid = self.alloc_rid();
+                    let fw = self.signaling_firewall();
+                    self.send(
+                        coord.addr,
+                        rid,
+                        Message::Signal {
+                            target,
+                            initiator: self.id,
+                            initiator_addr: coord.addr, // placeholder; coordinator overwrites
+                            nat: fw,
+                            is_reply: false,
+                        },
+                    );
+                }
+                None => {
+                    self.connecting.remove(&target);
+                    self.events.push(Event::Connected {
+                        target,
+                        outcome: ConnectOutcome::NotFound,
+                    });
+                }
+            },
+        }
+    }
+
+    fn on_signal(
+        &mut self,
+        from: SocketAddr,
+        target: NodeId,
+        initiator: NodeId,
+        initiator_addr: SocketAddr,
+        nat: Firewall,
+        is_reply: bool,
+    ) {
+        if !is_reply {
+            if target == self.id {
+                // We are the target: reply with our firewall via the coordinator.
+                let rid = self.alloc_rid();
+                let fw = self.signaling_firewall();
+                self.send(
+                    from,
+                    rid,
+                    Message::Signal {
+                        target,
+                        initiator,
+                        initiator_addr,
+                        nat: fw,
+                        is_reply: true,
+                    },
+                );
+            } else if let Some(target_addr) = self
+                .announces
+                .get(&target)
+                .and_then(|r| r.iter().find(|c| c.id == target))
+                .map(|c| c.addr)
+            {
+                // We are a coordinator: forward to the target's own record (the
+                // announcer whose id is the target), over the mapping it opened
+                // by announcing to us, filling in the observed initiator addr.
+                // Remember the initiator so we'll only relay the reply back to an
+                // address that actually initiated.
+                self.remember_initiator(target, from);
+                let rid = self.alloc_rid();
+                self.send(
+                    target_addr,
+                    rid,
+                    Message::Signal {
+                        target,
+                        initiator,
+                        initiator_addr: from,
+                        nat,
+                        is_reply: false,
+                    },
+                );
+            }
+        } else if initiator == self.id {
+            // We are the initiator: the reply carries the target's firewall — but
+            // accept it only from the coordinator we actually sent the request to,
+            // so another host can't spoof a reply and force a wrong outcome.
+            let from_coordinator = self
+                .connecting
+                .get(&target)
+                .is_some_and(|cs| cs.coordinator == Some(from));
+            if from_coordinator {
+                self.connecting.remove(&target);
+                let outcome = outcome_for(self.signaling_firewall(), nat);
+                self.events.push(Event::Connected { target, outcome });
+            }
+        } else if self.seen_initiators.contains(&(target, initiator_addr))
+            && self
+                .announces
+                .get(&target)
+                .is_some_and(|recs| recs.iter().any(|c| c.id == target && c.addr == from))
+        {
+            // We are the coordinator relaying the reply — but only to an address
+            // that actually initiated (so the target can't redirect it to a
+            // victim), and only if the reply truly came from the target's own
+            // record (id == target, at that address).
+            // Otherwise an arbitrary announcer under the same topic could spoof a
+            // reply to use us as a reflector or feed the initiator a bogus
+            // firewall type. (Full authentication — a Noise handshake and
+            // capability tokens, as in HyperDHT — is future work; it would also
+            // stop a peer from announcing under another peer's id at all.)
+            let rid = self.alloc_rid();
+            self.send(
+                initiator_addr,
+                rid,
+                Message::Signal {
+                    target,
+                    initiator,
+                    initiator_addr,
+                    nat,
+                    is_reply: true,
+                },
+            );
+        }
+    }
+}
+
+/// Map a pair of firewall types to the connection outcome. The strategy comes
+/// from [`crate::punch::plan`]; the punch's success probability for the
+/// one-sided-random cases is verified separately in `punch`.
+fn outcome_for(local: Firewall, remote: Firewall) -> ConnectOutcome {
+    match crate::punch::plan(local, remote) {
+        crate::punch::Strategy::Direct => ConnectOutcome::Direct,
+        crate::punch::Strategy::SprayRandomPorts | crate::punch::Strategy::OpenBirthdaySockets => {
+            ConnectOutcome::Punched
+        }
+        crate::punch::Strategy::Relay => ConnectOutcome::Relayed,
     }
 }

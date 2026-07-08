@@ -28,7 +28,7 @@ pub mod punch;
 pub mod routing;
 pub mod sim;
 
-pub use dht::{Dht, Event, Millis, QueryId, Transmit, ALPHA, REQUEST_TIMEOUT_MS};
+pub use dht::{ConnectOutcome, Dht, Event, Millis, QueryId, Transmit, ALPHA, REQUEST_TIMEOUT_MS};
 pub use id::{Distance, NodeId, ID_LEN};
 pub use msg::{Message, Packet};
 pub use nat::{Firewall, NatSampler};

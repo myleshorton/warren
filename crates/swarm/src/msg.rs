@@ -6,6 +6,7 @@
 //! the [`wire`] codec.
 
 use crate::id::{NodeId, ID_LEN};
+use crate::nat::Firewall;
 use crate::routing::Contact;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use thiserror::Error;
@@ -15,6 +16,8 @@ const KIND_PING: u8 = 1;
 const KIND_PONG: u8 = 2;
 const KIND_FIND_NODE: u8 = 3;
 const KIND_NODES: u8 = 4;
+const KIND_ANNOUNCE: u8 = 5;
+const KIND_SIGNAL: u8 = 7;
 
 const ADDR_V4: u8 = 4;
 const ADDR_V6: u8 = 6;
@@ -39,8 +42,31 @@ pub enum Message {
     Pong { observed: SocketAddr },
     /// Request the closest known nodes to `target`.
     FindNode { target: NodeId },
-    /// Reply to [`Message::FindNode`] with closest known contacts.
-    Nodes { contacts: Vec<Contact> },
+    /// Reply to [`Message::FindNode`]: the closest known contacts, plus any
+    /// announce records the responder holds for `target` (empty if none).
+    Nodes {
+        /// Closer nodes toward the queried target.
+        contacts: Vec<Contact>,
+        /// Peers that announced themselves under the queried target.
+        peers: Vec<Contact>,
+    },
+    /// Ask the recipient to store the sender as an announcer under `topic`.
+    /// One-way (best-effort); the announcer does not wait for confirmation.
+    Announce { topic: NodeId },
+    /// Coordinate a hole punch: relayed initiator↔target through a coordinator
+    /// that holds the target's announce record.
+    Signal {
+        /// The peer being connected to.
+        target: NodeId,
+        /// The peer initiating the connection.
+        initiator: NodeId,
+        /// The initiator's address, as observed and filled in by the coordinator.
+        initiator_addr: SocketAddr,
+        /// The sender's firewall type (initiator's on a request, target's on a reply).
+        nat: Firewall,
+        /// False for an initiator→target request, true for a target→initiator reply.
+        is_reply: bool,
+    },
 }
 
 /// A full DHT packet: sender identity, request id, and a message body.
@@ -72,13 +98,28 @@ impl Packet {
                 enc.u8(KIND_FIND_NODE);
                 enc.raw(target.as_bytes());
             }
-            Message::Nodes { contacts } => {
+            Message::Nodes { contacts, peers } => {
                 enc.u8(KIND_NODES);
-                enc.uint(contacts.len() as u64);
-                for c in contacts {
-                    enc.raw(c.id.as_bytes());
-                    encode_addr(&mut enc, &c.addr);
-                }
+                encode_contacts(&mut enc, contacts);
+                encode_contacts(&mut enc, peers);
+            }
+            Message::Announce { topic } => {
+                enc.u8(KIND_ANNOUNCE);
+                enc.raw(topic.as_bytes());
+            }
+            Message::Signal {
+                target,
+                initiator,
+                initiator_addr,
+                nat,
+                is_reply,
+            } => {
+                enc.u8(KIND_SIGNAL);
+                enc.raw(target.as_bytes());
+                enc.raw(initiator.as_bytes());
+                encode_addr(&mut enc, initiator_addr);
+                enc.u8(nat.as_u8());
+                enc.u8(u8::from(*is_reply));
             }
         }
         enc.into_vec()
@@ -100,25 +141,60 @@ impl Packet {
                 Message::FindNode { target }
             }
             KIND_NODES => {
-                let n = dec.uint()?;
-                // Each contact is at least 32 + 1 + 2 bytes; reject counts that
-                // cannot possibly fit so a bad length can't drive a huge alloc.
-                if n > dec.remaining() as u64 {
-                    return Err(MsgError::Malformed("contact count exceeds buffer"));
+                let contacts = decode_contacts(&mut dec)?;
+                let peers = decode_contacts(&mut dec)?;
+                Message::Nodes { contacts, peers }
+            }
+            KIND_ANNOUNCE => {
+                let topic = NodeId::from_bytes(dec.array::<ID_LEN>()?);
+                Message::Announce { topic }
+            }
+            KIND_SIGNAL => {
+                let target = NodeId::from_bytes(dec.array::<ID_LEN>()?);
+                let initiator = NodeId::from_bytes(dec.array::<ID_LEN>()?);
+                let initiator_addr = decode_addr(&mut dec)?;
+                let nat = Firewall::from_u8(dec.u8()?)
+                    .ok_or(MsgError::Malformed("unknown firewall tag"))?;
+                let is_reply = dec.u8()? != 0;
+                Message::Signal {
+                    target,
+                    initiator,
+                    initiator_addr,
+                    nat,
+                    is_reply,
                 }
-                let mut contacts = Vec::with_capacity(n as usize);
-                for _ in 0..n {
-                    let id = NodeId::from_bytes(dec.array::<ID_LEN>()?);
-                    let addr = decode_addr(&mut dec)?;
-                    contacts.push(Contact::new(id, addr));
-                }
-                Message::Nodes { contacts }
             }
             _ => return Err(MsgError::Malformed("unknown message kind")),
         };
         dec.finish()?;
         Ok(Packet { sender, rid, msg })
     }
+}
+
+fn encode_contacts(enc: &mut Encoder, contacts: &[Contact]) {
+    enc.uint(contacts.len() as u64);
+    for c in contacts {
+        enc.raw(c.id.as_bytes());
+        encode_addr(enc, &c.addr);
+    }
+}
+
+fn decode_contacts<'a>(dec: &mut Decoder<'a>) -> Result<Vec<Contact>, MsgError> {
+    // A contact is at minimum an id + an address-family tag + a v4 address:
+    // 32 + 1 + (4 + 2) bytes. Bounding the count by this (not by raw remaining
+    // bytes) stops a crafted length from forcing an allocation ~40x the buffer.
+    const MIN_CONTACT_BYTES: u64 = ID_LEN as u64 + 1 + 4 + 2;
+    let n = dec.uint()?;
+    if n > dec.remaining() as u64 / MIN_CONTACT_BYTES {
+        return Err(MsgError::Malformed("contact count exceeds buffer"));
+    }
+    let mut contacts = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        let id = NodeId::from_bytes(dec.array::<ID_LEN>()?);
+        let addr = decode_addr(dec)?;
+        contacts.push(Contact::new(id, addr));
+    }
+    Ok(contacts)
 }
 
 fn encode_addr(enc: &mut Encoder, addr: &SocketAddr) {
@@ -192,23 +268,64 @@ mod tests {
         });
     }
 
+    fn addr4(port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), port))
+    }
+
     #[test]
     fn nodes_roundtrip_both_families() {
         let contacts = vec![
-            Contact::new(
-                id(10),
-                SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(1, 2, 3, 4), 5000)),
-            ),
+            Contact::new(id(10), addr4(5000)),
             Contact::new(
                 id(11),
                 SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 6000, 0, 0)),
             ),
         ];
+        let peers = vec![Contact::new(id(12), addr4(7000))];
         roundtrip(&Packet {
             sender: id(4),
             rid: 100,
-            msg: Message::Nodes { contacts },
+            msg: Message::Nodes { contacts, peers },
         });
+        // Empty peers list is the common case and must round-trip too.
+        roundtrip(&Packet {
+            sender: id(4),
+            rid: 101,
+            msg: Message::Nodes {
+                contacts: vec![Contact::new(id(10), addr4(5000))],
+                peers: vec![],
+            },
+        });
+    }
+
+    #[test]
+    fn announce_roundtrip() {
+        roundtrip(&Packet {
+            sender: id(5),
+            rid: 1,
+            msg: Message::Announce { topic: id(99) },
+        });
+    }
+
+    #[test]
+    fn signal_roundtrip() {
+        for (nat, is_reply) in [
+            (Firewall::Open, false),
+            (Firewall::Consistent, true),
+            (Firewall::Random, false),
+        ] {
+            roundtrip(&Packet {
+                sender: id(6),
+                rid: 3,
+                msg: Message::Signal {
+                    target: id(20),
+                    initiator: id(21),
+                    initiator_addr: addr4(9000),
+                    nat,
+                    is_reply,
+                },
+            });
+        }
     }
 
     #[test]

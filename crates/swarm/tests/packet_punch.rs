@@ -50,12 +50,16 @@ fn double_random_relays_at_packet_level() {
 #[test]
 fn one_sided_random_punches_at_packet_level() {
     let params = PunchParams::default();
-    let mut rng = Rng::new(3);
-    // Both role orders drive the same collision through real packets.
-    for (a, b) in [
+    // Both role orders drive the same collision through real packets. Each gets
+    // its own seeded stream so the two assertions are independent.
+    for (i, (a, b)) in [
         (Firewall::Consistent, Firewall::Random),
         (Firewall::Random, Firewall::Consistent),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut rng = Rng::new(3 + i as u64);
         let r = rate(1000, || packet_punch(a, b, &mut rng, &params));
         assert!(r > 0.99, "{a:?}/{b:?} punched only {r:.4} of the time");
     }

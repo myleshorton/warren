@@ -497,11 +497,13 @@ async fn run(
                     strategy,
                 } => {
                     // Stand up a data socket, tell the core where to punch back,
-                    // and accept a punch from the initiator on it per `strategy`.
-                    // Decline if the node is bound to an unspecified address: the
-                    // data socket's address would be unspecified too, unpunchable
-                    // by the peer (mirrors the outbound `UnspecifiedLocalAddr`
-                    // check). The initiator simply times out.
+                    // then run the punch primitive `strategy` selects toward the
+                    // initiator (dial-accept on this socket, or spray / open
+                    // birthday sockets). Decline if the node is bound to an
+                    // unspecified address: the data socket's address would be
+                    // unspecified too, unpunchable by the peer (mirrors the
+                    // outbound `UnspecifiedLocalAddr` check); the initiator times
+                    // out.
                     if !data_ip.is_unspecified() {
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
                             if let Ok(data_addr) = data_sock.local_addr() {

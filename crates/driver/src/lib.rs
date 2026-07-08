@@ -640,24 +640,37 @@ struct AcceptJob {
 /// dials the peer's data socket; the birthday roles spray / open sockets toward
 /// the peer's host; `Relay`/`None` report no channel.
 fn spawn_connect_punch(job: PunchJob) {
+    let PunchJob {
+        data_sock,
+        own_host,
+        peer,
+        strategy,
+        outcome,
+        cfg,
+        birthday,
+        seed,
+        tx,
+    } = job;
     tokio::spawn(async move {
-        let channel = match (job.strategy, job.peer) {
-            (Some(Strategy::Direct), Some(peer)) => {
-                punch_direct(job.data_sock, peer, &job.cfg).await
-            }
+        let channel = match (strategy, peer) {
+            (Some(Strategy::Direct), Some(peer)) => punch_direct(data_sock, peer, &cfg).await,
             (Some(Strategy::SprayRandomPorts), Some(peer)) => {
-                punch_spray(job.own_host, peer.ip(), &job.cfg, job.birthday, job.seed).await
+                // The birthday primitives bind their own sockets; free the
+                // pre-bound one now so its FD/port can't collide with them.
+                drop(data_sock);
+                punch_spray(own_host, peer.ip(), &cfg, birthday, seed).await
             }
             (Some(Strategy::OpenBirthdaySockets), Some(peer)) => {
-                punch_open(job.own_host, peer.ip(), &job.cfg, job.birthday, job.seed).await
+                drop(data_sock);
+                punch_open(own_host, peer.ip(), &cfg, birthday, seed).await
             }
             // Relay (no direct data path yet) / no peer to punch to.
-            _ => None,
+            _ => {
+                drop(data_sock);
+                None
+            }
         };
-        let _ = job.tx.send(Ok(Connection {
-            outcome: job.outcome,
-            channel,
-        }));
+        let _ = tx.send(Ok(Connection { outcome, channel }));
     });
 }
 
@@ -665,37 +678,39 @@ fn spawn_connect_punch(job: PunchJob) {
 /// hand the channel to the node's incoming stream. Runs in its own task for the
 /// same reason as [`spawn_connect_punch`].
 fn spawn_accept_punch(job: AcceptJob) {
+    let AcceptJob {
+        data_sock,
+        own_host,
+        peer_host,
+        strategy,
+        cfg,
+        birthday,
+        seed,
+        incoming_tx,
+    } = job;
     tokio::spawn(async move {
-        let channel = match job.strategy {
-            Strategy::Direct => punch_accept(job.data_sock, job.peer_host, &job.cfg).await,
+        let channel = match strategy {
+            Strategy::Direct => punch_accept(data_sock, peer_host, &cfg).await,
             Strategy::SprayRandomPorts => {
-                punch_spray(
-                    job.own_host,
-                    job.peer_host,
-                    &job.cfg,
-                    job.birthday,
-                    job.seed,
-                )
-                .await
+                // Birthday primitives bind their own sockets (see connect side).
+                drop(data_sock);
+                punch_spray(own_host, peer_host, &cfg, birthday, seed).await
             }
             Strategy::OpenBirthdaySockets => {
-                punch_open(
-                    job.own_host,
-                    job.peer_host,
-                    &job.cfg,
-                    job.birthday,
-                    job.seed,
-                )
-                .await
+                drop(data_sock);
+                punch_open(own_host, peer_host, &cfg, birthday, seed).await
             }
-            Strategy::Relay => None,
+            Strategy::Relay => {
+                drop(data_sock);
+                None
+            }
         };
         if let Some(channel) = channel {
             // Non-blocking: if the application isn't draining `next_incoming`
             // (queue full), drop this channel rather than park the task holding
             // its socket. A flood of inbound connects is shed at the queue bound
             // instead of accumulating blocked tasks; the peer can retry.
-            let _ = job.incoming_tx.try_send(channel);
+            let _ = incoming_tx.try_send(channel);
         }
     });
 }

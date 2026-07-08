@@ -205,6 +205,15 @@ fn one_sided_random(
     rng: &mut Rng,
     params: &PunchParams,
 ) -> bool {
+    // The random peer must be able to mint one distinct external port per
+    // birthday socket, so the port space has to be at least that large.
+    let port_space = (params.port_max - params.port_min) as usize + 1;
+    assert!(
+        port_space >= params.birthday_sockets,
+        "port space ({port_space}) is smaller than birthday_sockets ({})",
+        params.birthday_sockets
+    );
+
     let cs = consistent.open_socket();
     let c_ext = consistent.send(cs, RENDEZVOUS);
 

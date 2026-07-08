@@ -7,8 +7,9 @@
 //!   `Consistent`/`Open` use one stable port per local socket (endpoint-
 //!   independent); `Random` (symmetric) allocates a fresh port per destination.
 //! - **Filtering** — which inbound packets are admitted. `Consistent`/`Random`
-//!   are address-restricted: a packet is admitted only from a destination the
-//!   owning socket has already sent to. `Open` admits anything.
+//!   use address-and-port-dependent filtering (RFC 4787): a packet is admitted
+//!   only from the exact IP:port the owning socket has already sent to. `Open`
+//!   admits anything.
 //!
 //! Driving real packets through two `NatBox`es reproduces hole-punch outcomes
 //! from first principles — including the birthday collision — rather than
@@ -37,7 +38,8 @@ pub struct NatBox {
     per_dest_port: HashMap<(SocketId, SocketAddr), u16>,
     /// Which socket owns each allocated external port.
     port_owner: HashMap<u16, SocketId>,
-    /// Address-restricted filter: sources each external port will accept.
+    /// Address-and-port-dependent filter: exact IP:port sources each external
+    /// port will accept.
     port_allow: HashMap<u16, HashSet<SocketAddr>>,
 }
 
@@ -142,7 +144,7 @@ impl NatBox {
         match self.kind {
             // Publicly reachable: any source is admitted to a bound port.
             Firewall::Open => Some(owner),
-            // Address-restricted: only from a destination we've sent to.
+            // Address-and-port-dependent: only from an exact IP:port sent to.
             Firewall::Consistent | Firewall::Random => {
                 if self.port_allow.get(&port)?.contains(&from) {
                     Some(owner)

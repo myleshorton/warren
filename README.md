@@ -1,4 +1,6 @@
-# holepunch (working name)
+# Warren
+
+*A warren is a network of interconnected burrows — many entrances, no center.*
 
 A fully decentralized, serverless peer-to-peer stack in Rust — the substrate for a
 P2P video platform for non-copyrighted content. Design rationale lives in

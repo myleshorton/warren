@@ -21,13 +21,104 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 
-use swarm::dht::{ConnectOutcome, Dht, Event};
+use swarm::dht::{Dht, Event};
 use swarm::{Contact, NodeId, QueryId};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
+
+pub use puncher::Config as PunchConfig;
+pub use swarm::dht::ConnectOutcome;
+
+/// A live, bidirectional data channel to a peer, established by a hole punch —
+/// a socket already reaching the peer, over which application bytes flow.
+///
+/// Where [`Node::connect`] reports *whether* a peer is reachable (a
+/// [`ConnectOutcome`]), a `Channel` is the *usable* path you then establish with
+/// [`open_channel`] / [`DataListener`]. Built on the [`puncher`] primitives.
+#[derive(Debug)]
+pub struct Channel {
+    socket: UdpSocket,
+    peer: SocketAddr,
+}
+
+impl Channel {
+    /// The peer on the far end of the channel.
+    pub fn peer(&self) -> SocketAddr {
+        self.peer
+    }
+
+    /// Send application bytes to the peer.
+    pub async fn send(&self, data: &[u8]) -> io::Result<usize> {
+        self.socket.send(data).await
+    }
+
+    /// Receive application bytes from the peer. The socket is connected to the
+    /// peer (see [`open_channel`] / [`DataListener::accept`]), so the OS drops
+    /// datagrams from any other source before they reach us — no user-space
+    /// filtering, and stray traffic can't be read as channel data.
+    pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+        self.socket.recv(buf).await
+    }
+}
+
+/// Open a data channel to a reachable peer at `peer`, punching from a fresh
+/// socket bound at `bind`. `Ok(None)` means the punch didn't complete in time.
+pub async fn open_channel(
+    bind: SocketAddr,
+    peer: SocketAddr,
+    cfg: &PunchConfig,
+) -> io::Result<Option<Channel>> {
+    let socket = UdpSocket::bind(bind).await?;
+    connect_channel(puncher::connect_to(socket, peer, cfg).await?).await
+}
+
+/// Turn a punched [`puncher::Established`] into a [`Channel`], connecting the
+/// socket to the confirmed peer so the OS filters out every other source. Shared
+/// by both the dial ([`open_channel`]) and accept ([`DataListener::accept`])
+/// paths so they can't drift.
+async fn connect_channel(established: Option<puncher::Established>) -> io::Result<Option<Channel>> {
+    match established {
+        Some(e) => {
+            e.socket.connect(e.peer).await?;
+            Ok(Some(Channel {
+                socket: e.socket,
+                peer: e.peer,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// A bound socket awaiting an inbound data channel (the reachable side). Expose
+/// [`DataListener::local_addr`] to the peer, then [`DataListener::accept`].
+#[derive(Debug)]
+pub struct DataListener {
+    socket: UdpSocket,
+}
+
+impl DataListener {
+    /// Bind a listener at `bind`.
+    pub async fn bind(bind: SocketAddr) -> io::Result<Self> {
+        Ok(Self {
+            socket: UdpSocket::bind(bind).await?,
+        })
+    }
+
+    /// The address to advertise to a peer that will `open_channel` to us.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.socket.local_addr()
+    }
+
+    /// Accept one inbound channel from a peer at `peer_host`. `Ok(None)` means
+    /// none arrived in time. Only a punch from `peer_host` is accepted, so an
+    /// off-path host that learns the advertised address can't race the peer.
+    pub async fn accept(self, peer_host: IpAddr, cfg: &PunchConfig) -> io::Result<Option<Channel>> {
+        connect_channel(puncher::accept(self.socket, peer_host, cfg).await?).await
+    }
+}
 
 /// Largest datagram we read. A `Nodes` reply (up to `K` contacts + `K` peers,
 /// each 39 bytes for a v4 address or 51 for v6) fits comfortably inside this.

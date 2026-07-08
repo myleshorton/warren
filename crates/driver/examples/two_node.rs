@@ -3,7 +3,7 @@
 //!
 //! Run with: `cargo run -p driver --example two_node`
 
-use driver::Node;
+use driver::{open_channel, DataListener, Node, PunchConfig};
 use swarm::sim::Rng;
 
 #[tokio::main]
@@ -49,5 +49,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let outcome = client.connect(server.id()).await?;
     println!("client connected to server over real UDP -> {outcome:?}");
+
+    // Now turn that into a live data channel: the server stands up a listener,
+    // the client punches a channel to it, and they exchange application bytes.
+    let listener = DataListener::bind("127.0.0.1:0".parse().unwrap()).await?;
+    let data_addr = listener.local_addr()?;
+    // One config drives both sides, so dial and accept can't diverge.
+    let cfg = PunchConfig::default();
+    // peer_host is the *dialer's* host: the client punches from loopback (`lo`),
+    // and the listener only accepts a punch coming from that host.
+    let peer_host = lo.ip();
+    let accept = tokio::spawn(async move { listener.accept(peer_host, &cfg).await });
+
+    let chan = open_channel(lo, data_addr, &cfg)
+        .await?
+        .expect("channel established");
+    let server_chan = accept.await??.expect("server channel");
+
+    chan.send(b"hello over the punched channel").await?;
+    let mut buf = [0u8; 64];
+    let n = server_chan.recv(&mut buf).await?;
+    println!(
+        "server received {} bytes: {:?}",
+        n,
+        String::from_utf8_lossy(&buf[..n])
+    );
     Ok(())
 }

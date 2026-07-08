@@ -122,6 +122,38 @@ fn connect_outcomes_match_nat_pairing() {
 }
 
 #[test]
+fn connect_times_out_when_signaling_cannot_complete() {
+    // Server announces, then goes offline. The client still discovers a
+    // coordinator (which holds the record), signals it, but the forward to the
+    // now-unreachable server is dropped — so the connect must fail with TimedOut
+    // rather than hang forever.
+    let mut sim = backbone(12, 0xF00D);
+    let server = join(&mut sim, NatKind::Consistent);
+    let server_id = sim.dht(server).id();
+    sim.announce(server, server_id);
+    sim.run(100_000);
+    sim.take_events();
+
+    sim.disable_node(server);
+
+    let client = join(&mut sim, NatKind::Consistent);
+    sim.connect(client, server_id);
+    sim.run(1_000_000);
+
+    let outcome = sim
+        .take_events()
+        .into_iter()
+        .find_map(|(node, ev)| match ev {
+            Event::Connected { target, outcome } if node == client && target == server_id => {
+                Some(outcome)
+            }
+            _ => None,
+        })
+        .expect("connect should resolve (to TimedOut), never hang");
+    assert_eq!(outcome, ConnectOutcome::TimedOut);
+}
+
+#[test]
 fn connecting_to_an_unannounced_peer_reports_not_found() {
     let mut sim = backbone(12, 0xDEAD);
     let client = join(&mut sim, NatKind::Consistent);

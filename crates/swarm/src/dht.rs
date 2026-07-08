@@ -28,6 +28,9 @@ pub const ALPHA: usize = 3;
 /// How long (ms) to wait for a response before treating a request as failed.
 pub const REQUEST_TIMEOUT_MS: u64 = 1_000;
 
+/// How long (ms) to wait for a connect's signaling to complete before giving up.
+pub const CONNECT_TIMEOUT_MS: u64 = 10_000;
+
 /// Milliseconds since an arbitrary epoch chosen by the caller.
 pub type Millis = u64;
 
@@ -54,6 +57,8 @@ pub enum ConnectOutcome {
     Relayed,
     /// The target could not be found on the DHT (not announced).
     NotFound,
+    /// The target was found but signaling did not complete before the deadline.
+    TimedOut,
 }
 
 /// Something the DHT wants the caller to know about.
@@ -169,8 +174,8 @@ pub struct Dht {
     local_firewall: Firewall,
     /// topic -> peers that have announced under it (records this node stores).
     announces: HashMap<NodeId, Vec<Contact>>,
-    /// Targets we are mid-connect to, awaiting a signaling reply.
-    connecting: std::collections::HashSet<NodeId>,
+    /// Targets we are mid-connect to -> deadline by which signaling must finish.
+    connecting: HashMap<NodeId, Millis>,
     outbox: Vec<Transmit>,
     events: Vec<Event>,
     next_rid: u64,
@@ -190,7 +195,7 @@ impl Dht {
             self_reachable: false,
             local_firewall: Firewall::Open,
             announces: HashMap::new(),
-            connecting: std::collections::HashSet::new(),
+            connecting: HashMap::new(),
             outbox: Vec::new(),
             events: Vec::new(),
             next_rid: 1,
@@ -288,7 +293,7 @@ impl Dht {
     /// punch through a node that holds its announce record. Completion is
     /// reported as an [`Event::Connected`].
     pub fn connect(&mut self, target: NodeId, now: Millis) -> QueryId {
-        self.connecting.insert(target);
+        self.connecting.insert(target, now + CONNECT_TIMEOUT_MS);
         self.start_query(target, QueryKind::Connect, now)
     }
 
@@ -381,14 +386,30 @@ impl Dht {
 
         // Expire NAT probes; a lost Pong simply yields one fewer sample.
         self.nat_pending.retain(|_, deadline| *deadline > now);
+
+        // Fail connects whose signaling never completed, so they can't hang.
+        let stale: Vec<NodeId> = self
+            .connecting
+            .iter()
+            .filter(|(_, &deadline)| deadline <= now)
+            .map(|(target, _)| *target)
+            .collect();
+        for target in stale {
+            self.connecting.remove(&target);
+            self.events.push(Event::Connected {
+                target,
+                outcome: ConnectOutcome::TimedOut,
+            });
+        }
     }
 
-    /// The earliest pending deadline, if any request is in flight.
+    /// The earliest pending deadline, if any request or connect is in flight.
     pub fn poll_timeout(&self) -> Option<Millis> {
         self.pending
             .values()
             .map(|p| p.deadline)
             .chain(self.nat_pending.values().copied())
+            .chain(self.connecting.values().copied())
             .min()
     }
 
@@ -646,12 +667,20 @@ impl Dht {
             }
         } else if initiator == self.id {
             // We are the initiator: the reply carries the target's firewall.
-            if self.connecting.remove(&target) {
+            if self.connecting.remove(&target).is_some() {
                 let outcome = outcome_for(self.local_firewall, nat);
                 self.events.push(Event::Connected { target, outcome });
             }
-        } else if self.announces.contains_key(&target) {
-            // We are the coordinator relaying the reply back to the initiator.
+        } else if self
+            .announces
+            .get(&target)
+            .is_some_and(|recs| recs.iter().any(|c| c.addr == from))
+        {
+            // We are the coordinator relaying the reply — but only if it truly
+            // came from a recorded target address. Otherwise an arbitrary host
+            // could spoof a reply to use us as a reflector or feed the initiator
+            // a bogus firewall type. (Full authentication — a Noise handshake and
+            // capability tokens, as in HyperDHT — is future work.)
             let rid = self.alloc_rid();
             self.send(
                 initiator_addr,

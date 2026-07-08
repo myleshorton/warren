@@ -71,6 +71,7 @@ fn main() {
             ConnectOutcome::Punched => "hole punched (birthday)",
             ConnectOutcome::Relayed => "via coordinator relay",
             ConnectOutcome::NotFound => "not found",
+            ConnectOutcome::TimedOut => "timed out",
         };
         println!("  client {client_nat:?} -> server {server_nat:?}  =>  {outcome:?} ({note})");
     }

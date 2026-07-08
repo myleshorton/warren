@@ -186,10 +186,12 @@ fn encode_contacts(enc: &mut Encoder, contacts: &[Contact]) {
 }
 
 fn decode_contacts<'a>(dec: &mut Decoder<'a>) -> Result<Vec<Contact>, MsgError> {
+    // A contact is at minimum an id + an address-family tag + a v4 address:
+    // 32 + 1 + (4 + 2) bytes. Bounding the count by this (not by raw remaining
+    // bytes) stops a crafted length from forcing an allocation ~40x the buffer.
+    const MIN_CONTACT_BYTES: u64 = ID_LEN as u64 + 1 + 4 + 2;
     let n = dec.uint()?;
-    // Each contact is at least 32 + 1 + 2 bytes; reject counts that cannot
-    // possibly fit so a bad length can't drive a huge allocation.
-    if n > dec.remaining() as u64 {
+    if n > dec.remaining() as u64 / MIN_CONTACT_BYTES {
         return Err(MsgError::Malformed("contact count exceeds buffer"));
     }
     let mut contacts = Vec::with_capacity(n as usize);

@@ -11,7 +11,7 @@ use crate::id::{NodeId, ID_LEN};
 use crate::nat::Firewall;
 use crate::routing::Contact;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 /// Small, fast, seedable PRNG (SplitMix64). Deterministic across platforms.
@@ -116,6 +116,8 @@ pub struct Sim {
     loss: f64,
     seed: u64,
     rng: Rng,
+    /// Nodes that have gone "offline": packets to them are dropped.
+    disabled: HashSet<usize>,
     events: Vec<(usize, Event)>,
 }
 
@@ -133,6 +135,7 @@ impl Sim {
             loss: 0.0,
             seed,
             rng: Rng::new(seed),
+            disabled: HashSet::new(),
             events: Vec::new(),
         }
     }
@@ -140,6 +143,12 @@ impl Sim {
     /// Set the packet loss probability in `[0, 1)`.
     pub fn set_loss(&mut self, loss: f64) {
         self.loss = loss;
+    }
+
+    /// Take a node "offline": packets addressed to it are dropped, modeling a
+    /// peer that has left the network.
+    pub fn disable_node(&mut self, i: usize) {
+        self.disabled.insert(i);
     }
 
     /// Borrow the simulator's PRNG (e.g. to mint node ids).
@@ -279,6 +288,9 @@ impl Sim {
                 let Some(to) = self.resolve(&t.to) else {
                     continue; // unknown destination: dropped, as on a real net
                 };
+                if self.disabled.contains(&to) {
+                    continue; // recipient is offline
+                }
                 if self.loss > 0.0 && self.rng.unit() < self.loss {
                     continue; // simulated packet loss
                 }

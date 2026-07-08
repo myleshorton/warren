@@ -11,17 +11,19 @@
 //! - [`msg`]: the DHT RPC wire format (over the `wire` codec).
 //! - [`dht`]: the sans-IO core with iterative Kademlia lookup.
 //! - [`nat`]: NAT self-classification from address samples.
-//! - [`punch`]: hole-punch strategy selection and the birthday-paradox model.
+//! - [`natbox`]: packet-level NAT model (mapping + filtering) for one endpoint.
+//! - [`punch`]: hole-punch strategy, the birthday model, and a packet-level punch.
 //! - [`sim`]: the deterministic network simulator used for verification.
 //!
-//! Still to come (see the design doc): wiring NAT classification into the DHT's
-//! ping sampling, a NAT-translating packet simulator to exercise real punch
-//! flows end to end, port mapping, a real UDP driver, and QUIC on punched paths.
+//! Still to come (see the design doc): coordinating a punch over the live DHT
+//! (relay-brokered address exchange), port mapping, a real UDP driver, and QUIC
+//! on punched paths.
 
 pub mod dht;
 pub mod id;
 pub mod msg;
 pub mod nat;
+pub mod natbox;
 pub mod punch;
 pub mod routing;
 pub mod sim;
@@ -30,5 +32,6 @@ pub use dht::{Dht, Event, Millis, QueryId, Transmit, ALPHA, REQUEST_TIMEOUT_MS};
 pub use id::{Distance, NodeId, ID_LEN};
 pub use msg::{Message, Packet};
 pub use nat::{Firewall, NatSampler};
-pub use punch::{attempt_punch, plan, Outcome, PunchParams, Strategy};
+pub use natbox::{NatBox, SocketId};
+pub use punch::{attempt_punch, packet_punch, plan, Outcome, PunchParams, Strategy};
 pub use routing::{Contact, RoutingTable, K};

@@ -16,8 +16,19 @@
 //! someone weakens them.
 
 use crate::nat::Firewall;
+use crate::natbox::NatBox;
 use crate::sim::Rng;
 use std::collections::HashSet;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+/// A public rendezvous both peers can reach, used only so a predictable side
+/// learns (and can share) its own external port before the punch — standing in
+/// for the DHT relay node that brokers a real punch.
+const RENDEZVOUS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 9999);
+
+fn host(octet: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(10, 0, 0, octet))
+}
 
 /// Sockets the Random side opens simultaneously (each mints one external port).
 pub const BIRTHDAY_SOCKETS: usize = 256;
@@ -135,6 +146,135 @@ pub fn attempt_punch(
         Strategy::Relay => Outcome::Relayed,
         Strategy::SprayRandomPorts | Strategy::OpenBirthdaySockets => {
             if simulate_birthday(rng, params) {
+                Outcome::Punched
+            } else {
+                Outcome::Relayed
+            }
+        }
+    }
+}
+
+/// Connect to a publicly-reachable `server` by dialing it: the dialer sends
+/// first, the server admits it (Open accepts any source) and replies to the
+/// observed source, which the dialer's own filter admits because it sent there.
+/// Works for any dialer NAT type — this is why any pair involving an Open peer
+/// connects directly.
+fn dial_reachable(dialer: &mut NatBox, server: &mut NatBox) -> bool {
+    let ss = server.open_socket();
+    let server_ext = server.send(ss, RENDEZVOUS);
+    let sd = dialer.open_socket();
+    let dialer_ext = dialer.send(sd, server_ext);
+    if server.recv(server_ext.port(), dialer_ext).is_none() {
+        return false;
+    }
+    server.send(ss, dialer_ext);
+    dialer.recv(dialer_ext.port(), server_ext).is_some()
+}
+
+/// Establish a direct connection between two predictable-port peers via
+/// simultaneous open: each learns the other's stable external address, then both
+/// send, opening each address-restricted filter. Returns whether traffic flows
+/// both ways.
+fn direct_open(a: &mut NatBox, b: &mut NatBox) -> bool {
+    let sa = a.open_socket();
+    let sb = b.open_socket();
+    let a_ext = a.send(sa, RENDEZVOUS);
+    let b_ext = b.send(sb, RENDEZVOUS);
+    // Two rounds so both filters open regardless of arrival order.
+    for _ in 0..2 {
+        a.send(sa, b_ext);
+        b.send(sb, a_ext);
+    }
+    let a_to_b = b.recv(b_ext.port(), a_ext).is_some();
+    let b_to_a = a.recv(a_ext.port(), b_ext).is_some();
+    a_to_b && b_to_a
+}
+
+/// Run a one-sided-random punch with real packets: the random peer opens many
+/// sockets toward the consistent peer's known port (minting one external port
+/// each), and the consistent peer sprays random guesses. Success is a guess
+/// that lands on an opened port — at which point both filters already admit the
+/// other, so the channel is bidirectional.
+fn one_sided_random(
+    random: &mut NatBox,
+    consistent: &mut NatBox,
+    rng: &mut Rng,
+    params: &PunchParams,
+) -> bool {
+    let cs = consistent.open_socket();
+    let c_ext = consistent.send(cs, RENDEZVOUS);
+
+    let mut opened = HashSet::new();
+    for _ in 0..params.birthday_sockets {
+        let s = random.open_socket();
+        let ext = random.send(s, c_ext);
+        opened.insert(ext.port());
+    }
+
+    let r_host = random.host();
+    for _ in 0..params.spray_probes {
+        let guess = params.random_port(rng);
+        let guess_addr = SocketAddr::new(r_host, guess);
+        // Spraying opens the consistent side's filter toward this address.
+        consistent.send(cs, guess_addr);
+        // If the guess hit an opened socket, the random side admits it (it
+        // already sent to the consistent side)...
+        if random.recv(guess, c_ext).is_some() {
+            // ...and the reply is admitted by the consistent side, since the
+            // winning spray just opened its filter toward this exact address.
+            let r_ext = SocketAddr::new(r_host, guess);
+            if consistent.recv(c_ext.port(), r_ext).is_some() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Attempt a punch with a full packet-level NAT model (mapping + filtering),
+/// rather than the probabilistic abstraction of [`attempt_punch`]. The outcome
+/// emerges from packets traversing two [`NatBox`]es.
+pub fn packet_punch(
+    local: Firewall,
+    remote: Firewall,
+    rng: &mut Rng,
+    params: &PunchParams,
+) -> Outcome {
+    match plan(local, remote) {
+        Strategy::Relay => Outcome::Relayed,
+        Strategy::Direct => {
+            let mut a = NatBox::new(local, host(1));
+            let mut b = NatBox::new(remote, host(2));
+            // "Direct" has two mechanisms: dial a reachable (Open) peer, or a
+            // simultaneous open between two predictable-port peers.
+            let ok = if remote == Firewall::Open {
+                dial_reachable(&mut a, &mut b)
+            } else if local == Firewall::Open {
+                dial_reachable(&mut b, &mut a)
+            } else {
+                direct_open(&mut a, &mut b)
+            };
+            if ok {
+                Outcome::Direct
+            } else {
+                Outcome::Relayed
+            }
+        }
+        Strategy::SprayRandomPorts => {
+            // We are the consistent side (spraying); the peer is random.
+            let mut consistent = NatBox::new(local, host(1));
+            let mut random = NatBox::new(remote, host(2));
+            if one_sided_random(&mut random, &mut consistent, rng, params) {
+                Outcome::Punched
+            } else {
+                Outcome::Relayed
+            }
+        }
+        Strategy::OpenBirthdaySockets => {
+            // We are the random side (opening sockets); the peer is consistent.
+            let mut random = NatBox::new(local, host(1));
+            let mut consistent = NatBox::new(remote, host(2));
+            if one_sided_random(&mut random, &mut consistent, rng, params) {
                 Outcome::Punched
             } else {
                 Outcome::Relayed

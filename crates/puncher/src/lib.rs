@@ -113,9 +113,13 @@ pub async fn connect_to(
         // Read until this probe's window elapses, so stray datagrams that return
         // early don't make us re-probe faster than `probe_interval`.
         loop {
-            let remaining = cfg.probe_interval.saturating_sub(sent_at.elapsed());
+            // Wait out this probe's window, but never past the overall deadline.
+            let remaining = cfg
+                .probe_interval
+                .saturating_sub(sent_at.elapsed())
+                .min(deadline.saturating_duration_since(Instant::now()));
             if remaining.is_zero() {
-                break; // window over: send the next probe
+                break; // window over (or deadline reached): send next / give up
             }
             match timeout(remaining, socket.recv_from(&mut buf)).await {
                 Ok(Ok((n, from))) if from == peer && is_control_msg(&buf[..n]) => {
@@ -275,8 +279,11 @@ pub async fn spray(
         // reply wait, not a send-rate cap — racing a NAT's mappings wants many
         // probes in flight. Only a single-byte control reply from the targeted
         // host counts; timeouts, strays, and transient recv errors all just move
-        // on to the next port.
-        match timeout(cfg.probe_interval, socket.recv_from(&mut buf)).await {
+        // on to the next port. The wait is capped by the overall deadline.
+        let wait = cfg
+            .probe_interval
+            .min(deadline.saturating_duration_since(Instant::now()));
+        match timeout(wait, socket.recv_from(&mut buf)).await {
             Ok(Ok((n, from))) if from.ip() == peer_host && is_control_msg(&buf[..n]) => {
                 // Normally the reply is an ACK; if it's a PROBE, answer it so the
                 // peer establishes too.

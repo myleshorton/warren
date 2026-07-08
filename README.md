@@ -58,17 +58,20 @@ crates/
             + hole-punch strategy/birthday model + packet-level NAT model
             + announce/lookup + DHT-coordinated connect (discovery →
               coordinator-brokered signaling → punch)
+            + Reflect/Reflected: a reflexive (STUN-like) probe a peer echoes,
+              exempt from routing so a transient socket can't poison the table
   driver    tokio UDP driver: the sans-IO core over real sockets, async API
             + Channel/DataListener: live data channels via the puncher
             + connect(id) -> Connection { outcome, channel }: discover +
               coordinate + punch in one call; inbound channels surfaced via
               Node::next_incoming; symmetric-NAT (Punched) connects run the
               birthday spray/open-sockets punch, chosen by the resolved strategy
+            + reflexive discovery: connect probes a reflector to advertise the
+              data socket's external address (so a NATed dialer is punchable)
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
 
-  next: reflexive discovery of the data socket's external mapping (so real
-        Consistent-NAT peers advertise a punchable address), port mapping,
-        blob, log, ...
+  next: reflexive discovery on the accept side too (a NATed target advertises
+        its external data address in the reply), port mapping, blob, log, ...
 ```
 
 Try it:

@@ -27,9 +27,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use swarm::dht::{Dht, Event};
-use swarm::{Contact, NodeId, QueryId, Strategy};
+use swarm::{Contact, Message, NodeId, Packet, QueryId, Strategy};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::time::timeout;
 
 pub use puncher::Config as PunchConfig;
 pub use swarm::dht::ConnectOutcome;
@@ -164,6 +165,11 @@ impl DataListener {
 /// each 39 bytes for a v4 address or 51 for v6) fits comfortably inside this.
 const RECV_BUF: usize = 4096;
 
+/// Reflectors to try when discovering a data socket's external address.
+const REFLECTORS: usize = 3;
+/// How long to wait for each reflector to echo before trying the next.
+const REFLECT_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// A driver operation failed because the node's task is no longer running.
 ///
 /// Distinct from an operation's own result (e.g. an empty lookup or a
@@ -255,6 +261,7 @@ enum Command {
     Lookup(NodeId, oneshot::Sender<Vec<Contact>>),
     Connect(NodeId, UdpSocket, SocketAddr, oneshot::Sender<ConnectReply>),
     SetFirewall(Firewall),
+    Reflectors(oneshot::Sender<Vec<SocketAddr>>),
 }
 
 /// A handle to a running DHT node backed by a real UDP socket.
@@ -369,7 +376,9 @@ impl Node {
     ///
     /// The data socket is bound here (not in the actor) so a local bind failure
     /// surfaces as [`ConnectError::Bind`] rather than being conflated with the
-    /// node shutting down.
+    /// node shutting down. Its externally-observed address is discovered via a
+    /// reflexive probe (so a NATed peer learns a punchable address) before being
+    /// advertised through the DHT signaling.
     pub async fn connect(&self, target: NodeId) -> std::result::Result<Connection, ConnectError> {
         // The data socket's address is advertised to the peer as the punch
         // target, so it must be concrete. A node bound to 0.0.0.0/:: has no such
@@ -380,10 +389,14 @@ impl Node {
         let data_sock = UdpSocket::bind(SocketAddr::new(self.local_addr.ip(), 0))
             .await
             .map_err(ConnectError::Bind)?;
-        let data_addr = data_sock.local_addr().map_err(ConnectError::Bind)?;
+        let local = data_sock.local_addr().map_err(ConnectError::Bind)?;
+        // Learn the data socket's external mapping from a reflector; falls back to
+        // `local` if none answers (correct on an unNATed host).
+        let reflectors = self.reflectors().await.map_err(|_| ConnectError::Closed)?;
+        let advertised = reflexive_addr(&data_sock, self.id, local, &reflectors).await;
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(Command::Connect(target, data_sock, data_addr, tx))
+            .send(Command::Connect(target, data_sock, advertised, tx))
             .await
             .map_err(|_| ConnectError::Closed)?;
         match rx.await {
@@ -399,6 +412,11 @@ impl Node {
     /// node shuts down).
     pub async fn next_incoming(&self) -> Result<Channel> {
         self.incoming.lock().await.recv().await.ok_or(Closed)
+    }
+
+    /// A few known peers to use as reflexive-probe reflectors (closest to us).
+    async fn reflectors(&self) -> Result<Vec<SocketAddr>> {
+        self.request(Command::Reflectors).await
     }
 
     /// Send a command carrying a reply channel and await its result, mapping a
@@ -576,6 +594,11 @@ async fn run(
                         }
                     }
                     Some(Command::SetFirewall(fw)) => dht.set_firewall(fw),
+                    Some(Command::Reflectors(tx)) => {
+                        let id = dht.id();
+                        let addrs = dht.closest(&id, REFLECTORS).into_iter().map(|c| c.addr).collect();
+                        let _ = tx.send(addrs);
+                    }
                 }
             }
             recv = socket.recv_from(&mut buf) => {
@@ -717,6 +740,43 @@ fn spawn_accept_punch(job: AcceptJob) {
     });
 }
 
+/// Discover `sock`'s externally-observed address by asking reflectors to echo
+/// the source they see (a STUN-like probe with [`Message::Reflect`]). Returns
+/// the first echoed address, or `local` if no reflector answers — correct on an
+/// unNATed host, and a NATed host with no reachable reflector can't be punched
+/// to anyway. Only a reply from the queried reflector is accepted.
+async fn reflexive_addr(
+    sock: &UdpSocket,
+    id: NodeId,
+    local: SocketAddr,
+    reflectors: &[SocketAddr],
+) -> SocketAddr {
+    let probe = Packet {
+        sender: id,
+        rid: 0,
+        msg: Message::Reflect,
+    }
+    .encode();
+    let mut buf = [0u8; 128];
+    for &reflector in reflectors {
+        if sock.send_to(&probe, reflector).await.is_err() {
+            continue;
+        }
+        if let Ok(Ok((n, from))) = timeout(REFLECT_TIMEOUT, sock.recv_from(&mut buf)).await {
+            if from == reflector {
+                if let Ok(Packet {
+                    msg: Message::Reflected { observed },
+                    ..
+                }) = Packet::decode(&buf[..n])
+                {
+                    return observed;
+                }
+            }
+        }
+    }
+    local
+}
+
 /// Dial a reachable peer on the pre-bound socket.
 async fn punch_direct(sock: UdpSocket, peer: SocketAddr, cfg: &PunchConfig) -> Option<Channel> {
     match puncher::connect_to(sock, peer, cfg).await {
@@ -759,5 +819,46 @@ async fn punch_open(
     match puncher::open_birthday_sockets(own_host, peer_host, b.range, b.sockets, seed, cfg).await {
         Ok(est) => connect_channel(est).await.ok().flatten(),
         Err(_) => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lo() -> SocketAddr {
+        "127.0.0.1:0".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn reflexive_addr_learns_the_socket_address() {
+        // A reflector node echoes the source it observes; on loopback that's the
+        // probe socket's own address, so the discovered address equals it.
+        let reflector = Node::bind(lo(), NodeId::from_bytes([9u8; 32]))
+            .await
+            .unwrap();
+        let sock = UdpSocket::bind(lo()).await.unwrap();
+        let local = sock.local_addr().unwrap();
+
+        let observed = reflexive_addr(
+            &sock,
+            NodeId::from_bytes([1u8; 32]),
+            local,
+            &[reflector.local_addr()],
+        )
+        .await;
+        assert_eq!(
+            observed, local,
+            "the reflexive probe should learn the socket's own address on loopback"
+        );
+    }
+
+    #[tokio::test]
+    async fn reflexive_addr_falls_back_with_no_reflectors() {
+        // No reflector to ask: fall back to the local address.
+        let sock = UdpSocket::bind(lo()).await.unwrap();
+        let local = sock.local_addr().unwrap();
+        let observed = reflexive_addr(&sock, NodeId::from_bytes([1u8; 32]), local, &[]).await;
+        assert_eq!(observed, local);
     }
 }

@@ -429,8 +429,11 @@ impl Dht {
         let Ok(packet) = Packet::decode(data) else {
             return;
         };
-        // Every packet is direct evidence the sender is reachable at `from`.
-        if packet.sender != self.id {
+        // Most packets are direct evidence the sender is reachable at `from`, so
+        // fold it into the routing table. A `Reflect` is the exception: it comes
+        // from a transient data socket (a reflexive probe), not a routable peer,
+        // so inserting it would poison routing with an ephemeral address.
+        if packet.sender != self.id && !matches!(&packet.msg, Message::Reflect) {
             self.table.insert(Contact::new(packet.sender, from));
         }
 
@@ -461,6 +464,15 @@ impl Dht {
                 if self.responsible_for(&topic) {
                     self.store_announce(topic, Contact::new(packet.sender, from));
                 }
+            }
+            Message::Reflect => {
+                // Echo the observed source so a peer can learn its externally
+                // mapped (post-NAT) address for the socket it probed from.
+                self.send(from, packet.rid, Message::Reflected { observed: from });
+            }
+            Message::Reflected { .. } => {
+                // A reply to our reflexive probe. The DHT core doesn't probe (the
+                // driver does, on its data socket), so nothing to do here.
             }
             Message::Signal {
                 target,
@@ -1022,5 +1034,47 @@ mod tests {
             !reply_dests.contains(&coord_b),
             "a replay must not redirect the reply to its coordinator"
         );
+    }
+
+    /// A `Reflect` is echoed to its source but, unlike a `Ping`, does not add the
+    /// (transient data-socket) sender to routing — otherwise a reflexive probe
+    /// would poison the table with an ephemeral address.
+    #[test]
+    fn reflect_is_echoed_without_poisoning_routing() {
+        let mut dht = Dht::new(id(1));
+        // Stands in for a NAT-mapped data-socket source.
+        let prober = addr("203.0.113.7:51000");
+
+        let reflect = Packet {
+            sender: id(2),
+            rid: 5,
+            msg: Message::Reflect,
+        }
+        .encode();
+        dht.handle_input(prober, &reflect, 0);
+
+        let replies: Vec<_> = std::iter::from_fn(|| dht.poll_transmit()).collect();
+        assert_eq!(replies.len(), 1, "a Reflect must be answered once");
+        assert_eq!(replies[0].to, prober);
+        assert_eq!(
+            Packet::decode(&replies[0].data).unwrap().msg,
+            Message::Reflected { observed: prober },
+            "Reflected must echo the observed source"
+        );
+        assert_eq!(
+            dht.routing_len(),
+            0,
+            "a Reflect must not add the transient prober to routing"
+        );
+
+        // Contrast: a Ping from the same peer *is* routing evidence.
+        let ping = Packet {
+            sender: id(2),
+            rid: 6,
+            msg: Message::Ping,
+        }
+        .encode();
+        dht.handle_input(prober, &ping, 0);
+        assert_eq!(dht.routing_len(), 1, "a Ping is routing evidence");
     }
 }

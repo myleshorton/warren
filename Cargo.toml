@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/myleshorton/holepunch"
+rust-version = "1.85"
+
+[workspace.dependencies]
+thiserror = "2"
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

@@ -1,0 +1,18 @@
+[package]
+name = "swarm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+wire = { path = "../wire" }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[[example]]
+name = "dht_sim"

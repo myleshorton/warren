@@ -29,8 +29,8 @@ use swarm::{Contact, NodeId, QueryId};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
-/// Largest datagram we read. A `Nodes` reply (up to `K` contacts + `K` peers at
-/// ~39 bytes each) fits comfortably inside this.
+/// Largest datagram we read. A `Nodes` reply (up to `K` contacts + `K` peers,
+/// each 39 bytes for a v4 address or 51 for v6) fits comfortably inside this.
 const RECV_BUF: usize = 4096;
 
 /// A driver operation failed because the node's task is no longer running.

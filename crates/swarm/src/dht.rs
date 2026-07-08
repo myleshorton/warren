@@ -200,8 +200,8 @@ pub struct Dht {
     /// redirect the relayed reply to an arbitrary victim (nor to an initiator of
     /// some other connect).
     seen_initiators: VecDeque<(NodeId, SocketAddr)>,
-    outbox: Vec<Transmit>,
-    events: Vec<Event>,
+    outbox: VecDeque<Transmit>,
+    events: VecDeque<Event>,
     next_rid: u64,
     next_qid: QueryId,
 }
@@ -221,8 +221,8 @@ impl Dht {
             announces: HashMap::new(),
             connecting: HashMap::new(),
             seen_initiators: VecDeque::new(),
-            outbox: Vec::new(),
-            events: Vec::new(),
+            outbox: VecDeque::new(),
+            events: VecDeque::new(),
             next_rid: 1,
             next_qid: 1,
         }
@@ -432,7 +432,7 @@ impl Dht {
             // Stop any still-running discovery for this target so it can't emit
             // a late Signal after we've already reported TimedOut.
             self.cancel_connect_queries(&target);
-            self.events.push(Event::Connected {
+            self.events.push_back(Event::Connected {
                 target,
                 outcome: ConnectOutcome::TimedOut,
             });
@@ -449,22 +449,15 @@ impl Dht {
             .min()
     }
 
-    /// Take the next packet to transmit, if any.
+    /// Take the next packet to transmit, if any. O(1) via a front pop, so
+    /// draining a full outbox is O(n) rather than O(n²).
     pub fn poll_transmit(&mut self) -> Option<Transmit> {
-        if self.outbox.is_empty() {
-            None
-        } else {
-            Some(self.outbox.remove(0))
-        }
+        self.outbox.pop_front()
     }
 
-    /// Take the next event, if any.
+    /// Take the next event, if any. O(1) front pop (see [`Dht::poll_transmit`]).
     pub fn poll_event(&mut self) -> Option<Event> {
-        if self.events.is_empty() {
-            None
-        } else {
-            Some(self.events.remove(0))
-        }
+        self.events.pop_front()
     }
 
     fn send(&mut self, to: SocketAddr, rid: u64, msg: Message) {
@@ -474,7 +467,7 @@ impl Dht {
             msg,
         }
         .encode();
-        self.outbox.push(Transmit { to, data });
+        self.outbox.push_back(Transmit { to, data });
     }
 
     fn on_nodes_response(
@@ -666,14 +659,14 @@ impl Dht {
     ) {
         match kind {
             QueryKind::FindNode => {
-                self.events.push(Event::QueryFinished {
+                self.events.push_back(Event::QueryFinished {
                     query: qid,
                     target,
                     closest,
                 });
             }
             QueryKind::Lookup => {
-                self.events.push(Event::LookupFinished {
+                self.events.push_back(Event::LookupFinished {
                     topic: target,
                     peers,
                 });
@@ -684,7 +677,8 @@ impl Dht {
                     let rid = self.alloc_rid();
                     self.send(c.addr, rid, Message::Announce { topic: target });
                 }
-                self.events.push(Event::AnnounceFinished { topic: target });
+                self.events
+                    .push_back(Event::AnnounceFinished { topic: target });
             }
             QueryKind::Connect => match coordinators.first().copied() {
                 Some(coord) => {
@@ -711,7 +705,7 @@ impl Dht {
                 }
                 None => {
                     self.connecting.remove(&target);
-                    self.events.push(Event::Connected {
+                    self.events.push_back(Event::Connected {
                         target,
                         outcome: ConnectOutcome::NotFound,
                     });
@@ -781,7 +775,7 @@ impl Dht {
             if from_coordinator {
                 self.connecting.remove(&target);
                 let outcome = outcome_for(self.signaling_firewall(), nat);
-                self.events.push(Event::Connected { target, outcome });
+                self.events.push_back(Event::Connected { target, outcome });
             }
         } else if self.seen_initiators.contains(&(target, initiator_addr))
             && self

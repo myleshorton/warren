@@ -94,7 +94,10 @@ async fn accept_ignores_spoofed_ack() {
     // Queue a spoofed ACK before accept even starts reading; loopback buffers it,
     // so accept is guaranteed to see (and reject) it rather than never observe it.
     let attacker = UdpSocket::bind(addr(0)).await.unwrap();
-    attacker.send_to(&[puncher::ACK], server_addr).await.unwrap();
+    attacker
+        .send_to(&[puncher::ACK], server_addr)
+        .await
+        .unwrap();
 
     let outcome = accept(server, &cfg).await.unwrap();
     assert!(

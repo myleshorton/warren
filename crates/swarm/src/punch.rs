@@ -1,12 +1,14 @@
 //! Hole-punch strategy selection and the birthday-paradox model.
 //!
 //! Given the two peers' firewall types (from [`crate::nat`]), [`plan`] picks the
-//! strategy — exactly the decision table HyperDHT uses:
+//! strategy — exactly the decision table HyperDHT uses. Any pair involving an
+//! Open (directly reachable) peer is a plain dial:
 //!
-//! | local \\ remote | Open/Consistent | Random |
-//! |---|---|---|
-//! | **Open/Consistent** | direct | spray random ports |
-//! | **Random** | open birthday sockets | relay (give up on direct) |
+//! | local \\ remote | Open | Consistent | Random |
+//! |---|---|---|---|
+//! | **Open** | direct | direct | direct |
+//! | **Consistent** | direct | direct | spray random ports |
+//! | **Random** | direct | open birthday sockets | relay (give up on direct) |
 //!
 //! When one side is Random and the other Consistent, direct connection needs a
 //! *port collision*: the Random side opens many external ports at once, and the
@@ -21,9 +23,11 @@ use crate::sim::Rng;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-/// A public rendezvous both peers can reach, used only so a predictable side
+/// A shared rendezvous both peers can reach, used only so a predictable side
 /// learns (and can share) its own external port before the punch — standing in
-/// for the DHT relay node that brokers a real punch.
+/// for the DHT relay node that brokers a real punch. The address is fictional,
+/// like every host in this model (all under 10.0.0.0/8); routability is not
+/// modeled.
 const RENDEZVOUS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)), 9999);
 
 fn host(octet: u8) -> IpAddr {
@@ -244,8 +248,8 @@ pub fn packet_punch(
     match plan(local, remote) {
         Strategy::Relay => Outcome::Relayed,
         Strategy::Direct => {
-            let mut a = NatBox::new(local, host(1));
-            let mut b = NatBox::new(remote, host(2));
+            let mut a = NatBox::with_range(local, host(1), params.port_min, params.port_max);
+            let mut b = NatBox::with_range(remote, host(2), params.port_min, params.port_max);
             // "Direct" has two mechanisms: dial a reachable (Open) peer, or a
             // simultaneous open between two predictable-port peers.
             let ok = if remote == Firewall::Open {
@@ -263,8 +267,9 @@ pub fn packet_punch(
         }
         Strategy::SprayRandomPorts => {
             // We are the consistent side (spraying); the peer is random.
-            let mut consistent = NatBox::new(local, host(1));
-            let mut random = NatBox::new(remote, host(2));
+            let mut consistent =
+                NatBox::with_range(local, host(1), params.port_min, params.port_max);
+            let mut random = NatBox::with_range(remote, host(2), params.port_min, params.port_max);
             if one_sided_random(&mut random, &mut consistent, rng, params) {
                 Outcome::Punched
             } else {
@@ -273,8 +278,9 @@ pub fn packet_punch(
         }
         Strategy::OpenBirthdaySockets => {
             // We are the random side (opening sockets); the peer is consistent.
-            let mut random = NatBox::new(local, host(1));
-            let mut consistent = NatBox::new(remote, host(2));
+            let mut random = NatBox::with_range(local, host(1), params.port_min, params.port_max);
+            let mut consistent =
+                NatBox::with_range(remote, host(2), params.port_min, params.port_max);
             if one_sided_random(&mut random, &mut consistent, rng, params) {
                 Outcome::Punched
             } else {

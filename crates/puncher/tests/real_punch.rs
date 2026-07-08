@@ -78,6 +78,32 @@ async fn dial_a_reachable_peer() {
 }
 
 #[tokio::test]
+async fn accept_ignores_spoofed_ack() {
+    // The reachable side never leads with a PROBE, so an ACK reaching it has no
+    // honest origin. A lone `[ACK]` byte must NOT establish a channel — otherwise
+    // any host could spoof or race an inbound channel with a single datagram.
+    // Only a PROBE (the dialer's lead) may establish; that path is covered by
+    // `dial_a_reachable_peer`.
+    let server = UdpSocket::bind(addr(0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let cfg = Config {
+        overall: Duration::from_millis(300),
+        probe_interval: Duration::from_millis(50),
+    };
+
+    // Queue a spoofed ACK before accept even starts reading; loopback buffers it,
+    // so accept is guaranteed to see (and reject) it rather than never observe it.
+    let attacker = UdpSocket::bind(addr(0)).await.unwrap();
+    attacker.send_to(&[puncher::ACK], server_addr).await.unwrap();
+
+    let outcome = accept(server, &cfg).await.unwrap();
+    assert!(
+        outcome.is_none(),
+        "a lone ACK must not establish an inbound channel"
+    );
+}
+
+#[tokio::test]
 async fn birthday_punch_over_real_sockets() {
     // Random side: 256 sockets at unpredictable ports in a range chosen below
     // both common OS ephemeral ranges (Linux 32768+, macOS 49152+), so parallel

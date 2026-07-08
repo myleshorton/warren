@@ -148,14 +148,16 @@ pub async fn accept(socket: UdpSocket, cfg: &Config) -> io::Result<Option<Establ
             return Ok(None);
         }
         match timeout(remaining, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) if is_control_msg(&buf[..n]) => {
-                // A PROBE needs an ACK back; an ACK already confirms the path.
-                if buf[0] == PROBE {
-                    socket.send_to(&[ACK], from).await?;
-                }
+            // The reachable side of a dial only ever leads with a PROBE: we never
+            // sent one, so no honest peer would answer us with an ACK. Requiring a
+            // PROBE (and replying ACK) means a lone `[ACK]` byte can't spoof an
+            // inbound channel or race the real peer's probe — matching the
+            // PROBE-only discipline of `open_birthday_sockets`.
+            Ok(Ok((n, from))) if matches!(&buf[..n], [PROBE]) => {
+                socket.send_to(&[ACK], from).await?;
                 return Ok(Some(Established { socket, peer: from }));
             }
-            Ok(Ok(_)) => {} // stray datagram: keep listening
+            Ok(Ok(_)) => {} // stray / ACK / non-control datagram: keep listening
             Ok(Err(e)) => return Err(e),
             Err(_) => return Ok(None), // timed out
         }

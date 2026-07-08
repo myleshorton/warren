@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
-use tokio::time::{timeout, Instant};
+use tokio::time::{sleep_until, timeout, Instant};
 
 /// Small deterministic PRNG (SplitMix64) for picking spray/bind ports. Inlined
 /// so this real-socket crate needn't depend on `swarm` (nor its simulator).
@@ -211,23 +211,29 @@ pub async fn open_birthday_sockets(
         }
     }
 
-    let found = timeout(deadline.saturating_duration_since(Instant::now()), async {
-        while let Some(joined) = set.join_next().await {
-            if let Ok(Some(hit)) = joined {
-                return Some(hit);
-            }
+    // Wait for the first listener to report a hit, biased toward the JoinSet so
+    // a hit that lands right at the deadline boundary is still observed.
+    let sleep = sleep_until(deadline);
+    tokio::pin!(sleep);
+    let found = loop {
+        tokio::select! {
+            biased;
+            joined = set.join_next() => match joined {
+                Some(Ok(Some(hit))) => break Some(hit),
+                Some(_) => {}       // that listener finished without a hit; keep waiting
+                None => break None, // no listeners left
+            },
+            _ = &mut sleep => break None, // deadline reached
         }
-        None
-    })
-    .await;
+    };
 
     set.abort_all();
     match found {
-        Ok(Some((socket, from))) => {
+        Some((socket, from)) => {
             socket.send_to(&[ACK], from).await?;
             Ok(Some(Established { socket, peer: from }))
         }
-        _ => Ok(None),
+        None => Ok(None),
     }
 }
 

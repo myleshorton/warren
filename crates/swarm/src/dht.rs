@@ -202,9 +202,9 @@ struct ConnectState {
     data_addr: SocketAddr,
 }
 
-/// The target side of an in-flight connect: a request arrived for us and awaits
-/// a [`Dht::accept_connect`] supplying our data-socket address before we can
-/// reply to the initiator.
+/// The target side of an in-flight connect: a request arrived for us, and we
+/// wait for the caller to supply our data-socket address via
+/// [`Dht::accept_connect`] before replying to the initiator.
 struct IncomingState {
     /// The coordinator that relayed the request; the reply goes back through it.
     coordinator: SocketAddr,

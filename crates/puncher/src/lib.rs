@@ -54,7 +54,9 @@ pub struct Established {
 pub struct Config {
     /// Give up after this long.
     pub overall: Duration,
-    /// Gap between successive probes (and how long to wait for a reply each).
+    /// How long to wait for a reply to a probe. [`connect_to`] also paces its
+    /// probes at this interval; [`spray`] uses it only as the per-probe reply
+    /// wait (spraying is intentionally fast, not rate-limited).
     pub probe_interval: Duration,
 }
 
@@ -143,6 +145,9 @@ pub async fn accept(socket: UdpSocket, cfg: &Config) -> io::Result<Option<Establ
 /// unpredictable ports in `range` on `host` and listen. Because we never send
 /// first, our ports are unobservable to the peer — the peer must find one by
 /// spraying. Returns the socket that first receives a probe.
+///
+/// `range` is half-open, `[range.0, range.1)`. Panics if not
+/// `1 <= range.0 < range.1`.
 pub async fn open_birthday_sockets(
     host: IpAddr,
     range: (u16, u16),
@@ -207,6 +212,9 @@ pub async fn open_birthday_sockets(
 /// The predictable side of a one-sided-random punch: spray probes at random
 /// ports in `range` on `peer_host` until one lands on an opened socket and is
 /// answered. Never sprays our own port (avoids a self-hit on loopback).
+///
+/// `range` is half-open, `[range.0, range.1)`. Panics if not
+/// `1 <= range.0 < range.1`.
 pub async fn spray(
     bind: SocketAddr,
     peer_host: IpAddr,

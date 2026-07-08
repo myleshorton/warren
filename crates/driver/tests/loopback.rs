@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use driver::Node;
+use driver::{ConnectError, Node};
 use swarm::dht::ConnectOutcome;
 use swarm::sim::Rng;
 use tokio::time::timeout;
@@ -120,5 +120,37 @@ async fn concurrent_connects_to_distinct_targets_each_get_a_channel() {
     assert!(
         a.channel.is_some() && b.channel.is_some(),
         "each concurrent connect should yield its own channel"
+    );
+}
+
+#[tokio::test]
+async fn second_concurrent_connect_to_same_target_is_in_progress() {
+    // Only one connect per target at a time. Two fired at once resolve to exactly
+    // one success and one `InProgress`: the second is rejected without disrupting
+    // the first (and is NOT misreported as the node having shut down).
+    let (_boot, peers) = network(6, 0xE5).await;
+    let server = &peers[0];
+    let client = &peers[1];
+    timeout(T, server.announce(server.id()))
+        .await
+        .expect("announce")
+        .expect("node alive");
+
+    let (a, b) = timeout(T, async {
+        tokio::join!(client.connect(server.id()), client.connect(server.id()))
+    })
+    .await
+    .expect("both connects should resolve, not hang");
+
+    let results = [a, b];
+    let ok = results.iter().filter(|r| r.is_ok()).count();
+    let in_progress = results
+        .iter()
+        .filter(|r| matches!(r, Err(ConnectError::InProgress)))
+        .count();
+    assert_eq!(ok, 1, "exactly one connect should succeed, got {results:?}");
+    assert_eq!(
+        in_progress, 1,
+        "the other should be rejected as InProgress, got {results:?}"
     );
 }

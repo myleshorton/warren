@@ -60,8 +60,9 @@ crates/
               coordinator-brokered signaling → punch)
   driver    tokio UDP driver: the sans-IO core over real sockets, async API
             + Channel/DataListener: live data channels via the puncher
-            + connect(id) -> Channel: discover + coordinate + punch in one call;
-              inbound channels surfaced via Node::next_incoming
+            + connect(id) -> Connection { outcome, channel }: discover +
+              coordinate + punch in one call; inbound channels surfaced via
+              Node::next_incoming
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
 
   next: reflexive discovery of the data socket's external mapping + birthday

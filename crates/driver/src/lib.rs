@@ -171,6 +171,10 @@ pub enum ConnectError {
     /// A connect to this target is already in flight on this node; only one at a
     /// time is supported, and the in-flight one is left untouched.
     InProgress,
+    /// The node is bound to an unspecified address (`0.0.0.0`/`::`), so there is
+    /// no concrete data address to advertise as a punch target. Bind the node to
+    /// a specific local IP.
+    UnspecifiedLocalAddr,
     /// Binding the local data socket for this connect failed.
     Bind(io::Error),
 }
@@ -180,6 +184,12 @@ impl std::fmt::Display for ConnectError {
         match self {
             ConnectError::Closed => write!(f, "driver node has shut down"),
             ConnectError::InProgress => write!(f, "a connect to this target is already in flight"),
+            ConnectError::UnspecifiedLocalAddr => {
+                write!(
+                    f,
+                    "node is bound to an unspecified address; connect needs a concrete local IP"
+                )
+            }
             ConnectError::Bind(e) => write!(f, "binding the local data socket failed: {e}"),
         }
     }
@@ -285,6 +295,12 @@ impl Node {
     /// surfaces as [`ConnectError::Bind`] rather than being conflated with the
     /// node shutting down.
     pub async fn connect(&self, target: NodeId) -> std::result::Result<Connection, ConnectError> {
+        // The data socket's address is advertised to the peer as the punch
+        // target, so it must be concrete. A node bound to 0.0.0.0/:: has no such
+        // address to offer.
+        if self.local_addr.ip().is_unspecified() {
+            return Err(ConnectError::UnspecifiedLocalAddr);
+        }
         let data_sock = UdpSocket::bind(SocketAddr::new(self.local_addr.ip(), 0))
             .await
             .map_err(ConnectError::Bind)?;
@@ -392,7 +408,7 @@ async fn run(
                     // and accept a punch from the initiator on it.
                     if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
                         if let Ok(data_addr) = data_sock.local_addr() {
-                            dht.accept_connect(initiator, data_addr);
+                            dht.accept_connect(initiator, data_addr, now());
                             spawn_accept_punch(
                                 data_sock,
                                 initiator_data_addr.ip(),

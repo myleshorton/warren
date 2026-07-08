@@ -202,9 +202,9 @@ struct ConnectState {
     data_addr: SocketAddr,
 }
 
-/// The target side of an in-flight connect: a request arrived for us and we are
-/// waiting for the caller to supply our data-socket address (via
-/// [`Dht::accept_connect`]) before we can reply to the initiator.
+/// The target side of an in-flight connect: a request arrived for us and awaits
+/// a [`Dht::accept_connect`] supplying our data-socket address before we can
+/// reply to the initiator.
 struct IncomingState {
     /// The coordinator that relayed the request; the reply goes back through it.
     coordinator: SocketAddr,
@@ -374,10 +374,14 @@ impl Dht {
 
     /// Accept an incoming connect surfaced by [`Event::IncomingConnect`]: reply
     /// to `initiator` (through the coordinator that relayed the request) with our
-    /// `data_addr`, so it can punch a channel to us. A no-op if the request has
-    /// already expired.
-    pub fn accept_connect(&mut self, initiator: NodeId, data_addr: SocketAddr) {
+    /// `data_addr`, so it can punch a channel to us. A no-op if the request is no
+    /// longer pending — already accepted, or past its deadline (the initiator has
+    /// itself timed out, so a reply would be ignored).
+    pub fn accept_connect(&mut self, initiator: NodeId, data_addr: SocketAddr, now: Millis) {
         if let Some(inc) = self.pending_incoming.remove(&initiator) {
+            if inc.deadline <= now {
+                return; // expired before we accepted; the initiator has given up
+            }
             let rid = self.alloc_rid();
             let fw = self.signaling_firewall();
             self.send(
@@ -821,11 +825,15 @@ impl Dht {
                 // data-socket address, which the caller supplies once it stands up
                 // the socket. Record the request and surface it; `accept_connect`
                 // sends the reply. `data_addr` here is the initiator's data socket
-                // — the host we'll accept a punch from. Drop the request if we're
-                // already holding the cap of pending incoming connects.
-                if self.pending_incoming.len() < MAX_PENDING_INCOMING
-                    || self.pending_incoming.contains_key(&initiator)
-                {
+                // — the host we'll accept a punch from.
+                //
+                // Emit `IncomingConnect` only the *first* time an initiator becomes
+                // pending: each event makes the caller bind a socket and start a
+                // punch, so re-emitting on duplicate (or replayed) requests would
+                // drive unbounded churn. Duplicates just refresh the deadline. A
+                // brand-new initiator is dropped once we hold the cap.
+                let known = self.pending_incoming.contains_key(&initiator);
+                if known || self.pending_incoming.len() < MAX_PENDING_INCOMING {
                     self.pending_incoming.insert(
                         initiator,
                         IncomingState {
@@ -834,11 +842,13 @@ impl Dht {
                             deadline: now + CONNECT_TIMEOUT_MS,
                         },
                     );
-                    self.events.push_back(Event::IncomingConnect {
-                        initiator,
-                        initiator_data_addr: data_addr,
-                        nat,
-                    });
+                    if !known {
+                        self.events.push_back(Event::IncomingConnect {
+                            initiator,
+                            initiator_data_addr: data_addr,
+                            nat,
+                        });
+                    }
                 }
             } else if let Some(target_addr) = self
                 .announces
@@ -929,5 +939,56 @@ fn outcome_for(local: Firewall, remote: Firewall) -> ConnectOutcome {
             ConnectOutcome::Punched
         }
         crate::punch::Strategy::Relay => ConnectOutcome::Relayed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::msg::Packet;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    fn id(b: u8) -> NodeId {
+        NodeId::from_bytes([b; 32])
+    }
+
+    /// A coordinator-forwarded connect request replayed for the same initiator
+    /// must surface `IncomingConnect` only once: each event drives the caller to
+    /// bind a socket and start a punch, so re-emitting on duplicates (which an
+    /// unauthenticated peer can replay) would be an amplification vector.
+    #[test]
+    fn duplicate_incoming_requests_emit_one_event() {
+        let me = id(1);
+        let mut dht = Dht::new(me);
+        let coordinator = addr("10.0.0.9:900");
+        let request = Packet {
+            sender: id(9),
+            rid: 1,
+            msg: Message::Signal {
+                target: me,
+                initiator: id(2),
+                initiator_addr: addr("10.0.0.2:100"),
+                data_addr: addr("10.0.0.2:200"),
+                nat: Firewall::Consistent,
+                is_reply: false,
+            },
+        }
+        .encode();
+
+        // Same request delivered three times before we accept.
+        dht.handle_input(coordinator, &request, 0);
+        dht.handle_input(coordinator, &request, 0);
+        dht.handle_input(coordinator, &request, 0);
+
+        let incoming = std::iter::from_fn(|| dht.poll_event())
+            .filter(|e| matches!(e, Event::IncomingConnect { .. }))
+            .count();
+        assert_eq!(
+            incoming, 1,
+            "duplicate requests must emit exactly one event"
+        );
     }
 }

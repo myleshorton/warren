@@ -335,7 +335,8 @@ impl Sim {
                 if let Event::IncomingConnect { initiator, .. } = &e {
                     let initiator = *initiator;
                     let data_addr = self.nodes[i].addr;
-                    self.nodes[i].dht.accept_connect(initiator, data_addr);
+                    let now = self.now;
+                    self.nodes[i].dht.accept_connect(initiator, data_addr, now);
                 }
                 self.events.push((i, e));
             }

@@ -25,10 +25,12 @@ async fn data_channel_over_real_udp() {
     let listener = DataListener::bind(LO.parse().unwrap()).await.unwrap();
     let server_data = listener.local_addr().unwrap();
 
+    // One config drives both sides so dial and accept can't diverge; `Config` is
+    // `Copy`, so the accept task takes its own copy and we still borrow it below.
     let cfg = PunchConfig::default();
     let accept = tokio::spawn(async move { listener.accept(&cfg).await });
 
-    let client = open_channel(LO.parse().unwrap(), server_data, &PunchConfig::default())
+    let client = open_channel(LO.parse().unwrap(), server_data, &cfg)
         .await
         .unwrap()
         .expect("client should punch a channel");
@@ -76,6 +78,7 @@ async fn discover_coordinate_then_open_channel() {
         .unwrap();
     let listener = DataListener::bind(lo).await.unwrap();
     let server_data = listener.local_addr().unwrap();
+    // Single config for both sides (see note in `data_channel_over_real_udp`).
     let cfg = PunchConfig::default();
     let accept = tokio::spawn(async move { listener.accept(&cfg).await });
 
@@ -86,7 +89,7 @@ async fn discover_coordinate_then_open_channel() {
     assert_eq!(outcome, ConnectOutcome::Direct);
 
     // Reachability confirmed over the DHT — now open the actual data channel.
-    let a = open_channel(lo, server_data, &PunchConfig::default())
+    let a = open_channel(lo, server_data, &cfg)
         .await
         .unwrap()
         .expect("client channel");

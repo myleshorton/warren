@@ -32,10 +32,12 @@ pub const PROBE: u8 = 1;
 /// Acknowledges a [`PROBE`]; its receipt confirms the reverse path.
 pub const ACK: u8 = 2;
 
-/// Whether a received byte is a punch control message. Establishment only ever
-/// keys on these, so stray application traffic can't be mistaken for a punch.
-fn is_control(b: u8) -> bool {
-    b == PROBE || b == ACK
+/// Whether a received datagram is a punch control message: exactly one byte,
+/// `PROBE` or `ACK`. Requiring the single-byte length means a multi-byte
+/// application payload that merely starts with 1 or 2 can't be mistaken for a
+/// punch.
+fn is_control_msg(datagram: &[u8]) -> bool {
+    matches!(datagram, [PROBE] | [ACK])
 }
 
 /// A punched path: a socket with a working route to `peer`.
@@ -89,7 +91,7 @@ pub async fn connect_to(
     while Instant::now() < deadline {
         socket.send_to(&[PROBE], peer).await?;
         match timeout(cfg.probe_interval, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) if n >= 1 && from == peer && is_control(buf[0]) => {
+            Ok(Ok((n, from))) if from == peer && is_control_msg(&buf[..n]) => {
                 if buf[0] == PROBE {
                     socket.send_to(&[ACK], from).await?;
                 }
@@ -112,7 +114,7 @@ pub async fn accept(socket: UdpSocket, cfg: &Config) -> io::Result<Option<Establ
             return Ok(None);
         }
         match timeout(remaining, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) if n >= 1 && is_control(buf[0]) => {
+            Ok(Ok((n, from))) if is_control_msg(&buf[..n]) => {
                 // A PROBE needs an ACK back; an ACK already confirms the path.
                 if buf[0] == PROBE {
                     socket.send_to(&[ACK], from).await?;
@@ -154,7 +156,7 @@ pub async fn open_birthday_sockets(
             set.spawn(async move {
                 let mut buf = [0u8; 64];
                 match socket.recv_from(&mut buf).await {
-                    Ok((n, from)) if n >= 1 && buf[0] == PROBE => Some((socket, from)),
+                    Ok((n, from)) if matches!(&buf[..n], [PROBE]) => Some((socket, from)),
                     _ => None,
                 }
             });
@@ -213,7 +215,12 @@ pub async fn spray(
         }
         socket.send_to(&[PROBE], (peer_host, port)).await?;
         if let Ok(Ok((n, from))) = timeout(cfg.probe_interval, socket.recv_from(&mut buf)).await {
-            if n >= 1 && is_control(buf[0]) {
+            if is_control_msg(&buf[..n]) {
+                // Normally the reply is an ACK; if it's a PROBE, answer it so the
+                // peer establishes too.
+                if buf[0] == PROBE {
+                    socket.send_to(&[ACK], from).await?;
+                }
                 return Ok(Some(Established { socket, peer: from }));
             }
         }

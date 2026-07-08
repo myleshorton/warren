@@ -19,25 +19,30 @@ fn addr(port: u16) -> SocketAddr {
     SocketAddr::new(LO, port)
 }
 
-/// After a punch, the two ends can actually exchange application bytes. `a`
-/// sends to the peer it punched to (`a.peer`, which is `b`'s address).
+/// After a punch, application bytes flow *both* ways over the punched path.
 async fn assert_bidirectional(a: &Established, b: &Established) {
+    send_and_receive(a, b, b"ping").await;
+    send_and_receive(b, a, b"pong").await;
+}
+
+/// `from` sends `payload` to the peer it punched to (`from.peer`, i.e. `to`'s
+/// address); `to` receives it, skipping any leftover handshake control bytes.
+async fn send_and_receive(from: &Established, to: &Established, payload: &[u8]) {
     use puncher::{ACK, PROBE};
-    a.socket.send_to(b"ping", a.peer).await.unwrap();
-    let mut buf = [0u8; 16];
-    // Skip any leftover handshake control bytes still buffered on `b`.
-    let (n, from) = timeout(Duration::from_secs(1), async {
+    from.socket.send_to(payload, from.peer).await.unwrap();
+    let mut buf = [0u8; 64];
+    let (n, src) = timeout(Duration::from_secs(1), async {
         loop {
-            let (n, from) = b.socket.recv_from(&mut buf).await.unwrap();
+            let (n, src) = to.socket.recv_from(&mut buf).await.unwrap();
             if !(n == 1 && (buf[0] == PROBE || buf[0] == ACK)) {
-                break (n, from);
+                break (n, src);
             }
         }
     })
     .await
     .expect("data should arrive over the punched path");
-    assert_eq!(&buf[..n], b"ping");
-    assert_eq!(from.port(), a.socket.local_addr().unwrap().port());
+    assert_eq!(&buf[..n], payload);
+    assert_eq!(src.port(), from.socket.local_addr().unwrap().port());
 }
 
 #[tokio::test]

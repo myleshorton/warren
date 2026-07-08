@@ -184,10 +184,11 @@ pub struct Dht {
     announces: HashMap<NodeId, Vec<Contact>>,
     /// Targets we are mid-connect to -> deadline by which signaling must finish.
     connecting: HashMap<NodeId, Millis>,
-    /// Recently observed (target, initiator) connect pairs (coordinator side),
-    /// bounded FIFO. We relay a reply only to an address that actually initiated
-    /// a connect *to that target*, so a target can't redirect the relayed reply
-    /// to an arbitrary victim (nor to an initiator of some other connect).
+    /// Recently observed (target id, initiator address) connect pairs
+    /// (coordinator side), bounded FIFO. We relay a reply only to an address
+    /// that actually initiated a connect *to that target*, so a target can't
+    /// redirect the relayed reply to an arbitrary victim (nor to an initiator of
+    /// some other connect).
     seen_initiators: VecDeque<(NodeId, SocketAddr)>,
     outbox: Vec<Transmit>,
     events: Vec<Event>,

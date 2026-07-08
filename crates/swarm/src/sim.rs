@@ -145,8 +145,9 @@ impl Sim {
         self.loss = loss;
     }
 
-    /// Take a node "offline": packets addressed to it are dropped, modeling a
-    /// peer that has left the network.
+    /// Take a node fully offline: packets both to and from it are dropped,
+    /// modeling a peer that has left the network. (Its internal timers may still
+    /// fire, but nothing it produces reaches the wire.)
     pub fn disable_node(&mut self, i: usize) {
         self.disabled.insert(i);
     }
@@ -284,7 +285,13 @@ impl Sim {
 
     fn drain_outboxes(&mut self) {
         for i in 0..self.nodes.len() {
+            // An offline node's outbound is drained and discarded, so it neither
+            // sends nor receives.
+            let sender_offline = self.disabled.contains(&i);
             while let Some(t) = self.nodes[i].dht.poll_transmit() {
+                if sender_offline {
+                    continue;
+                }
                 let Some(to) = self.resolve(&t.to) else {
                     continue; // unknown destination: dropped, as on a real net
                 };

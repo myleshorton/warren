@@ -52,18 +52,15 @@ impl Channel {
 
     /// Send application bytes to the peer.
     pub async fn send(&self, data: &[u8]) -> io::Result<usize> {
-        self.socket.send_to(data, self.peer).await
+        self.socket.send(data).await
     }
 
-    /// Receive application bytes from the peer. Datagrams from any other source
-    /// are ignored, so stray traffic can't be read as channel data.
+    /// Receive application bytes from the peer. The socket is connected to the
+    /// peer (see [`open_channel`] / [`DataListener::accept`]), so the OS drops
+    /// datagrams from any other source before they reach us — no user-space
+    /// filtering, and stray traffic can't be read as channel data.
     pub async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        loop {
-            let (n, from) = self.socket.recv_from(buf).await?;
-            if from == self.peer {
-                return Ok(n);
-            }
-        }
+        self.socket.recv(buf).await
     }
 }
 
@@ -75,12 +72,24 @@ pub async fn open_channel(
     cfg: &PunchConfig,
 ) -> io::Result<Option<Channel>> {
     let socket = UdpSocket::bind(bind).await?;
-    Ok(puncher::connect_to(socket, peer, cfg)
-        .await?
-        .map(|e| Channel {
-            socket: e.socket,
-            peer: e.peer,
-        }))
+    connect_channel(puncher::connect_to(socket, peer, cfg).await?).await
+}
+
+/// Turn a punched [`puncher::Established`] into a [`Channel`], connecting the
+/// socket to the confirmed peer so the OS filters out every other source. Shared
+/// by both the dial ([`open_channel`]) and accept ([`DataListener::accept`])
+/// paths so they can't drift.
+async fn connect_channel(established: Option<puncher::Established>) -> io::Result<Option<Channel>> {
+    match established {
+        Some(e) => {
+            e.socket.connect(e.peer).await?;
+            Ok(Some(Channel {
+                socket: e.socket,
+                peer: e.peer,
+            }))
+        }
+        None => Ok(None),
+    }
 }
 
 /// A bound socket awaiting an inbound data channel (the reachable side). Expose
@@ -105,10 +114,7 @@ impl DataListener {
 
     /// Accept one inbound channel. `Ok(None)` means none arrived in time.
     pub async fn accept(self, cfg: &PunchConfig) -> io::Result<Option<Channel>> {
-        Ok(puncher::accept(self.socket, cfg).await?.map(|e| Channel {
-            socket: e.socket,
-            peer: e.peer,
-        }))
+        connect_channel(puncher::accept(self.socket, cfg).await?).await
     }
 }
 

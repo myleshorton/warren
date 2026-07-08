@@ -56,11 +56,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data_addr = listener.local_addr()?;
     // One config drives both sides, so dial and accept can't diverge.
     let cfg = PunchConfig::default();
-    // The client punches from loopback, so the listener expects that host.
-    let peer_host = data_addr.ip();
+    // peer_host is the *dialer's* host: the client punches from loopback (`lo`),
+    // and the listener only accepts a punch coming from that host.
+    let peer_host = lo.ip();
     let accept = tokio::spawn(async move { listener.accept(peer_host, &cfg).await });
 
-    let chan = open_channel("127.0.0.1:0".parse().unwrap(), data_addr, &cfg)
+    let chan = open_channel(lo, data_addr, &cfg)
         .await?
         .expect("channel established");
     let server_chan = accept.await??.expect("server channel");

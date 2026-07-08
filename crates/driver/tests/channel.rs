@@ -8,6 +8,7 @@
 //! `connect(id)` returns the channel for arbitrary NATed peers is the remaining
 //! glue).
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use driver::{open_channel, ConnectOutcome, DataListener, Node, PunchConfig};
@@ -28,11 +29,13 @@ async fn data_channel_over_real_udp() {
     // One config drives both sides so dial and accept can't diverge; `Config` is
     // `Copy`, so the accept task takes its own copy and we still borrow it below.
     let cfg = PunchConfig::default();
-    // The client dials from loopback, so the listener expects that host.
-    let peer_host = server_data.ip();
+    // peer_host is the *dialer's* host: the client binds here, and the listener
+    // only accepts a punch coming from it.
+    let client_bind: SocketAddr = LO.parse().unwrap();
+    let peer_host = client_bind.ip();
     let accept = tokio::spawn(async move { listener.accept(peer_host, &cfg).await });
 
-    let client = open_channel(LO.parse().unwrap(), server_data, &cfg)
+    let client = open_channel(client_bind, server_data, &cfg)
         .await
         .unwrap()
         .expect("client should punch a channel");
@@ -82,7 +85,8 @@ async fn discover_coordinate_then_open_channel() {
     let server_data = listener.local_addr().unwrap();
     // Single config for both sides (see note in `data_channel_over_real_udp`).
     let cfg = PunchConfig::default();
-    let peer_host = server_data.ip();
+    // peer_host is the dialer's host — the client opens the channel from `lo`.
+    let peer_host = lo.ip();
     let accept = tokio::spawn(async move { listener.accept(peer_host, &cfg).await });
 
     let outcome = timeout(T, client.connect(server.id()))

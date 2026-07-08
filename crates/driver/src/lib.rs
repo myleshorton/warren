@@ -751,14 +751,19 @@ async fn reflexive_addr(
     local: SocketAddr,
     reflectors: &[SocketAddr],
 ) -> SocketAddr {
-    let probe = Packet {
-        sender: id,
-        rid: 0,
-        msg: Message::Reflect,
-    }
-    .encode();
     let mut buf = [0u8; 128];
-    for &reflector in reflectors {
+    // Distinct per-probe request id (based on this socket's port, so it also
+    // differs across concurrent connects). The reflector echoes it in the reply,
+    // letting us match a `Reflected` to the probe that elicited it.
+    let base_rid = local.port() as u64;
+    for (i, &reflector) in reflectors.iter().enumerate() {
+        let rid = base_rid.wrapping_add(i as u64);
+        let probe = Packet {
+            sender: id,
+            rid,
+            msg: Message::Reflect,
+        }
+        .encode();
         if sock.send_to(&probe, reflector).await.is_err() {
             continue;
         }
@@ -772,14 +777,18 @@ async fn reflexive_addr(
             }
             match timeout(remaining, sock.recv_from(&mut buf)).await {
                 Ok(Ok((n, from))) if from == reflector => {
+                    // Accept only a `Reflected` echoing this probe's rid.
                     if let Ok(Packet {
+                        rid: got,
                         msg: Message::Reflected { observed },
                         ..
                     }) = Packet::decode(&buf[..n])
                     {
-                        return observed;
+                        if got == rid {
+                            return observed;
+                        }
                     }
-                    // From the reflector but not a Reflected: keep reading.
+                    // Wrong rid or not a Reflected: keep reading this window.
                 }
                 Ok(Ok(_)) => {}      // stray datagram from elsewhere: keep reading
                 Ok(Err(_)) => break, // socket error: try the next reflector

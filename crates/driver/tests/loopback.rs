@@ -101,7 +101,11 @@ async fn concurrent_connects_to_same_target_all_resolve() {
         .expect("announce")
         .expect("node alive");
 
-    let (a, b) = tokio::join!(client.connect(server.id()), client.connect(server.id()));
+    let (a, b) = timeout(T, async {
+        tokio::join!(client.connect(server.id()), client.connect(server.id()))
+    })
+    .await
+    .expect("both connects should resolve, not hang");
     assert_eq!(a.expect("node alive"), ConnectOutcome::Direct);
     assert_eq!(b.expect("node alive"), ConnectOutcome::Direct);
 }

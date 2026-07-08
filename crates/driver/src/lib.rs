@@ -12,10 +12,10 @@
 //! ```no_run
 //! use driver::Node;
 //! use swarm::NodeId;
-//! # async fn ex() -> std::io::Result<()> {
+//! # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
 //! let addr = "127.0.0.1:0".parse().unwrap();
 //! let node = Node::bind(addr, NodeId::from_bytes([7u8; 32])).await?;
-//! node.bootstrap().await;
+//! node.bootstrap().await?;
 //! # Ok(()) }
 //! ```
 
@@ -226,8 +226,17 @@ async fn run(mut dht: Dht, socket: UdpSocket, mut cmd_rx: mpsc::Receiver<Command
                 }
             }
             recv = socket.recv_from(&mut buf) => {
-                if let Ok((n, from)) = recv {
-                    dht.handle_input(from, &buf[..n], now());
+                match recv {
+                    Ok((n, from)) => dht.handle_input(from, &buf[..n], now()),
+                    // Transient, e.g. an ICMP error surfaced from a prior send;
+                    // the datagram is lost but the socket is fine — keep going.
+                    Err(e) if matches!(
+                        e.kind(),
+                        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionRefused
+                    ) => {}
+                    // A genuinely broken socket: shut the node down cleanly
+                    // (callers get `Closed`) rather than busy-spin on the error.
+                    Err(_) => return,
                 }
             }
             _ = async {

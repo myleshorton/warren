@@ -25,6 +25,10 @@ pub const NAT_SAMPLE_COUNT: usize = 5;
 /// How many recent connect initiators a coordinator remembers (bounded FIFO).
 const MAX_SEEN_INITIATORS: usize = 1024;
 
+/// Absolute cap on distinct announce topics a node stores, bounding memory even
+/// when the routing table is too small for [`Dht::responsible_for`] to bite.
+const MAX_ANNOUNCE_TOPICS: usize = 65_536;
+
 /// Concurrency parameter: how many lookup requests may be in flight at once.
 pub const ALPHA: usize = 3;
 
@@ -180,10 +184,11 @@ pub struct Dht {
     announces: HashMap<NodeId, Vec<Contact>>,
     /// Targets we are mid-connect to -> deadline by which signaling must finish.
     connecting: HashMap<NodeId, Millis>,
-    /// Recently observed connect initiators (coordinator side), bounded FIFO. We
-    /// relay a reply only to an address that actually initiated, so a target
-    /// can't redirect the relayed reply to an arbitrary victim.
-    seen_initiators: VecDeque<SocketAddr>,
+    /// Recently observed (target, initiator) connect pairs (coordinator side),
+    /// bounded FIFO. We relay a reply only to an address that actually initiated
+    /// a connect *to that target*, so a target can't redirect the relayed reply
+    /// to an arbitrary victim (nor to an initiator of some other connect).
+    seen_initiators: VecDeque<(NodeId, SocketAddr)>,
     outbox: Vec<Transmit>,
     events: Vec<Event>,
     next_rid: u64,
@@ -497,17 +502,31 @@ impl Dht {
         self.drive_query(p.query, now);
     }
 
-    fn remember_initiator(&mut self, addr: SocketAddr) {
-        if self.seen_initiators.contains(&addr) {
+    fn remember_initiator(&mut self, target: NodeId, addr: SocketAddr) {
+        let key = (target, addr);
+        if self.seen_initiators.contains(&key) {
             return;
         }
         if self.seen_initiators.len() >= MAX_SEEN_INITIATORS {
             self.seen_initiators.pop_front();
         }
-        self.seen_initiators.push_back(addr);
+        self.seen_initiators.push_back(key);
+    }
+
+    /// The firewall type to advertise in signaling: the sampler's classification
+    /// once available, else the explicitly set value (default Open). This means a
+    /// node that has sampled its NAT reports the right type without every caller
+    /// having to remember to sync it.
+    fn signaling_firewall(&self) -> Firewall {
+        self.firewall().unwrap_or(self.local_firewall)
     }
 
     fn store_announce(&mut self, topic: NodeId, announcer: Contact) {
+        // Don't create a new topic entry past the absolute cap (existing topics
+        // still accept updates), so memory stays bounded even in small networks.
+        if !self.announces.contains_key(&topic) && self.announces.len() >= MAX_ANNOUNCE_TOPICS {
+            return;
+        }
         let records = self.announces.entry(topic).or_default();
         if let Some(existing) = records.iter_mut().find(|c| c.id == announcer.id) {
             existing.addr = announcer.addr; // refresh the mapping
@@ -652,7 +671,7 @@ impl Dht {
                     // our signal. It overwrites initiator_addr with the address it
                     // observes, so we needn't know our own external address.
                     let rid = self.alloc_rid();
-                    let fw = self.local_firewall;
+                    let fw = self.signaling_firewall();
                     self.send(
                         coord.addr,
                         rid,
@@ -689,7 +708,7 @@ impl Dht {
             if target == self.id {
                 // We are the target: reply with our firewall via the coordinator.
                 let rid = self.alloc_rid();
-                let fw = self.local_firewall;
+                let fw = self.signaling_firewall();
                 self.send(
                     from,
                     rid,
@@ -712,7 +731,7 @@ impl Dht {
                 // by announcing to us, filling in the observed initiator addr.
                 // Remember the initiator so we'll only relay the reply back to an
                 // address that actually initiated.
-                self.remember_initiator(from);
+                self.remember_initiator(target, from);
                 let rid = self.alloc_rid();
                 self.send(
                     target_addr,
@@ -729,10 +748,10 @@ impl Dht {
         } else if initiator == self.id {
             // We are the initiator: the reply carries the target's firewall.
             if self.connecting.remove(&target).is_some() {
-                let outcome = outcome_for(self.local_firewall, nat);
+                let outcome = outcome_for(self.signaling_firewall(), nat);
                 self.events.push(Event::Connected { target, outcome });
             }
-        } else if self.seen_initiators.contains(&initiator_addr)
+        } else if self.seen_initiators.contains(&(target, initiator_addr))
             && self
                 .announces
                 .get(&target)

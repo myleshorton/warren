@@ -62,11 +62,12 @@ crates/
             + Channel/DataListener: live data channels via the puncher
             + connect(id) -> Connection { outcome, channel }: discover +
               coordinate + punch in one call; inbound channels surfaced via
-              Node::next_incoming
+              Node::next_incoming; symmetric-NAT (Punched) connects run the
+              birthday spray/open-sockets punch, chosen by the resolved strategy
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
 
-  next: reflexive discovery of the data socket's external mapping + birthday
-        spray in the connect path (real symmetric-NAT peers), port mapping,
+  next: reflexive discovery of the data socket's external mapping (so real
+        Consistent-NAT peers advertise a punchable address), port mapping,
         blob, log, ...
 ```
 

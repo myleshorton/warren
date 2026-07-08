@@ -15,6 +15,7 @@
 use crate::id::NodeId;
 use crate::msg::{Message, Packet};
 use crate::nat::{Firewall, NatSampler};
+use crate::punch::{plan, Strategy};
 use crate::routing::{Contact, RoutingTable, K};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -109,18 +110,23 @@ pub enum Event {
         /// target accepted (`None` for `NotFound`/`TimedOut`, where there is no
         /// peer to punch to).
         peer_data_addr: Option<SocketAddr>,
+        /// Our punch role toward the peer (from the two firewalls): dial, spray,
+        /// or open birthday sockets. `None` when there is no peer to punch to
+        /// (`NotFound`/`TimedOut`).
+        strategy: Option<Strategy>,
     },
     /// A peer wants to connect to us (we are the target). The caller stands up a
-    /// data socket, starts accepting a punch from `initiator_data_addr`, and
-    /// calls [`Dht::accept_connect`] with that socket's address to complete the
-    /// signaling. Ignore the event to decline.
+    /// data socket, calls [`Dht::accept_connect`] with its address to complete
+    /// the signaling, and runs the punch primitive `strategy` indicates —
+    /// dial-accept, spray, or open birthday sockets — toward `initiator_data_addr`.
+    /// Ignore the event to decline.
     IncomingConnect {
         /// The peer initiating the connection.
         initiator: NodeId,
         /// The initiator's data-socket address — the host to accept a punch from.
         initiator_data_addr: SocketAddr,
-        /// The initiator's firewall type (drives the punch strategy).
-        nat: Firewall,
+        /// Our punch role toward the initiator (from the two firewalls).
+        strategy: Strategy,
     },
 }
 
@@ -517,6 +523,7 @@ impl Dht {
                 target,
                 outcome: ConnectOutcome::TimedOut,
                 peer_data_addr: None,
+                strategy: None,
             });
         }
 
@@ -801,6 +808,7 @@ impl Dht {
                         target,
                         outcome: ConnectOutcome::NotFound,
                         peer_data_addr: None,
+                        strategy: None,
                     });
                 }
             },
@@ -846,10 +854,12 @@ impl Dht {
                             deadline: now + CONNECT_TIMEOUT_MS,
                         },
                     );
+                    // Our role toward the initiator, from our firewall and theirs.
+                    let strategy = plan(self.signaling_firewall(), nat);
                     self.events.push_back(Event::IncomingConnect {
                         initiator,
                         initiator_data_addr: data_addr,
-                        nat,
+                        strategy,
                     });
                 }
             } else if let Some(target_addr) = self
@@ -891,11 +901,12 @@ impl Dht {
                 .is_some_and(|cs| cs.coordinator == Some(from));
             if from_coordinator {
                 self.connecting.remove(&target);
-                let outcome = outcome_for(self.signaling_firewall(), nat);
+                let strategy = plan(self.signaling_firewall(), nat);
                 self.events.push_back(Event::Connected {
                     target,
-                    outcome,
+                    outcome: outcome_for(strategy),
                     peer_data_addr: Some(data_addr),
+                    strategy: Some(strategy),
                 });
             }
         } else if self.seen_initiators.contains(&(target, initiator_addr))
@@ -931,16 +942,14 @@ impl Dht {
     }
 }
 
-/// Map a pair of firewall types to the connection outcome. The strategy comes
-/// from [`crate::punch::plan`]; the punch's success probability for the
-/// one-sided-random cases is verified separately in `punch`.
-fn outcome_for(local: Firewall, remote: Firewall) -> ConnectOutcome {
-    match crate::punch::plan(local, remote) {
-        crate::punch::Strategy::Direct => ConnectOutcome::Direct,
-        crate::punch::Strategy::SprayRandomPorts | crate::punch::Strategy::OpenBirthdaySockets => {
-            ConnectOutcome::Punched
-        }
-        crate::punch::Strategy::Relay => ConnectOutcome::Relayed,
+/// Map a punch [`Strategy`] to the user-facing connection outcome. The strategy
+/// comes from [`plan`]; the punch's success probability for the one-sided-random
+/// cases is verified separately in `punch`.
+fn outcome_for(strategy: Strategy) -> ConnectOutcome {
+    match strategy {
+        Strategy::Direct => ConnectOutcome::Direct,
+        Strategy::SprayRandomPorts | Strategy::OpenBirthdaySockets => ConnectOutcome::Punched,
+        Strategy::Relay => ConnectOutcome::Relayed,
     }
 }
 

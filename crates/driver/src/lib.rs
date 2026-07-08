@@ -27,12 +27,50 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use swarm::dht::{Dht, Event};
-use swarm::{Contact, NodeId, QueryId};
+use swarm::{Contact, NodeId, QueryId, Strategy};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
 pub use puncher::Config as PunchConfig;
 pub use swarm::dht::ConnectOutcome;
+pub use swarm::Firewall;
+
+/// Tuning for the one-sided-random *birthday* hole punch used on symmetric-NAT
+/// connects (the `Punched` outcome). Defaults match the analytic model verified
+/// in `swarm::punch`; tests shrink the range to stay fast and reliable on
+/// loopback (the full 64k range would bind hundreds of sockets against the whole
+/// port space).
+#[derive(Debug, Clone, Copy)]
+pub struct BirthdayParams {
+    /// Half-open port range `[start, end)` to spray / open sockets within.
+    pub range: (u16, u16),
+    /// Sockets the Random side opens at once (each mints one external port).
+    pub sockets: usize,
+    /// Random-port guesses the Consistent side sprays.
+    pub probes: usize,
+}
+
+impl Default for BirthdayParams {
+    fn default() -> Self {
+        Self {
+            // Half-open [min, max); drops only the single top port vs the
+            // model's inclusive [PORT_MIN, PORT_MAX], negligible for the math.
+            range: (swarm::punch::PORT_MIN, swarm::punch::PORT_MAX),
+            sockets: swarm::punch::BIRTHDAY_SOCKETS,
+            probes: swarm::punch::SPRAY_PROBES,
+        }
+    }
+}
+
+/// All timing/parameter tuning for the hole punch a connect performs once the
+/// DHT has brokered reachability.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PunchTuning {
+    /// Timing knobs (deadline, probe interval) for every punch primitive.
+    pub config: PunchConfig,
+    /// Birthday-punch parameters for the symmetric-NAT (`Punched`) path.
+    pub birthday: BirthdayParams,
+}
 
 /// A live, bidirectional data channel to a peer, established by a hole punch —
 /// a socket already reaching the peer, over which application bytes flow.
@@ -147,10 +185,10 @@ pub type Result<T> = std::result::Result<T, Closed>;
 /// The result of [`Node::connect`]: how the DHT resolved reachability, plus the
 /// live [`Channel`] if the punch to the peer's data socket succeeded.
 ///
-/// `channel` is `None` when the target wasn't found, signaling timed out, the
-/// outcome is `Punched` or `Relayed` (the real-NAT birthday punch and the relay
-/// data path are future work), or the direct punch to a reachable peer didn't
-/// complete in time.
+/// A `Direct` or `Punched` outcome normally carries a live `channel` (dialed or
+/// birthday-punched, respectively). `channel` is `None` when the target wasn't
+/// found, signaling timed out, the outcome is `Relayed` (no direct data path
+/// yet — future work), or the punch to a reachable peer didn't complete in time.
 #[derive(Debug)]
 pub struct Connection {
     /// How the DHT resolved the connection.
@@ -216,6 +254,7 @@ enum Command {
     Announce(NodeId, oneshot::Sender<()>),
     Lookup(NodeId, oneshot::Sender<Vec<Contact>>),
     Connect(NodeId, UdpSocket, SocketAddr, oneshot::Sender<ConnectReply>),
+    SetFirewall(Firewall),
 }
 
 /// A handle to a running DHT node backed by a real UDP socket.
@@ -234,13 +273,39 @@ pub struct Node {
 }
 
 impl Node {
-    /// Bind a UDP socket at `bind_addr` and start the node with the given id.
+    /// Bind a UDP socket at `bind_addr` and start the node with the given id,
+    /// using default punch tuning.
     pub async fn bind(bind_addr: SocketAddr, id: NodeId) -> io::Result<Node> {
+        Node::bind_with(bind_addr, id, PunchTuning::default()).await
+    }
+
+    /// Like [`Node::bind`], but with explicit punch tuning — chiefly to shrink
+    /// the birthday port range for fast, reliable loopback tests.
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if the birthday port range is
+    /// invalid (`start` must satisfy `1 <= start < end`) — validated here so a
+    /// bad range fails at construction rather than panicking the node's task
+    /// when a `Punched` connect later invokes the spray/open primitives.
+    pub async fn bind_with(
+        bind_addr: SocketAddr,
+        id: NodeId,
+        tuning: PunchTuning,
+    ) -> io::Result<Node> {
+        let (lo, hi) = tuning.birthday.range;
+        if !(lo >= 1 && lo < hi) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid birthday port range {:?}: need 1 <= start < end",
+                    (lo, hi)
+                ),
+            ));
+        }
         let socket = UdpSocket::bind(bind_addr).await?;
         let local_addr = socket.local_addr()?;
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (incoming_tx, incoming_rx) = mpsc::channel(16);
-        tokio::spawn(run(Dht::new(id), socket, cmd_rx, incoming_tx));
+        tokio::spawn(run(Dht::new(id), socket, cmd_rx, incoming_tx, tuning));
         Ok(Node {
             id,
             local_addr,
@@ -268,6 +333,16 @@ impl Node {
     pub async fn add_contact(&self, contact: Contact) -> Result<()> {
         self.cmd_tx
             .send(Command::AddContact(contact))
+            .await
+            .map_err(|_| Closed)
+    }
+
+    /// Declare this node's firewall type, used when planning a connect's punch
+    /// strategy. Normally derived from NAT self-classification; set explicitly to
+    /// exercise the symmetric-NAT (`Punched`) path. Defaults to `Open`.
+    pub async fn set_firewall(&self, firewall: Firewall) -> Result<()> {
+        self.cmd_tx
+            .send(Command::SetFirewall(firewall))
             .await
             .map_err(|_| Closed)
     }
@@ -341,6 +416,7 @@ async fn run(
     socket: UdpSocket,
     mut cmd_rx: mpsc::Receiver<Command>,
     incoming_tx: mpsc::Sender<Channel>,
+    tuning: PunchTuning,
 ) {
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
@@ -352,8 +428,9 @@ async fn run(
         .local_addr()
         .map(|a| a.ip())
         .unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
-    // Timing for the actual hole punch once the DHT has brokered reachability.
-    let punch_cfg = PunchConfig::default();
+    // Timing + birthday parameters for the punch once the DHT brokers reachability.
+    let punch_cfg = tuning.config;
+    let birthday = tuning.birthday;
 
     // Bootstrap waiters are keyed by the query id so a stray QueryFinished can't
     // resolve them and concurrent bootstraps don't clobber each other. Announce
@@ -395,32 +472,52 @@ async fn run(
                     target,
                     outcome,
                     peer_data_addr,
+                    strategy,
                 } => {
                     if let Some((data_sock, tx)) = pending_connect.remove(&target) {
-                        spawn_connect_punch(data_sock, outcome, peer_data_addr, punch_cfg, tx);
+                        // Seed the birthday RNG from the pre-bound socket's port so
+                        // concurrent connects don't spray identical port sequences.
+                        let seed = data_sock.local_addr().map(|a| a.port()).unwrap_or(0) as u64;
+                        spawn_connect_punch(PunchJob {
+                            data_sock,
+                            own_host: data_ip,
+                            peer: peer_data_addr,
+                            strategy,
+                            outcome,
+                            cfg: punch_cfg,
+                            birthday,
+                            seed,
+                            tx,
+                        });
                     }
                 }
                 Event::IncomingConnect {
                     initiator,
                     initiator_data_addr,
-                    ..
+                    strategy,
                 } => {
                     // Stand up a data socket, tell the core where to punch back,
-                    // and accept a punch from the initiator on it. Decline if the
-                    // node is bound to an unspecified address: the data socket's
-                    // address would be unspecified too, unpunchable by the peer
-                    // (mirrors the outbound `UnspecifiedLocalAddr` check). The
-                    // initiator simply times out.
+                    // then run the punch primitive `strategy` selects toward the
+                    // initiator (dial-accept on this socket, or spray / open
+                    // birthday sockets). Decline if the node is bound to an
+                    // unspecified address: the data socket's address would be
+                    // unspecified too, unpunchable by the peer (mirrors the
+                    // outbound `UnspecifiedLocalAddr` check); the initiator times
+                    // out.
                     if !data_ip.is_unspecified() {
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
                             if let Ok(data_addr) = data_sock.local_addr() {
                                 dht.accept_connect(initiator, data_addr, now());
-                                spawn_accept_punch(
+                                spawn_accept_punch(AcceptJob {
                                     data_sock,
-                                    initiator_data_addr.ip(),
-                                    punch_cfg,
-                                    incoming_tx.clone(),
-                                );
+                                    own_host: data_ip,
+                                    peer_host: initiator_data_addr.ip(),
+                                    strategy,
+                                    cfg: punch_cfg,
+                                    birthday,
+                                    seed: data_addr.port() as u64,
+                                    incoming_tx: incoming_tx.clone(),
+                                });
                             }
                         }
                     }
@@ -478,6 +575,7 @@ async fn run(
                             }
                         }
                     }
+                    Some(Command::SetFirewall(fw)) => dht.set_firewall(fw),
                 }
             }
             recv = socket.recv_from(&mut buf) => {
@@ -506,55 +604,160 @@ async fn run(
     }
 }
 
+/// The initiator side of a punch after a `connect` resolves.
+struct PunchJob {
+    /// The data socket pre-bound by `Node::connect` (used only for a `Direct`
+    /// dial; the birthday primitives bind their own sockets).
+    data_sock: UdpSocket,
+    /// Our data host, to bind spray/birthday sockets on.
+    own_host: IpAddr,
+    /// The peer's data address (its host is what we punch toward).
+    peer: Option<SocketAddr>,
+    /// Our punch role, as planned by the core.
+    strategy: Option<Strategy>,
+    /// The reachability outcome to report alongside any channel.
+    outcome: ConnectOutcome,
+    cfg: PunchConfig,
+    birthday: BirthdayParams,
+    seed: u64,
+    tx: oneshot::Sender<ConnectReply>,
+}
+
+/// The reachable side of a punch after an `IncomingConnect`.
+struct AcceptJob {
+    data_sock: UdpSocket,
+    own_host: IpAddr,
+    /// The initiator's data host, the only source we accept a punch from.
+    peer_host: IpAddr,
+    strategy: Strategy,
+    cfg: PunchConfig,
+    birthday: BirthdayParams,
+    seed: u64,
+    incoming_tx: mpsc::Sender<Channel>,
+}
+
 /// Punch a data channel to the peer that a `connect` resolved, then report the
 /// [`Connection`] to the waiting caller. Runs in its own task so the punch's
-/// wait doesn't block the actor loop.
-///
-/// Only `Direct` dials the peer's data socket. `Punched` is the one-sided-random
-/// *birthday* strategy (spray / open birthday sockets), which this path does not
-/// yet run — dialing a single advertised address would just burn the puncher
-/// timeout — so it reports no channel for now (birthday-in-connect is the next
-/// slice). `Relayed`/`NotFound`/`TimedOut` likewise report no channel.
-fn spawn_connect_punch(
-    data_sock: UdpSocket,
-    outcome: ConnectOutcome,
-    peer_data_addr: Option<SocketAddr>,
-    cfg: PunchConfig,
-    tx: oneshot::Sender<ConnectReply>,
-) {
+/// wait doesn't block the actor loop. The strategy picks the primitive: `Direct`
+/// dials the peer's data socket; the birthday roles spray / open sockets toward
+/// the peer's host; `Relay`/`None` report no channel.
+fn spawn_connect_punch(job: PunchJob) {
+    let PunchJob {
+        data_sock,
+        own_host,
+        peer,
+        strategy,
+        outcome,
+        cfg,
+        birthday,
+        seed,
+        tx,
+    } = job;
     tokio::spawn(async move {
-        let channel = match (outcome, peer_data_addr) {
-            (ConnectOutcome::Direct, Some(peer)) => {
-                match puncher::connect_to(data_sock, peer, &cfg).await {
-                    Ok(est) => connect_channel(est).await.ok().flatten(),
-                    Err(_) => None,
-                }
+        let channel = match (strategy, peer) {
+            (Some(Strategy::Direct), Some(peer)) => punch_direct(data_sock, peer, &cfg).await,
+            (Some(Strategy::SprayRandomPorts), Some(peer)) => {
+                // The birthday primitives bind their own sockets; free the
+                // pre-bound one now so its FD/port can't collide with them.
+                drop(data_sock);
+                punch_spray(own_host, peer.ip(), &cfg, birthday, seed).await
             }
-            _ => None,
+            (Some(Strategy::OpenBirthdaySockets), Some(peer)) => {
+                drop(data_sock);
+                punch_open(own_host, peer.ip(), &cfg, birthday, seed).await
+            }
+            // Relay (no direct data path yet) / no peer to punch to.
+            _ => {
+                drop(data_sock);
+                None
+            }
         };
         let _ = tx.send(Ok(Connection { outcome, channel }));
     });
 }
 
-/// Accept a punch from `peer_host` on `data_sock` and, on success, hand the
-/// channel to the node's incoming stream. Runs in its own task for the same
-/// reason as [`spawn_connect_punch`].
-fn spawn_accept_punch(
-    data_sock: UdpSocket,
-    peer_host: IpAddr,
-    cfg: PunchConfig,
-    incoming_tx: mpsc::Sender<Channel>,
-) {
+/// Accept a punch from the initiator per its planned strategy and, on success,
+/// hand the channel to the node's incoming stream. Runs in its own task for the
+/// same reason as [`spawn_connect_punch`].
+fn spawn_accept_punch(job: AcceptJob) {
+    let AcceptJob {
+        data_sock,
+        own_host,
+        peer_host,
+        strategy,
+        cfg,
+        birthday,
+        seed,
+        incoming_tx,
+    } = job;
     tokio::spawn(async move {
-        if let Ok(est) = puncher::accept(data_sock, peer_host, &cfg).await {
-            if let Ok(Some(channel)) = connect_channel(est).await {
-                // Non-blocking: if the application isn't draining `next_incoming`
-                // (queue full), drop this channel rather than park the task
-                // holding its socket. A flood of inbound connects is shed at the
-                // queue bound instead of accumulating blocked tasks; the peer sees
-                // its channel go nowhere and can retry.
-                let _ = incoming_tx.try_send(channel);
+        let channel = match strategy {
+            Strategy::Direct => punch_accept(data_sock, peer_host, &cfg).await,
+            Strategy::SprayRandomPorts => {
+                // Birthday primitives bind their own sockets (see connect side).
+                drop(data_sock);
+                punch_spray(own_host, peer_host, &cfg, birthday, seed).await
             }
+            Strategy::OpenBirthdaySockets => {
+                drop(data_sock);
+                punch_open(own_host, peer_host, &cfg, birthday, seed).await
+            }
+            Strategy::Relay => {
+                drop(data_sock);
+                None
+            }
+        };
+        if let Some(channel) = channel {
+            // Non-blocking: if the application isn't draining `next_incoming`
+            // (queue full), drop this channel rather than park the task holding
+            // its socket. A flood of inbound connects is shed at the queue bound
+            // instead of accumulating blocked tasks; the peer can retry.
+            let _ = incoming_tx.try_send(channel);
         }
     });
+}
+
+/// Dial a reachable peer on the pre-bound socket.
+async fn punch_direct(sock: UdpSocket, peer: SocketAddr, cfg: &PunchConfig) -> Option<Channel> {
+    match puncher::connect_to(sock, peer, cfg).await {
+        Ok(est) => connect_channel(est).await.ok().flatten(),
+        Err(_) => None,
+    }
+}
+
+/// Wait for a punch from `peer_host` on the pre-bound socket.
+async fn punch_accept(sock: UdpSocket, peer_host: IpAddr, cfg: &PunchConfig) -> Option<Channel> {
+    match puncher::accept(sock, peer_host, cfg).await {
+        Ok(est) => connect_channel(est).await.ok().flatten(),
+        Err(_) => None,
+    }
+}
+
+/// The Consistent side of a birthday punch: spray random ports at `peer_host`.
+async fn punch_spray(
+    own_host: IpAddr,
+    peer_host: IpAddr,
+    cfg: &PunchConfig,
+    b: BirthdayParams,
+    seed: u64,
+) -> Option<Channel> {
+    let bind = SocketAddr::new(own_host, 0);
+    match puncher::spray(bind, peer_host, b.range, b.probes, seed, cfg).await {
+        Ok(est) => connect_channel(est).await.ok().flatten(),
+        Err(_) => None,
+    }
+}
+
+/// The Random side of a birthday punch: open many sockets and await a probe.
+async fn punch_open(
+    own_host: IpAddr,
+    peer_host: IpAddr,
+    cfg: &PunchConfig,
+    b: BirthdayParams,
+    seed: u64,
+) -> Option<Channel> {
+    match puncher::open_birthday_sockets(own_host, peer_host, b.range, b.sockets, seed, cfg).await {
+        Ok(est) => connect_channel(est).await.ok().flatten(),
+        Err(_) => None,
+    }
 }

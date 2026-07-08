@@ -15,7 +15,9 @@ use swarm::sim::Rng;
 use tokio::time::timeout;
 
 const LO: &str = "127.0.0.1:0";
-const T: Duration = Duration::from_secs(5);
+// Comfortably longer than the punch's own `overall` (5s) so this outer guard
+// can't fire just before a legitimate establishment completes.
+const T: Duration = Duration::from_secs(15);
 
 #[tokio::test]
 async fn data_channel_over_real_udp() {

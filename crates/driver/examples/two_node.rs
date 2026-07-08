@@ -54,16 +54,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the client punches a channel to it, and they exchange application bytes.
     let listener = DataListener::bind("127.0.0.1:0".parse().unwrap()).await?;
     let data_addr = listener.local_addr()?;
+    // One config drives both sides, so dial and accept can't diverge.
     let cfg = PunchConfig::default();
     let accept = tokio::spawn(async move { listener.accept(&cfg).await });
 
-    let chan = open_channel(
-        "127.0.0.1:0".parse().unwrap(),
-        data_addr,
-        &PunchConfig::default(),
-    )
-    .await?
-    .expect("channel established");
+    let chan = open_channel("127.0.0.1:0".parse().unwrap(), data_addr, &cfg)
+        .await?
+        .expect("channel established");
     let server_chan = accept.await??.expect("server channel");
 
     chan.send(b"hello over the punched channel").await?;

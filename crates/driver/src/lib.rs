@@ -32,11 +32,12 @@ use tokio::sync::{mpsc, oneshot};
 pub use puncher::Config as PunchConfig;
 pub use swarm::dht::ConnectOutcome;
 
-/// A live, bidirectional data channel to a peer, established by a hole punch.
+/// A live, bidirectional data channel to a peer, established by a hole punch —
+/// a socket already reaching the peer, over which application bytes flow.
 ///
-/// This is what turns a `connect` from *reporting* an outcome into a *usable*
-/// connection: a socket already reaching the peer, over which application bytes
-/// flow. Built on the [`puncher`] primitives.
+/// Where [`Node::connect`] reports *whether* a peer is reachable (a
+/// [`ConnectOutcome`]), a `Channel` is the *usable* path you then establish with
+/// [`open_channel`] / [`DataListener`]. Built on the [`puncher`] primitives.
 #[derive(Debug)]
 pub struct Channel {
     socket: UdpSocket,

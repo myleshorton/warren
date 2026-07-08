@@ -185,10 +185,10 @@ pub type Result<T> = std::result::Result<T, Closed>;
 /// The result of [`Node::connect`]: how the DHT resolved reachability, plus the
 /// live [`Channel`] if the punch to the peer's data socket succeeded.
 ///
-/// `channel` is `None` when the target wasn't found, signaling timed out, the
-/// outcome is `Punched` or `Relayed` (the real-NAT birthday punch and the relay
-/// data path are future work), or the direct punch to a reachable peer didn't
-/// complete in time.
+/// A `Direct` or `Punched` outcome normally carries a live `channel` (dialed or
+/// birthday-punched, respectively). `channel` is `None` when the target wasn't
+/// found, signaling timed out, the outcome is `Relayed` (no direct data path
+/// yet — future work), or the punch to a reachable peer didn't complete in time.
 #[derive(Debug)]
 pub struct Connection {
     /// How the DHT resolved the connection.
@@ -281,11 +281,26 @@ impl Node {
 
     /// Like [`Node::bind`], but with explicit punch tuning — chiefly to shrink
     /// the birthday port range for fast, reliable loopback tests.
+    ///
+    /// Returns [`io::ErrorKind::InvalidInput`] if the birthday port range is
+    /// invalid (`start` must satisfy `1 <= start < end`) — validated here so a
+    /// bad range fails at construction rather than panicking the node's task
+    /// when a `Punched` connect later invokes the spray/open primitives.
     pub async fn bind_with(
         bind_addr: SocketAddr,
         id: NodeId,
         tuning: PunchTuning,
     ) -> io::Result<Node> {
+        let (lo, hi) = tuning.birthday.range;
+        if !(lo >= 1 && lo < hi) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "invalid birthday port range {:?}: need 1 <= start < end",
+                    (lo, hi)
+                ),
+            ));
+        }
         let socket = UdpSocket::bind(bind_addr).await?;
         let local_addr = socket.local_addr()?;
         let (cmd_tx, cmd_rx) = mpsc::channel(64);

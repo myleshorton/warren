@@ -179,3 +179,22 @@ async fn connect_punches_a_channel_for_symmetric_nat() {
         .unwrap();
     assert_eq!(&buf[..n], b"punch");
 }
+
+#[tokio::test]
+async fn bind_with_rejects_an_invalid_birthday_range() {
+    // A bad range must be rejected at construction, not panic the node task when
+    // a Punched connect later reaches the spray/open primitives.
+    let tuning = PunchTuning {
+        config: PunchConfig::default(),
+        birthday: BirthdayParams {
+            range: (30_000, 20_000), // start >= end
+            sockets: 256,
+            probes: 1750,
+        },
+    };
+    let err = match Node::bind_with(LO.parse().unwrap(), Rng::new(1).node_id(), tuning).await {
+        Ok(_) => panic!("an invalid range must be rejected"),
+        Err(e) => e,
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}

@@ -548,7 +548,12 @@ fn spawn_accept_punch(
     tokio::spawn(async move {
         if let Ok(est) = puncher::accept(data_sock, peer_host, &cfg).await {
             if let Ok(Some(channel)) = connect_channel(est).await {
-                let _ = incoming_tx.send(channel).await;
+                // Non-blocking: if the application isn't draining `next_incoming`
+                // (queue full), drop this channel rather than park the task
+                // holding its socket. A flood of inbound connects is shed at the
+                // queue bound instead of accumulating blocked tasks; the peer sees
+                // its channel go nowhere and can retry.
+                let _ = incoming_tx.try_send(channel);
             }
         }
     });

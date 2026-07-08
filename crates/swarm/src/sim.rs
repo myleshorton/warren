@@ -48,9 +48,26 @@ impl Rng {
     }
 }
 
+/// The NAT a simulated node sits behind.
+///
+/// This is a minimal model covering the signal NAT *classification* depends on:
+/// what source address a receiver observes. Full data-plane translation with
+/// inbound admission/filtering (needed to exercise real punch delivery) arrives
+/// with the NAT-translating packet simulator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NatKind {
+    /// Publicly reachable; stable observed address, unsolicited inbound works.
+    Open,
+    /// Firewalled but stable observed port (endpoint-independent mapping).
+    Consistent,
+    /// Symmetric: a fresh observed port per destination.
+    Random,
+}
+
 struct Node {
     dht: Dht,
     addr: SocketAddr,
+    nat: NatKind,
 }
 
 enum Scheduled {
@@ -89,10 +106,14 @@ pub struct Sim {
     now: Millis,
     nodes: Vec<Node>,
     by_addr: HashMap<SocketAddr, usize>,
+    /// Reverse map from a NAT-translated source address back to its node, so a
+    /// reply addressed to an observed (translated) address routes home.
+    nat_reverse: HashMap<SocketAddr, usize>,
     queue: BinaryHeap<Reverse<Slot>>,
     seq: u64,
     latency_ms: Millis,
     loss: f64,
+    seed: u64,
     rng: Rng,
     events: Vec<(usize, Event)>,
 }
@@ -104,10 +125,12 @@ impl Sim {
             now: 0,
             nodes: Vec::new(),
             by_addr: HashMap::new(),
+            nat_reverse: HashMap::new(),
             queue: BinaryHeap::new(),
             seq: 0,
             latency_ms,
             loss: 0.0,
+            seed,
             rng: Rng::new(seed),
             events: Vec::new(),
         }
@@ -138,9 +161,56 @@ impl Sim {
         self.nodes.push(Node {
             dht: Dht::new(id),
             addr,
+            nat: NatKind::Open,
         });
         self.by_addr.insert(addr, index);
         (index, addr)
+    }
+
+    /// Set the NAT a node sits behind (default [`NatKind::Open`]).
+    pub fn set_nat(&mut self, i: usize, kind: NatKind) {
+        self.nodes[i].nat = kind;
+    }
+
+    /// The NAT a node sits behind.
+    pub fn nat_kind(&self, i: usize) -> NatKind {
+        self.nodes[i].nat
+    }
+
+    /// Have node `i` sample its NAT by probing up to `count` known peers.
+    ///
+    /// Reachability (which distinguishes Open from Consistent) is supplied from
+    /// the node's modeled NAT, standing in for the inbound firewall probe.
+    pub fn sample_nat(&mut self, i: usize, count: usize) {
+        let now = self.now;
+        let reachable = self.nodes[i].nat == NatKind::Open;
+        self.nodes[i].dht.note_reachable(reachable);
+        self.nodes[i].dht.sample_nat(now, count);
+    }
+
+    /// The source address a receiver observes for a packet `sender` -> `dest`.
+    ///
+    /// Stable for Open/Consistent; per-destination for Random. Random ports live
+    /// well above the real-address block so they cannot collide with it.
+    fn translated_source(&self, sender: usize, dest: usize) -> SocketAddr {
+        match self.nodes[sender].nat {
+            NatKind::Open | NatKind::Consistent => self.nodes[sender].addr,
+            NatKind::Random => {
+                let host = self.nodes[sender].addr.ip();
+                let mut r = Rng::new(self.seed ^ ((sender as u64) << 32) ^ dest as u64);
+                let port = 30_000 + (r.next_u64() % 30_000) as u16;
+                SocketAddr::new(host, port)
+            }
+        }
+    }
+
+    /// Resolve a destination address to a node, via the direct map or the NAT
+    /// reverse map (so replies to observed addresses route home).
+    fn resolve(&self, addr: &SocketAddr) -> Option<usize> {
+        self.by_addr
+            .get(addr)
+            .copied()
+            .or_else(|| self.nat_reverse.get(addr).copied())
     }
 
     /// Address of node `i`.
@@ -177,13 +247,17 @@ impl Sim {
 
     fn drain_outboxes(&mut self) {
         for i in 0..self.nodes.len() {
-            let from = self.nodes[i].addr;
             while let Some(t) = self.nodes[i].dht.poll_transmit() {
-                let Some(&to) = self.by_addr.get(&t.to) else {
+                let Some(to) = self.resolve(&t.to) else {
                     continue; // unknown destination: dropped, as on a real net
                 };
                 if self.loss > 0.0 && self.rng.unit() < self.loss {
                     continue; // simulated packet loss
+                }
+                // The receiver sees our NAT-translated source, not our raw addr.
+                let from = self.translated_source(i, to);
+                if from != self.nodes[i].addr {
+                    self.nat_reverse.insert(from, i);
                 }
                 let time = self.now + self.latency_ms;
                 self.queue.push(Reverse(Slot {

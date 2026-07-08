@@ -35,8 +35,8 @@ pub enum MsgError {
 pub enum Message {
     /// Liveness probe.
     Ping,
-    /// Reply to [`Message::Ping`].
-    Pong,
+    /// Reply to [`Message::Ping`], echoing the source address the responder saw.
+    Pong { observed: SocketAddr },
     /// Request the closest known nodes to `target`.
     FindNode { target: NodeId },
     /// Reply to [`Message::FindNode`] with closest known contacts.
@@ -64,8 +64,9 @@ impl Packet {
             Message::Ping => {
                 enc.u8(KIND_PING);
             }
-            Message::Pong => {
+            Message::Pong { observed } => {
                 enc.u8(KIND_PONG);
+                encode_addr(&mut enc, observed);
             }
             Message::FindNode { target } => {
                 enc.u8(KIND_FIND_NODE);
@@ -91,7 +92,9 @@ impl Packet {
         let kind = dec.u8()?;
         let msg = match kind {
             KIND_PING => Message::Ping,
-            KIND_PONG => Message::Pong,
+            KIND_PONG => Message::Pong {
+                observed: decode_addr(&mut dec)?,
+            },
             KIND_FIND_NODE => {
                 let target = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 Message::FindNode { target }
@@ -174,7 +177,9 @@ mod tests {
         roundtrip(&Packet {
             sender: id(2),
             rid: 8,
-            msg: Message::Pong,
+            msg: Message::Pong {
+                observed: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(9, 9, 9, 9), 42)),
+            },
         });
     }
 

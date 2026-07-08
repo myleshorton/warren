@@ -51,13 +51,15 @@ crates/
   wire      byte-level codec (varints, length-delimited frames)    — done
   crypto    ed25519 identity, blake3 hashing, discovery keys        — done
   swarm     sans-IO Kademlia DHT + deterministic network simulator  — phase-0
-            + NAT self-classification + hole-punch strategy/birthday model
-  (next: wire NAT sampling into the DHT, NAT-translating packet sim, real UDP
+            + NAT self-classification (wired into DHT ping sampling)
+            + hole-punch strategy/birthday model
+  (next: full NAT-translating packet sim with inbound admission, real UDP
    driver, port mapping, blob, log, ...)
 ```
 
 Try it:
 - `cargo run -p swarm --example dht_sim` — a 30-node DHT bootstraps and answers a lookup.
+- `cargo run -p swarm --example nat_sim` — a node classifies its own NAT by probing the swarm.
 - `cargo run -p swarm --example punch_sim` — hole-punch success rate across every NAT pairing.
 
 Crates are `publish = false` while the design settles. Names are role-based and

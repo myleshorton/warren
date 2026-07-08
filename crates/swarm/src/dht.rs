@@ -14,9 +14,13 @@
 
 use crate::id::NodeId;
 use crate::msg::{Message, Packet};
+use crate::nat::{Firewall, NatSampler};
 use crate::routing::{Contact, RoutingTable, K};
 use std::collections::HashMap;
 use std::net::SocketAddr;
+
+/// Peers to probe when sampling the local NAT.
+pub const NAT_SAMPLE_COUNT: usize = 5;
 
 /// Concurrency parameter: how many lookup requests may be in flight at once.
 pub const ALPHA: usize = 3;
@@ -112,6 +116,9 @@ pub struct Dht {
     table: RoutingTable,
     queries: HashMap<QueryId, Query>,
     pending: HashMap<u64, Pending>,
+    nat: NatSampler,
+    nat_pending: HashMap<u64, Millis>,
+    self_reachable: bool,
     outbox: Vec<Transmit>,
     events: Vec<Event>,
     next_rid: u64,
@@ -126,6 +133,9 @@ impl Dht {
             table: RoutingTable::new(id),
             queries: HashMap::new(),
             pending: HashMap::new(),
+            nat: NatSampler::new(),
+            nat_pending: HashMap::new(),
+            self_reachable: false,
             outbox: Vec::new(),
             events: Vec::new(),
             next_rid: 1,
@@ -151,6 +161,44 @@ impl Dht {
     /// Seed a bootstrap contact into the routing table.
     pub fn add_contact(&mut self, contact: Contact) {
         self.table.insert(contact);
+    }
+
+    /// Probe up to `count` known peers to learn our externally-observed address.
+    ///
+    /// Each peer replies with the source address it saw; those observations feed
+    /// the [`NatSampler`], which classifies our firewall once enough arrive. This
+    /// is the outbound half of NAT detection; reachability (Open vs Consistent)
+    /// comes from a separate inbound probe fed via [`Dht::note_reachable`].
+    pub fn sample_nat(&mut self, now: Millis, count: usize) {
+        let peers: Vec<SocketAddr> = self
+            .table
+            .closest(&self.id, count)
+            .into_iter()
+            .map(|c| c.addr)
+            .collect();
+        for addr in peers {
+            let rid = self.next_rid;
+            self.next_rid += 1;
+            self.nat_pending.insert(rid, now + REQUEST_TIMEOUT_MS);
+            self.send(addr, rid, Message::Ping);
+        }
+    }
+
+    /// Record whether an inbound reachability probe succeeded (drives the
+    /// Open-vs-Consistent distinction). The probe that produces this signal
+    /// lands with the NAT-translating packet simulator.
+    pub fn note_reachable(&mut self, reachable: bool) {
+        self.self_reachable = reachable;
+    }
+
+    /// The current NAT classification, or `None` until enough samples arrive.
+    pub fn firewall(&self) -> Option<Firewall> {
+        self.nat.classify(self.self_reachable)
+    }
+
+    /// Number of NAT observations collected so far.
+    pub fn nat_samples(&self) -> usize {
+        self.nat.len()
     }
 
     /// Begin a lookup for the nodes closest to our own id — the standard way to
@@ -188,9 +236,15 @@ impl Dht {
 
         match packet.msg {
             Message::Ping => {
-                self.send(from, packet.rid, Message::Pong);
+                // Echo back the source address we saw, so the sender can learn
+                // how the network observes it.
+                self.send(from, packet.rid, Message::Pong { observed: from });
             }
-            Message::Pong => {}
+            Message::Pong { observed } => {
+                if self.nat_pending.remove(&packet.rid).is_some() {
+                    self.nat.add(observed);
+                }
+            }
             Message::FindNode { target } => {
                 let contacts = self.table.closest(&target, K);
                 self.send(from, packet.rid, Message::Nodes { contacts });
@@ -220,11 +274,18 @@ impl Dht {
                 self.drive_query(p.query, now);
             }
         }
+
+        // Expire NAT probes; a lost Pong simply yields one fewer sample.
+        self.nat_pending.retain(|_, deadline| *deadline > now);
     }
 
     /// The earliest pending deadline, if any request is in flight.
     pub fn poll_timeout(&self) -> Option<Millis> {
-        self.pending.values().map(|p| p.deadline).min()
+        self.pending
+            .values()
+            .map(|p| p.deadline)
+            .chain(self.nat_pending.values().copied())
+            .min()
     }
 
     /// Take the next packet to transmit, if any.

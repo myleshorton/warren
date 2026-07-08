@@ -239,12 +239,22 @@ fn one_sided_random(
 /// Attempt a punch with a full packet-level NAT model (mapping + filtering),
 /// rather than the probabilistic abstraction of [`attempt_punch`]. The outcome
 /// emerges from packets traversing two [`NatBox`]es.
+///
+/// Panics if `params.port_min > params.port_max`.
 pub fn packet_punch(
     local: Firewall,
     remote: Firewall,
     rng: &mut Rng,
     params: &PunchParams,
 ) -> Outcome {
+    // Validate at the public boundary so an invalid range is attributed to
+    // PunchParams, not a deeper NatBox construction panic.
+    assert!(
+        params.port_min <= params.port_max,
+        "invalid PunchParams port range: {} > {}",
+        params.port_min,
+        params.port_max
+    );
     match plan(local, remote) {
         Strategy::Relay => Outcome::Relayed,
         Strategy::Direct => {

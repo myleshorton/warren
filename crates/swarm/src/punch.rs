@@ -177,7 +177,7 @@ fn dial_reachable(dialer: &mut NatBox, server: &mut NatBox) -> bool {
 
 /// Establish a direct connection between two predictable-port peers via
 /// simultaneous open: each learns the other's stable external address, then both
-/// send, opening each address-restricted filter. Returns whether traffic flows
+/// send, opening each address-and-port-dependent filter. Returns whether traffic flows
 /// both ways.
 fn direct_open(a: &mut NatBox, b: &mut NatBox) -> bool {
     let sa = a.open_socket();
@@ -233,10 +233,11 @@ fn one_sided_random(
         consistent.send(cs, guess_addr);
         // If the guess hit an opened socket, the random side admits it (it
         // already sent to the consistent side)...
-        if random.recv(guess, c_ext).is_some() {
-            // ...and the reply is admitted by the consistent side, since the
-            // winning spray just opened its filter toward this exact address.
-            let r_ext = SocketAddr::new(r_host, guess);
+        if let Some(owner) = random.recv(guess, c_ext) {
+            // ...so that socket replies, and the consistent side admits it
+            // because the winning spray just opened its filter toward this
+            // exact address. Both directions now flow.
+            let r_ext = random.send(owner, c_ext);
             if consistent.recv(c_ext.port(), r_ext).is_some() {
                 return true;
             }

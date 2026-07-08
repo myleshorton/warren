@@ -126,7 +126,11 @@ impl NatBox {
             },
         };
         self.port_owner.insert(port, socket);
-        self.port_allow.entry(port).or_default().insert(dest);
+        // Open admits any source, so recv never consults the filter — don't
+        // grow it for nothing.
+        if self.kind != Firewall::Open {
+            self.port_allow.entry(port).or_default().insert(dest);
+        }
         SocketAddr::new(self.host, port)
     }
 

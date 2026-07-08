@@ -10,6 +10,7 @@ use swarm::sim::Rng;
 use swarm::{Firewall, Outcome};
 
 fn rate<F: FnMut() -> Outcome>(trials: usize, mut f: F) -> f64 {
+    assert!(trials > 0, "rate() needs at least one trial");
     let ok = (0..trials)
         .filter(|_| !matches!(f(), Outcome::Relayed))
         .count();

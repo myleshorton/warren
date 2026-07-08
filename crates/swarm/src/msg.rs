@@ -18,6 +18,8 @@ const KIND_FIND_NODE: u8 = 3;
 const KIND_NODES: u8 = 4;
 const KIND_ANNOUNCE: u8 = 5;
 const KIND_SIGNAL: u8 = 7;
+const KIND_REFLECT: u8 = 8;
+const KIND_REFLECTED: u8 = 9;
 
 const ADDR_V4: u8 = 4;
 const ADDR_V6: u8 = 6;
@@ -53,6 +55,14 @@ pub enum Message {
     /// Ask the recipient to store the sender as an announcer under `topic`.
     /// One-way (best-effort); the announcer does not wait for confirmation.
     Announce { topic: NodeId },
+    /// Ask the recipient to echo the source address it observes (a STUN-like
+    /// reflexive probe). Unlike [`Message::Ping`], a `Reflect` is *not* routing
+    /// evidence: it comes from a transient data socket, not a routable peer, so
+    /// the recipient must not add the sender to its routing table.
+    Reflect,
+    /// Reply to [`Message::Reflect`]: the source address the responder saw,
+    /// i.e. the sender's externally-observed (post-NAT) data-socket address.
+    Reflected { observed: SocketAddr },
     /// Coordinate a hole punch: relayed initiator↔target through a coordinator
     /// that holds the target's announce record.
     Signal {
@@ -115,6 +125,13 @@ impl Packet {
                 enc.u8(KIND_ANNOUNCE);
                 enc.raw(topic.as_bytes());
             }
+            Message::Reflect => {
+                enc.u8(KIND_REFLECT);
+            }
+            Message::Reflected { observed } => {
+                enc.u8(KIND_REFLECTED);
+                encode_addr(&mut enc, observed);
+            }
             Message::Signal {
                 target,
                 initiator,
@@ -159,6 +176,10 @@ impl Packet {
                 let topic = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 Message::Announce { topic }
             }
+            KIND_REFLECT => Message::Reflect,
+            KIND_REFLECTED => Message::Reflected {
+                observed: decode_addr(&mut dec)?,
+            },
             KIND_SIGNAL => {
                 let target = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 let initiator = NodeId::from_bytes(dec.array::<ID_LEN>()?);
@@ -316,6 +337,22 @@ mod tests {
             sender: id(5),
             rid: 1,
             msg: Message::Announce { topic: id(99) },
+        });
+    }
+
+    #[test]
+    fn reflect_roundtrip() {
+        roundtrip(&Packet {
+            sender: id(7),
+            rid: 2,
+            msg: Message::Reflect,
+        });
+        roundtrip(&Packet {
+            sender: id(8),
+            rid: 3,
+            msg: Message::Reflected {
+                observed: addr4(51000),
+            },
         });
     }
 

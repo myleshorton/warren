@@ -60,8 +60,16 @@ pub enum Message {
         target: NodeId,
         /// The peer initiating the connection.
         initiator: NodeId,
-        /// The initiator's address, as observed and filled in by the coordinator.
+        /// The initiator's *control* address, as observed and filled in by the
+        /// coordinator (which sees the control socket, not the data socket).
         initiator_addr: SocketAddr,
+        /// The sender's *data-socket* address, where the actual channel is
+        /// punched (initiator's on a request, target's on a reply). Unlike
+        /// `initiator_addr` the coordinator can't observe this — a data socket is
+        /// a different port with its own NAT mapping — so the sender fills it in.
+        /// On loopback that's the local address; a real NAT's external mapping
+        /// needs reflexive discovery (a separate layer).
+        data_addr: SocketAddr,
         /// The sender's firewall type (initiator's on a request, target's on a reply).
         nat: Firewall,
         /// False for an initiator→target request, true for a target→initiator reply.
@@ -111,6 +119,7 @@ impl Packet {
                 target,
                 initiator,
                 initiator_addr,
+                data_addr,
                 nat,
                 is_reply,
             } => {
@@ -118,6 +127,7 @@ impl Packet {
                 enc.raw(target.as_bytes());
                 enc.raw(initiator.as_bytes());
                 encode_addr(&mut enc, initiator_addr);
+                encode_addr(&mut enc, data_addr);
                 enc.u8(nat.as_u8());
                 enc.u8(u8::from(*is_reply));
             }
@@ -153,6 +163,7 @@ impl Packet {
                 let target = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 let initiator = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 let initiator_addr = decode_addr(&mut dec)?;
+                let data_addr = decode_addr(&mut dec)?;
                 let nat = Firewall::from_u8(dec.u8()?)
                     .ok_or(MsgError::Malformed("unknown firewall tag"))?;
                 let is_reply = dec.u8()? != 0;
@@ -160,6 +171,7 @@ impl Packet {
                     target,
                     initiator,
                     initiator_addr,
+                    data_addr,
                     nat,
                     is_reply,
                 }
@@ -321,6 +333,7 @@ mod tests {
                     target: id(20),
                     initiator: id(21),
                     initiator_addr: addr4(9000),
+                    data_addr: addr4(9001),
                     nat,
                     is_reply,
                 },

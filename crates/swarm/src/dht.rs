@@ -16,11 +16,14 @@ use crate::id::NodeId;
 use crate::msg::{Message, Packet};
 use crate::nat::{Firewall, NatSampler};
 use crate::routing::{Contact, RoutingTable, K};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 
 /// Peers to probe when sampling the local NAT.
 pub const NAT_SAMPLE_COUNT: usize = 5;
+
+/// How many recent connect initiators a coordinator remembers (bounded FIFO).
+const MAX_SEEN_INITIATORS: usize = 1024;
 
 /// Concurrency parameter: how many lookup requests may be in flight at once.
 pub const ALPHA: usize = 3;
@@ -177,6 +180,10 @@ pub struct Dht {
     announces: HashMap<NodeId, Vec<Contact>>,
     /// Targets we are mid-connect to -> deadline by which signaling must finish.
     connecting: HashMap<NodeId, Millis>,
+    /// Recently observed connect initiators (coordinator side), bounded FIFO. We
+    /// relay a reply only to an address that actually initiated, so a target
+    /// can't redirect the relayed reply to an arbitrary victim.
+    seen_initiators: VecDeque<SocketAddr>,
     outbox: Vec<Transmit>,
     events: Vec<Event>,
     next_rid: u64,
@@ -197,6 +204,7 @@ impl Dht {
             local_firewall: Firewall::Open,
             announces: HashMap::new(),
             connecting: HashMap::new(),
+            seen_initiators: VecDeque::new(),
             outbox: Vec::new(),
             events: Vec::new(),
             next_rid: 1,
@@ -470,12 +478,15 @@ impl Dht {
                 q.add_if_new(c);
             }
         }
-        // A responder that holds announce records for the target is a candidate
-        // coordinator; remember it and the records it returned.
+        // A responder is a candidate coordinator only if it holds the target's
+        // own self-announce (a record whose id is the target); a non-empty peers
+        // list under the topic that lacks it doesn't help a connect-by-id.
         if !peers.is_empty() {
-            let coord = Contact::new(responder, responder_addr);
-            if !q.coordinators.iter().any(|c| c.id == coord.id) {
-                q.coordinators.push(coord);
+            if peers.iter().any(|p| p.id == q.target) {
+                let coord = Contact::new(responder, responder_addr);
+                if !q.coordinators.iter().any(|c| c.id == coord.id) {
+                    q.coordinators.push(coord);
+                }
             }
             for peer in peers {
                 if !q.peers.iter().any(|c| c.id == peer.id) {
@@ -484,6 +495,16 @@ impl Dht {
             }
         }
         self.drive_query(p.query, now);
+    }
+
+    fn remember_initiator(&mut self, addr: SocketAddr) {
+        if self.seen_initiators.contains(&addr) {
+            return;
+        }
+        if self.seen_initiators.len() >= MAX_SEEN_INITIATORS {
+            self.seen_initiators.pop_front();
+        }
+        self.seen_initiators.push_back(addr);
     }
 
     fn store_announce(&mut self, topic: NodeId, announcer: Contact) {
@@ -689,6 +710,9 @@ impl Dht {
                 // We are a coordinator: forward to the target's own record (the
                 // announcer whose id is the target), over the mapping it opened
                 // by announcing to us, filling in the observed initiator addr.
+                // Remember the initiator so we'll only relay the reply back to an
+                // address that actually initiated.
+                self.remember_initiator(from);
                 let rid = self.alloc_rid();
                 self.send(
                     target_addr,
@@ -708,13 +732,16 @@ impl Dht {
                 let outcome = outcome_for(self.local_firewall, nat);
                 self.events.push(Event::Connected { target, outcome });
             }
-        } else if self
-            .announces
-            .get(&target)
-            .is_some_and(|recs| recs.iter().any(|c| c.id == target && c.addr == from))
+        } else if self.seen_initiators.contains(&initiator_addr)
+            && self
+                .announces
+                .get(&target)
+                .is_some_and(|recs| recs.iter().any(|c| c.id == target && c.addr == from))
         {
-            // We are the coordinator relaying the reply — but only if it truly
-            // came from the target's own record (id == target, at that address).
+            // We are the coordinator relaying the reply — but only to an address
+            // that actually initiated (so the target can't redirect it to a
+            // victim), and only if the reply truly came from the target's own
+            // record (id == target, at that address).
             // Otherwise an arbitrary announcer under the same topic could spoof a
             // reply to use us as a reflector or feed the initiator a bogus
             // firewall type. (Full authentication — a Noise handshake and

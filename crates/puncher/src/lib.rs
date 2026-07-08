@@ -154,6 +154,7 @@ pub async fn open_birthday_sockets(
         range.0 >= 1 && range.0 < range.1,
         "invalid port range {range:?}: need 1 <= start < end"
     );
+    let deadline = Instant::now() + cfg.overall;
     let mut rng = Rng::new(seed);
     let span = (range.1 - range.0) as u64;
     let mut set = JoinSet::new();
@@ -161,6 +162,9 @@ pub async fn open_birthday_sockets(
     let mut attempts = 0;
     let max_attempts = count.saturating_mul(20);
     while opened < count && attempts < max_attempts {
+        if Instant::now() >= deadline {
+            break; // binding also counts against the overall deadline
+        }
         attempts += 1;
         let port = range.0 + (rng.next_u64() % span) as u16;
         if let Ok(socket) = UdpSocket::bind((host, port)).await {
@@ -180,7 +184,7 @@ pub async fn open_birthday_sockets(
         }
     }
 
-    let found = timeout(cfg.overall, async {
+    let found = timeout(deadline.saturating_duration_since(Instant::now()), async {
         while let Some(joined) = set.join_next().await {
             if let Ok(Some(hit)) = joined {
                 return Some(hit);

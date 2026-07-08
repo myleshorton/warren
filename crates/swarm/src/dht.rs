@@ -35,7 +35,8 @@ pub const ALPHA: usize = 3;
 /// How long (ms) to wait for a response before treating a request as failed.
 pub const REQUEST_TIMEOUT_MS: u64 = 1_000;
 
-/// How long (ms) to wait for a connect's signaling to complete before giving up.
+/// Overall deadline (ms) for a connect — covering both discovery and the
+/// coordinator-brokered signaling — after which it gives up.
 pub const CONNECT_TIMEOUT_MS: u64 = 10_000;
 
 /// Milliseconds since an arbitrary epoch chosen by the caller.
@@ -510,7 +511,11 @@ impl Dht {
                 }
             }
             for peer in peers {
-                if !q.peers.iter().any(|c| c.id == peer.id) {
+                // Last-reported address wins, so a re-announce (or a fresher
+                // report from another coordinator) refreshes a known peer.
+                if let Some(existing) = q.peers.iter_mut().find(|c| c.id == peer.id) {
+                    existing.addr = peer.addr;
+                } else {
                     q.peers.push(peer);
                 }
             }

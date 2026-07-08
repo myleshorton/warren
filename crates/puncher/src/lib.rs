@@ -1,7 +1,7 @@
 //! Real-UDP hole punching: the socket-level mechanics that establish a direct
 //! path between two peers, over `tokio` sockets.
 //!
-//! Which primitive a peer runs is chosen by [`swarm::punch::plan`] from the two
+//! Which primitive a peer runs is chosen by `swarm::punch::plan` from the two
 //! peers' firewall types (that decision, and its success probability, are
 //! verified in the `swarm` crate). This crate is the *execution*:
 //!
@@ -22,10 +22,27 @@ use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
-use swarm::sim::Rng;
 use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Instant};
+
+/// Small deterministic PRNG (SplitMix64) for picking spray/bind ports. Inlined
+/// so this real-socket crate needn't depend on `swarm` (nor its simulator).
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed)
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+}
 
 /// A hole-punch probe.
 pub const PROBE: u8 = 1;
@@ -142,14 +159,19 @@ pub async fn accept(socket: UdpSocket, cfg: &Config) -> io::Result<Option<Establ
 }
 
 /// The random side of a one-sided-random punch: bind `count` sockets to
-/// unpredictable ports in `range` on `host` and listen. Because we never send
-/// first, our ports are unobservable to the peer — the peer must find one by
-/// spraying. Returns the socket that first receives a probe.
+/// unpredictable ports in `range` on `host` and listen for a probe from
+/// `peer_host`. Because we never send first, our ports are unobservable to the
+/// peer — the peer must find one by spraying. Returns the socket that first
+/// receives a probe from `peer_host`.
+///
+/// Only probes from `peer_host` are honored, so on a non-loopback bind an
+/// unrelated host can't hijack a socket by guessing a port.
 ///
 /// `range` is half-open, `[range.0, range.1)`. Panics if not
 /// `1 <= range.0 < range.1`.
 pub async fn open_birthday_sockets(
     host: IpAddr,
+    peer_host: IpAddr,
     range: (u16, u16),
     count: usize,
     seed: u64,
@@ -178,10 +200,10 @@ pub async fn open_birthday_sockets(
                 let mut buf = [0u8; 64];
                 loop {
                     match socket.recv_from(&mut buf).await {
-                        Ok((n, from)) if matches!(&buf[..n], [PROBE]) => {
+                        Ok((n, from)) if from.ip() == peer_host && matches!(&buf[..n], [PROBE]) => {
                             return Some((socket, from));
                         }
-                        Ok(_) => {} // stray datagram: keep this socket listening
+                        Ok(_) => {} // stray/foreign datagram: keep listening
                         Err(_) => return None,
                     }
                 }

@@ -87,7 +87,7 @@ async fn birthday_punch_over_real_sockets() {
     let range = (20_000u16, 30_000u16);
     let cfg = Config::fast();
 
-    let random = open_birthday_sockets(LO, range, 256, 0xB1_2345, &cfg);
+    let random = open_birthday_sockets(LO, LO, range, 256, 0xB1_2345, &cfg);
     let consistent = spray(addr(0), LO, range, 5_000, 0x5B_9876, &cfg);
 
     let (rr, rc) = tokio::join!(random, consistent);

@@ -5,13 +5,18 @@
 //! full path: a single `connect(id)` discovers the peer, coordinates
 //! reachability through a DHT coordinator, and punches a live channel — with no
 //! out-of-band address exchange (the data-socket addresses ride the DHT
-//! signaling). On loopback every node is reachable, so the connect resolves
-//! `Direct`.
+//! signaling). On loopback every node is reachable, so a default connect resolves
+//! `Direct`; `connect_punches_a_channel_for_symmetric_nat` forces a
+//! Consistent↔Random pairing so it resolves `Punched` and runs the birthday
+//! punch instead.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use driver::{open_channel, ConnectOutcome, DataListener, Node, PunchConfig};
+use driver::{
+    open_channel, BirthdayParams, ConnectOutcome, DataListener, Firewall, Node, PunchConfig,
+    PunchTuning,
+};
 use swarm::sim::Rng;
 use tokio::time::timeout;
 
@@ -113,4 +118,64 @@ async fn connect_yields_a_live_channel() {
         .unwrap()
         .unwrap();
     assert_eq!(&buf[..n], b"pong");
+}
+
+#[tokio::test]
+async fn connect_punches_a_channel_for_symmetric_nat() {
+    // Force a Consistent↔Random pairing so the connect resolves `Punched`: the
+    // Consistent client sprays random ports, the Random server opens many
+    // sockets, and a probe collides — the birthday punch, end to end over
+    // loopback (a bounded port range + fast timing keeps it quick and reliable,
+    // the OS port space standing in for a symmetric NAT's external ports).
+    let tuning = PunchTuning {
+        config: PunchConfig::fast(),
+        birthday: BirthdayParams {
+            range: (20_000, 30_000),
+            sockets: 256,
+            probes: 5_000,
+        },
+    };
+    let lo = LO.parse().unwrap();
+    let mut rng = Rng::new(0xB1D7A);
+    let boot = Node::bind_with(lo, rng.node_id(), tuning).await.unwrap();
+
+    let mut peers = Vec::new();
+    for _ in 0..6 {
+        let n = Node::bind_with(lo, rng.node_id(), tuning).await.unwrap();
+        n.add_contact(boot.contact()).await.unwrap();
+        timeout(T, n.bootstrap()).await.unwrap().unwrap();
+        peers.push(n);
+    }
+    let server = &peers[0];
+    let client = &peers[1];
+    client.set_firewall(Firewall::Consistent).await.unwrap();
+    server.set_firewall(Firewall::Random).await.unwrap();
+
+    timeout(T, server.announce(server.id()))
+        .await
+        .unwrap()
+        .unwrap();
+    let server_id = server.id();
+    let server_handle = server.clone();
+    let incoming = tokio::spawn(async move { server_handle.next_incoming().await });
+
+    let conn = timeout(T, client.connect(server_id))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(conn.outcome, ConnectOutcome::Punched);
+    let client_chan = conn.channel.expect("birthday punch should yield a channel");
+    let server_chan = timeout(T, incoming)
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("server should receive a punched channel");
+
+    client_chan.send(b"punch").await.unwrap();
+    let mut buf = [0u8; 32];
+    let n = timeout(T, server_chan.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"punch");
 }

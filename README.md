@@ -42,6 +42,7 @@ accept weaker guarantees.
 | **Oracle checks** | Lookup results verified against a brute-force ground truth | `swarm` |
 | **Statistical guardrails** | Probabilistic behavior (birthday punch) measured against its analytic bound; fails if constants weaken | `swarm` |
 | **Loopback integration** | Real `tokio` UDP sockets on one host: bootstrap, announce, lookup, connect | `driver` |
+| **Real-socket punching** | Actual UDP hole punching on one host — direct, dial, and a real birthday port-collision | `puncher` |
 | **Fault injection** (planned) | Drops, reorders, corruption, partitions | `swarm`, `log` |
 | **Corpus / golden files** (planned) | Wire format stays stable across versions | `wire`, `log` |
 | **Live demos** (planned) | A human can watch it work (network forming, a video streaming) | binaries |
@@ -58,7 +59,9 @@ crates/
             + announce/lookup + DHT-coordinated connect (discovery →
               coordinator-brokered signaling → punch)
   driver    tokio UDP driver: the sans-IO core over real sockets, async API
-  (next: NAT sampling + hole punching over real sockets, port mapping, blob, log, ...)
+  puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
+
+  next: wire the puncher into the driver's connect, port mapping, blob, log, ...
 ```
 
 Try it:

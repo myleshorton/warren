@@ -1,0 +1,18 @@
+[package]
+name = "driver"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+swarm = { path = "../swarm" }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "test-util"] }
+
+[[example]]
+name = "two_node"

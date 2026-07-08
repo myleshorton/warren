@@ -41,7 +41,7 @@ accept weaker guarantees.
 | **Deterministic sim** | Multi-node behavior under a controlled clock/network — no flakes | `swarm` |
 | **Oracle checks** | Lookup results verified against a brute-force ground truth | `swarm` |
 | **Statistical guardrails** | Probabilistic behavior (birthday punch) measured against its analytic bound; fails if constants weaken | `swarm` |
-| **Loopback integration** (planned) | Real UDP sockets, real punching, on one host | `swarm` |
+| **Loopback integration** | Real `tokio` UDP sockets on one host: bootstrap, announce, lookup, connect | `driver` |
 | **Fault injection** (planned) | Drops, reorders, corruption, partitions | `swarm`, `log` |
 | **Corpus / golden files** (planned) | Wire format stays stable across versions | `wire`, `log` |
 | **Live demos** (planned) | A human can watch it work (network forming, a video streaming) | binaries |
@@ -57,7 +57,8 @@ crates/
             + hole-punch strategy/birthday model + packet-level NAT model
             + announce/lookup + DHT-coordinated connect (discovery →
               coordinator-brokered signaling → punch)
-  (next: real UDP driver, port mapping, blob, log, ...)
+  driver    tokio UDP driver: the sans-IO core over real sockets, async API
+  (next: NAT sampling + hole punching over real sockets, port mapping, blob, log, ...)
 ```
 
 Try it:
@@ -65,6 +66,7 @@ Try it:
 - `cargo run -p swarm --example nat_sim` — a node classifies its own NAT by probing the swarm.
 - `cargo run -p swarm --example punch_sim` — hole-punch success rate across every NAT pairing.
 - `cargo run -p swarm --example connect_sim` — two NATed peers connect by id, coordinated over the DHT.
+- `cargo run -p driver --example two_node` — the same connect, over **real UDP sockets** on loopback.
 
 Crates are `publish = false` while the design settles. Names are role-based and
 unprefixed for clean internal imports.

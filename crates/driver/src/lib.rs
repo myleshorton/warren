@@ -25,13 +25,31 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use swarm::dht::{ConnectOutcome, Dht, Event};
-use swarm::{Contact, NodeId};
+use swarm::{Contact, NodeId, QueryId};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot};
 
 /// Largest datagram we read. A `Nodes` reply (up to `K` contacts + `K` peers at
 /// ~39 bytes each) fits comfortably inside this.
 const RECV_BUF: usize = 4096;
+
+/// A driver operation failed because the node's task is no longer running.
+///
+/// Distinct from an operation's own result (e.g. an empty lookup or a
+/// [`ConnectOutcome::TimedOut`]): this means the node itself is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Closed;
+
+impl std::fmt::Display for Closed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "driver node has shut down")
+    }
+}
+
+impl std::error::Error for Closed {}
+
+/// Result of a driver operation; `Err(Closed)` means the node has shut down.
+pub type Result<T> = std::result::Result<T, Closed>;
 
 enum Command {
     AddContact(Contact),
@@ -82,47 +100,39 @@ impl Node {
     }
 
     /// Seed a bootstrap contact into the routing table.
-    pub async fn add_contact(&self, contact: Contact) {
-        let _ = self.cmd_tx.send(Command::AddContact(contact)).await;
+    pub async fn add_contact(&self, contact: Contact) -> Result<()> {
+        self.cmd_tx
+            .send(Command::AddContact(contact))
+            .await
+            .map_err(|_| Closed)
     }
 
     /// Bootstrap (self-lookup) and wait for it to settle.
-    pub async fn bootstrap(&self) {
-        let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::Bootstrap(tx)).await.is_ok() {
-            let _ = rx.await;
-        }
+    pub async fn bootstrap(&self) -> Result<()> {
+        self.request(Command::Bootstrap).await
     }
 
     /// Announce this node under `topic` and wait for the announce to complete.
-    pub async fn announce(&self, topic: NodeId) {
-        let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::Announce(topic, tx)).await.is_ok() {
-            let _ = rx.await;
-        }
+    pub async fn announce(&self, topic: NodeId) -> Result<()> {
+        self.request(|tx| Command::Announce(topic, tx)).await
     }
 
     /// Look up peers announced under `topic`.
-    pub async fn lookup(&self, topic: NodeId) -> Vec<Contact> {
-        let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(Command::Lookup(topic, tx)).await.is_err() {
-            return Vec::new();
-        }
-        rx.await.unwrap_or_default()
+    pub async fn lookup(&self, topic: NodeId) -> Result<Vec<Contact>> {
+        self.request(|tx| Command::Lookup(topic, tx)).await
     }
 
     /// Connect to `target` by id, coordinated over the DHT.
-    pub async fn connect(&self, target: NodeId) -> ConnectOutcome {
+    pub async fn connect(&self, target: NodeId) -> Result<ConnectOutcome> {
+        self.request(|tx| Command::Connect(target, tx)).await
+    }
+
+    /// Send a command carrying a reply channel and await its result, mapping a
+    /// closed channel (the node's task has stopped) to [`Closed`].
+    async fn request<T>(&self, make: impl FnOnce(oneshot::Sender<T>) -> Command) -> Result<T> {
         let (tx, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(Command::Connect(target, tx))
-            .await
-            .is_err()
-        {
-            return ConnectOutcome::TimedOut;
-        }
-        rx.await.unwrap_or(ConnectOutcome::TimedOut)
+        self.cmd_tx.send(make(tx)).await.map_err(|_| Closed)?;
+        rx.await.map_err(|_| Closed)
     }
 }
 
@@ -132,36 +142,43 @@ async fn run(mut dht: Dht, socket: UdpSocket, mut cmd_rx: mpsc::Receiver<Command
     let now = || start.elapsed().as_millis() as u64;
     let mut buf = vec![0u8; RECV_BUF];
 
-    let mut pending_bootstrap: Option<oneshot::Sender<()>> = None;
-    let mut pending_announce: HashMap<NodeId, oneshot::Sender<()>> = HashMap::new();
-    let mut pending_lookup: HashMap<NodeId, oneshot::Sender<Vec<Contact>>> = HashMap::new();
-    let mut pending_connect: HashMap<NodeId, oneshot::Sender<ConnectOutcome>> = HashMap::new();
+    // Bootstrap waiters are keyed by the query id so a stray QueryFinished can't
+    // resolve them and concurrent bootstraps don't clobber each other. The other
+    // ops keep a list of waiters per key: a second caller for an in-flight key
+    // joins the existing operation rather than starting (and overwriting) a
+    // duplicate.
+    let mut pending_bootstrap: HashMap<QueryId, oneshot::Sender<()>> = HashMap::new();
+    let mut pending_announce: HashMap<NodeId, Vec<oneshot::Sender<()>>> = HashMap::new();
+    let mut pending_lookup: HashMap<NodeId, Vec<oneshot::Sender<Vec<Contact>>>> = HashMap::new();
+    let mut pending_connect: HashMap<NodeId, Vec<oneshot::Sender<ConnectOutcome>>> = HashMap::new();
 
     loop {
-        // Flush everything the core wants to send.
+        // Flush everything the core wants to send. A dropped datagram is fine:
+        // this is best-effort UDP and the DHT tolerates loss via query/connect
+        // timeouts, so we don't tear the node down on a transient send error.
         while let Some(t) = dht.poll_transmit() {
             let _ = socket.send_to(&t.data, t.to).await;
         }
-        // Deliver completed operations back to their awaiting callers.
+        // Deliver completed operations back to every awaiting caller.
         while let Some(ev) = dht.poll_event() {
             match ev {
-                Event::QueryFinished { .. } => {
-                    if let Some(tx) = pending_bootstrap.take() {
+                Event::QueryFinished { query, .. } => {
+                    if let Some(tx) = pending_bootstrap.remove(&query) {
                         let _ = tx.send(());
                     }
                 }
                 Event::LookupFinished { topic, peers } => {
-                    if let Some(tx) = pending_lookup.remove(&topic) {
-                        let _ = tx.send(peers);
+                    for tx in pending_lookup.remove(&topic).unwrap_or_default() {
+                        let _ = tx.send(peers.clone());
                     }
                 }
                 Event::AnnounceFinished { topic } => {
-                    if let Some(tx) = pending_announce.remove(&topic) {
+                    for tx in pending_announce.remove(&topic).unwrap_or_default() {
                         let _ = tx.send(());
                     }
                 }
                 Event::Connected { target, outcome } => {
-                    if let Some(tx) = pending_connect.remove(&target) {
+                    for tx in pending_connect.remove(&target).unwrap_or_default() {
                         let _ = tx.send(outcome);
                     }
                 }
@@ -179,20 +196,32 @@ async fn run(mut dht: Dht, socket: UdpSocket, mut cmd_rx: mpsc::Receiver<Command
                     None => return, // all handles dropped
                     Some(Command::AddContact(c)) => dht.add_contact(c),
                     Some(Command::Bootstrap(tx)) => {
-                        pending_bootstrap = Some(tx);
-                        dht.bootstrap(now());
+                        let qid = dht.bootstrap(now());
+                        pending_bootstrap.insert(qid, tx);
                     }
                     Some(Command::Announce(topic, tx)) => {
-                        pending_announce.insert(topic, tx);
-                        dht.announce(topic, now());
+                        let waiters = pending_announce.entry(topic).or_default();
+                        let first = waiters.is_empty();
+                        waiters.push(tx);
+                        if first {
+                            dht.announce(topic, now());
+                        }
                     }
                     Some(Command::Lookup(topic, tx)) => {
-                        pending_lookup.insert(topic, tx);
-                        dht.lookup(topic, now());
+                        let waiters = pending_lookup.entry(topic).or_default();
+                        let first = waiters.is_empty();
+                        waiters.push(tx);
+                        if first {
+                            dht.lookup(topic, now());
+                        }
                     }
                     Some(Command::Connect(target, tx)) => {
-                        pending_connect.insert(target, tx);
-                        dht.connect(target, now());
+                        let waiters = pending_connect.entry(target).or_default();
+                        let first = waiters.is_empty();
+                        waiters.push(tx);
+                        if first {
+                            dht.connect(target, now());
+                        }
                     }
                 }
             }

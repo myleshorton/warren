@@ -14,6 +14,7 @@ use swarm::sim::Rng;
 use tokio::time::timeout;
 
 const LO: &str = "127.0.0.1:0";
+const T: Duration = Duration::from_secs(5);
 
 /// Bring up a `boot` node plus `n` bootstrapped peers, all on loopback.
 async fn network(n: usize, seed: u64) -> (Node, Vec<Node>) {
@@ -24,10 +25,11 @@ async fn network(n: usize, seed: u64) -> (Node, Vec<Node>) {
     let mut peers = Vec::new();
     for _ in 0..n {
         let node = Node::bind(lo, rng.node_id()).await.unwrap();
-        node.add_contact(boot.contact()).await;
-        timeout(Duration::from_secs(5), node.bootstrap())
+        node.add_contact(boot.contact()).await.unwrap();
+        timeout(T, node.bootstrap())
             .await
-            .expect("bootstrap should settle");
+            .expect("bootstrap should settle")
+            .expect("node alive");
         peers.push(node);
     }
     (boot, peers)
@@ -39,13 +41,15 @@ async fn announce_then_lookup_over_udp() {
     let server = &peers[0];
     let client = &peers[1];
 
-    timeout(Duration::from_secs(5), server.announce(server.id()))
+    timeout(T, server.announce(server.id()))
         .await
-        .expect("announce should complete");
+        .expect("announce should complete")
+        .expect("node alive");
 
-    let found = timeout(Duration::from_secs(5), client.lookup(server.id()))
+    let found = timeout(T, client.lookup(server.id()))
         .await
-        .expect("lookup should complete");
+        .expect("lookup should complete")
+        .expect("node alive");
     assert!(
         found.iter().any(|c| c.id == server.id()),
         "lookup over UDP should discover the announced server"
@@ -58,13 +62,15 @@ async fn connect_by_id_over_udp() {
     let server = &peers[0];
     let client = &peers[1];
 
-    timeout(Duration::from_secs(5), server.announce(server.id()))
+    timeout(T, server.announce(server.id()))
         .await
-        .expect("announce should complete");
+        .expect("announce should complete")
+        .expect("node alive");
 
-    let outcome = timeout(Duration::from_secs(5), client.connect(server.id()))
+    let outcome = timeout(T, client.connect(server.id()))
         .await
-        .expect("connect should complete");
+        .expect("connect should complete")
+        .expect("node alive");
     // Every node is directly reachable on loopback, so the coordinated connect
     // is a direct dial.
     assert_eq!(outcome, ConnectOutcome::Direct);
@@ -76,8 +82,26 @@ async fn connect_to_unannounced_peer_is_not_found() {
     let client = &peers[0];
     let ghost = Rng::new(0xDEAD).node_id();
 
-    let outcome = timeout(Duration::from_secs(5), client.connect(ghost))
+    let outcome = timeout(T, client.connect(ghost))
         .await
-        .expect("connect should resolve, not hang");
+        .expect("connect should resolve, not hang")
+        .expect("node alive");
     assert_eq!(outcome, ConnectOutcome::NotFound);
+}
+
+#[tokio::test]
+async fn concurrent_connects_to_same_target_all_resolve() {
+    // Two callers connecting to the same target must both get a result — the
+    // driver joins them to one operation rather than clobbering a waiter.
+    let (_boot, peers) = network(6, 0xD4).await;
+    let server = &peers[0];
+    let client = &peers[1];
+    timeout(T, server.announce(server.id()))
+        .await
+        .expect("announce")
+        .expect("node alive");
+
+    let (a, b) = tokio::join!(client.connect(server.id()), client.connect(server.id()));
+    assert_eq!(a.expect("node alive"), ConnectOutcome::Direct);
+    assert_eq!(b.expect("node alive"), ConnectOutcome::Direct);
 }

@@ -60,7 +60,8 @@ crates/
               coordinator-brokered signaling → punch)
   driver    tokio UDP driver: the sans-IO core over real sockets, async API
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
-  (next: wire the puncher into the driver's connect, port mapping, blob, log, ...)
+
+  next: wire the puncher into the driver's connect, port mapping, blob, log, ...
 ```
 
 Try it:

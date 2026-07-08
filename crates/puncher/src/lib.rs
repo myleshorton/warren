@@ -167,9 +167,14 @@ pub async fn open_birthday_sockets(
             opened += 1;
             set.spawn(async move {
                 let mut buf = [0u8; 64];
-                match socket.recv_from(&mut buf).await {
-                    Ok((n, from)) if matches!(&buf[..n], [PROBE]) => Some((socket, from)),
-                    _ => None,
+                loop {
+                    match socket.recv_from(&mut buf).await {
+                        Ok((n, from)) if matches!(&buf[..n], [PROBE]) => {
+                            return Some((socket, from));
+                        }
+                        Ok(_) => {} // stray datagram: keep this socket listening
+                        Err(_) => return None,
+                    }
                 }
             });
         }
@@ -226,10 +231,13 @@ pub async fn spray(
             continue; // never spray our own socket (would self-hit)
         }
         socket.send_to(&[PROBE], (peer_host, port)).await?;
-        if let Ok(Ok((n, from))) = timeout(cfg.probe_interval, socket.recv_from(&mut buf)).await {
-            // Only a control reply from the host we're targeting counts, so an
-            // unrelated socket receiving a stray probe can't be a false hit.
-            if from.ip() == peer_host && is_control_msg(&buf[..n]) {
+        // Spraying is intentionally fast: `probe_interval` here is the per-probe
+        // reply wait, not a send-rate cap — racing a NAT's mappings wants many
+        // probes in flight. Only a single-byte control reply from the targeted
+        // host counts; timeouts, strays, and transient recv errors all just move
+        // on to the next port.
+        match timeout(cfg.probe_interval, socket.recv_from(&mut buf)).await {
+            Ok(Ok((n, from))) if from.ip() == peer_host && is_control_msg(&buf[..n]) => {
                 // Normally the reply is an ACK; if it's a PROBE, answer it so the
                 // peer establishes too.
                 if buf[0] == PROBE {
@@ -237,6 +245,7 @@ pub async fn spray(
                 }
                 return Ok(Some(Established { socket, peer: from }));
             }
+            _ => {}
         }
     }
     Ok(None)

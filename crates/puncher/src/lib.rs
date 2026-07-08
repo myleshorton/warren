@@ -89,15 +89,26 @@ pub async fn connect_to(
     let deadline = Instant::now() + cfg.overall;
     let mut buf = [0u8; 64];
     while Instant::now() < deadline {
+        let sent_at = Instant::now();
         socket.send_to(&[PROBE], peer).await?;
-        match timeout(cfg.probe_interval, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) if from == peer && is_control_msg(&buf[..n]) => {
-                if buf[0] == PROBE {
-                    socket.send_to(&[ACK], from).await?;
-                }
-                return Ok(Some(Established { socket, peer }));
+        // Read until this probe's window elapses, so stray datagrams that return
+        // early don't make us re-probe faster than `probe_interval`.
+        loop {
+            let remaining = cfg.probe_interval.saturating_sub(sent_at.elapsed());
+            if remaining.is_zero() {
+                break; // window over: send the next probe
             }
-            _ => {} // timeout, stray traffic, or spurious source: keep probing
+            match timeout(remaining, socket.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) if from == peer && is_control_msg(&buf[..n]) => {
+                    if buf[0] == PROBE {
+                        socket.send_to(&[ACK], from).await?;
+                    }
+                    return Ok(Some(Established { socket, peer }));
+                }
+                Ok(Ok(_)) => {} // stray/spurious: keep reading this window
+                Ok(Err(e)) => return Err(e),
+                Err(_) => break, // window elapsed: send the next probe
+            }
         }
     }
     Ok(None)
@@ -148,7 +159,8 @@ pub async fn open_birthday_sockets(
     let mut set = JoinSet::new();
     let mut opened = 0;
     let mut attempts = 0;
-    while opened < count && attempts < count * 20 {
+    let max_attempts = count.saturating_mul(20);
+    while opened < count && attempts < max_attempts {
         attempts += 1;
         let port = range.0 + (rng.next_u64() % span) as u16;
         if let Ok(socket) = UdpSocket::bind((host, port)).await {
@@ -215,7 +227,9 @@ pub async fn spray(
         }
         socket.send_to(&[PROBE], (peer_host, port)).await?;
         if let Ok(Ok((n, from))) = timeout(cfg.probe_interval, socket.recv_from(&mut buf)).await {
-            if is_control_msg(&buf[..n]) {
+            // Only a control reply from the host we're targeting counts, so an
+            // unrelated socket receiving a stray probe can't be a false hit.
+            if from.ip() == peer_host && is_control_msg(&buf[..n]) {
                 // Normally the reply is an ACK; if it's a PROBE, answer it so the
                 // peer establishes too.
                 if buf[0] == PROBE {

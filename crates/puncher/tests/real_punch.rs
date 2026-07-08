@@ -79,11 +79,12 @@ async fn dial_a_reachable_peer() {
 
 #[tokio::test]
 async fn birthday_punch_over_real_sockets() {
-    // Random side: 256 sockets at unpredictable ports in a range; the sprayer
-    // never targets its own port (spray skips it), so a self-hit is impossible
-    // wherever its ephemeral socket lands. Predictable side sprays the same
-    // range. The collision is real UDP.
-    let range = (30_000u16, 45_000u16);
+    // Random side: 256 sockets at unpredictable ports in a range chosen below
+    // both common OS ephemeral ranges (Linux 32768+, macOS 49152+), so parallel
+    // tests' ephemeral sockets don't land in it. spray also skips its own port
+    // and only accepts a control reply from the target host, so a stray hit on
+    // an unrelated socket can't establish. The collision is real UDP.
+    let range = (20_000u16, 30_000u16);
     let cfg = Config::fast();
 
     let random = open_birthday_sockets(LO, range, 256, 0xB1_2345, &cfg);

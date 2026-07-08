@@ -10,19 +10,25 @@
 //! - [`routing`]: k-bucket routing table.
 //! - [`msg`]: the DHT RPC wire format (over the `wire` codec).
 //! - [`dht`]: the sans-IO core with iterative Kademlia lookup.
+//! - [`nat`]: NAT self-classification from address samples.
+//! - [`punch`]: hole-punch strategy selection and the birthday-paradox model.
 //! - [`sim`]: the deterministic network simulator used for verification.
 //!
-//! Still to come (see the design doc): the ephemeral/persistent lifecycle and
-//! NAT classification, the birthday-paradox hole puncher, port mapping, a real
-//! UDP driver, and QUIC on top of punched paths.
+//! Still to come (see the design doc): wiring NAT classification into the DHT's
+//! ping sampling, a NAT-translating packet simulator to exercise real punch
+//! flows end to end, port mapping, a real UDP driver, and QUIC on punched paths.
 
 pub mod dht;
 pub mod id;
 pub mod msg;
+pub mod nat;
+pub mod punch;
 pub mod routing;
 pub mod sim;
 
 pub use dht::{Dht, Event, Millis, QueryId, Transmit, ALPHA, REQUEST_TIMEOUT_MS};
 pub use id::{Distance, NodeId, ID_LEN};
 pub use msg::{Message, Packet};
+pub use nat::{Firewall, NatSampler};
+pub use punch::{attempt_punch, plan, Outcome, PunchParams, Strategy};
 pub use routing::{Contact, RoutingTable, K};

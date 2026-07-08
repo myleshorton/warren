@@ -38,6 +38,7 @@ accept weaker guarantees.
 | **Known-answer tests** | Bit-exact match to published spec vectors (RFC 8032, BLAKE3) | `crypto` |
 | **Deterministic sim** | Multi-node behavior under a controlled clock/network — no flakes | `swarm` |
 | **Oracle checks** | Lookup results verified against a brute-force ground truth | `swarm` |
+| **Statistical guardrails** | Probabilistic behavior (birthday punch) measured against its analytic bound; fails if constants weaken | `swarm` |
 | **Loopback integration** (planned) | Real UDP sockets, real punching, on one host | `swarm` |
 | **Fault injection** (planned) | Drops, reorders, corruption, partitions | `swarm`, `log` |
 | **Corpus / golden files** (planned) | Wire format stays stable across versions | `wire`, `log` |
@@ -49,12 +50,15 @@ accept weaker guarantees.
 crates/
   wire      byte-level codec (varints, length-delimited frames)    — done
   crypto    ed25519 identity, blake3 hashing, discovery keys        — done
-  swarm     sans-IO Kademlia DHT + deterministic network simulator  — phase-0 scaffold
-  (next: NAT lifecycle + hole punching, real UDP driver, blob, log, ...)
+  swarm     sans-IO Kademlia DHT + deterministic network simulator  — phase-0
+            + NAT self-classification + hole-punch strategy/birthday model
+  (next: wire NAT sampling into the DHT, NAT-translating packet sim, real UDP
+   driver, port mapping, blob, log, ...)
 ```
 
-Try the DHT: `cargo run -p swarm --example dht_sim` watches a 30-node network
-bootstrap itself and answer a lookup.
+Try it:
+- `cargo run -p swarm --example dht_sim` — a 30-node DHT bootstraps and answers a lookup.
+- `cargo run -p swarm --example punch_sim` — hole-punch success rate across every NAT pairing.
 
 Crates are `publish = false` while the design settles. Names are role-based and
 unprefixed for clean internal imports.

@@ -16,3 +16,6 @@ proptest.workspace = true
 
 [[example]]
 name = "dht_sim"
+
+[[example]]
+name = "punch_sim"

@@ -370,6 +370,9 @@ impl Sim {
                 }
                 let Reverse(slot) = self.queue.pop().unwrap();
                 let Scheduled::Deliver { to, from, data } = slot.item;
+                if self.disabled.contains(&to) {
+                    continue; // recipient went offline after this was scheduled
+                }
                 let now = self.now;
                 self.nodes[to].dht.handle_input(from, &data, now);
             }

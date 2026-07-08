@@ -169,6 +169,14 @@ struct Pending {
     deadline: Millis,
 }
 
+struct ConnectState {
+    /// When this connect gives up if signaling hasn't completed.
+    deadline: Millis,
+    /// The coordinator we sent the request to; a reply is accepted only from it,
+    /// so another host can't spoof a reply and force a wrong outcome.
+    coordinator: Option<SocketAddr>,
+}
+
 /// A Kademlia DHT node.
 pub struct Dht {
     id: NodeId,
@@ -182,8 +190,9 @@ pub struct Dht {
     local_firewall: Firewall,
     /// topic -> peers that have announced under it (records this node stores).
     announces: HashMap<NodeId, Vec<Contact>>,
-    /// Targets we are mid-connect to -> deadline by which signaling must finish.
-    connecting: HashMap<NodeId, Millis>,
+    /// Targets we are mid-connect to -> the connect's state (deadline + the
+    /// coordinator we're expecting the reply from).
+    connecting: HashMap<NodeId, ConnectState>,
     /// Recently observed (target id, initiator address) connect pairs
     /// (coordinator side), bounded FIFO. We relay a reply only to an address
     /// that actually initiated a connect *to that target*, so a target can't
@@ -308,7 +317,13 @@ impl Dht {
     /// punch through a node that holds its announce record. Completion is
     /// reported as an [`Event::Connected`].
     pub fn connect(&mut self, target: NodeId, now: Millis) -> QueryId {
-        self.connecting.insert(target, now + CONNECT_TIMEOUT_MS);
+        self.connecting.insert(
+            target,
+            ConnectState {
+                deadline: now + CONNECT_TIMEOUT_MS,
+                coordinator: None,
+            },
+        );
         self.start_query(target, QueryKind::Connect, now)
     }
 
@@ -408,7 +423,7 @@ impl Dht {
         let stale: Vec<NodeId> = self
             .connecting
             .iter()
-            .filter(|(_, &deadline)| deadline <= now)
+            .filter(|(_, cs)| cs.deadline <= now)
             .map(|(target, _)| *target)
             .collect();
         for target in stale {
@@ -429,7 +444,7 @@ impl Dht {
             .values()
             .map(|p| p.deadline)
             .chain(self.nat_pending.values().copied())
-            .chain(self.connecting.values().copied())
+            .chain(self.connecting.values().map(|cs| cs.deadline))
             .min()
     }
 
@@ -671,6 +686,10 @@ impl Dht {
                     // Ask a coordinator (which holds the target's record) to relay
                     // our signal. It overwrites initiator_addr with the address it
                     // observes, so we needn't know our own external address.
+                    // Record the coordinator so we accept the reply only from it.
+                    if let Some(cs) = self.connecting.get_mut(&target) {
+                        cs.coordinator = Some(coord.addr);
+                    }
                     let rid = self.alloc_rid();
                     let fw = self.signaling_firewall();
                     self.send(
@@ -747,8 +766,15 @@ impl Dht {
                 );
             }
         } else if initiator == self.id {
-            // We are the initiator: the reply carries the target's firewall.
-            if self.connecting.remove(&target).is_some() {
+            // We are the initiator: the reply carries the target's firewall — but
+            // accept it only from the coordinator we actually sent the request to,
+            // so another host can't spoof a reply and force a wrong outcome.
+            let from_coordinator = self
+                .connecting
+                .get(&target)
+                .is_some_and(|cs| cs.coordinator == Some(from));
+            if from_coordinator {
+                self.connecting.remove(&target);
                 let outcome = outcome_for(self.signaling_firewall(), nat);
                 self.events.push(Event::Connected { target, outcome });
             }

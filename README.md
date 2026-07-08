@@ -59,9 +59,11 @@ crates/
             + announce/lookup + DHT-coordinated connect (discovery →
               coordinator-brokered signaling → punch)
   driver    tokio UDP driver: the sans-IO core over real sockets, async API
+            + Channel/DataListener: live data channels via the puncher
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
 
-  next: wire the puncher into the driver's connect, port mapping, blob, log, ...
+  next: carry the data-socket address through DHT signaling (bare connect(id)
+        -> channel for NATed peers), port mapping, blob, log, ...
 ```
 
 Try it:

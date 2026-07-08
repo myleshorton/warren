@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 swarm = { path = "../swarm" }
+puncher = { path = "../puncher" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
 
 [dev-dependencies]

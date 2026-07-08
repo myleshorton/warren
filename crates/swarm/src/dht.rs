@@ -25,7 +25,7 @@ pub const NAT_SAMPLE_COUNT: usize = 5;
 /// How many recent connect initiators a coordinator remembers (bounded FIFO).
 const MAX_SEEN_INITIATORS: usize = 1024;
 
-/// Cap on pending incoming connects awaiting an [`Dht::accept_connect`], so a
+/// Cap on pending incoming connects awaiting a [`Dht::accept_connect`], so a
 /// flood of connect requests can't grow the target's state unboundedly. Beyond
 /// this, new requests are dropped (the initiator simply times out).
 const MAX_PENDING_INCOMING: usize = 256;

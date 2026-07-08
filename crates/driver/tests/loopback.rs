@@ -70,7 +70,7 @@ async fn connect_by_id_over_udp() {
     let conn = timeout(T, client.connect(server.id()))
         .await
         .expect("connect should complete")
-        .expect("node alive");
+        .expect("connect succeeds");
     // Every node is directly reachable on loopback, so the coordinated connect
     // is a direct dial — and it yields a live channel, punched end to end.
     assert_eq!(conn.outcome, ConnectOutcome::Direct);
@@ -89,7 +89,7 @@ async fn connect_to_unannounced_peer_is_not_found() {
     let conn = timeout(T, client.connect(ghost))
         .await
         .expect("connect should resolve, not hang")
-        .expect("node alive");
+        .expect("connect succeeds");
     assert_eq!(conn.outcome, ConnectOutcome::NotFound);
     assert!(conn.channel.is_none(), "a not-found connect has no channel");
 }
@@ -113,8 +113,8 @@ async fn concurrent_connects_to_distinct_targets_each_get_a_channel() {
     })
     .await
     .expect("both connects should resolve, not hang");
-    let a = a.expect("node alive");
-    let b = b.expect("node alive");
+    let a = a.expect("connect a succeeds");
+    let b = b.expect("connect b succeeds");
     assert_eq!(a.outcome, ConnectOutcome::Direct);
     assert_eq!(b.outcome, ConnectOutcome::Direct);
     assert!(

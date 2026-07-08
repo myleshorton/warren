@@ -19,6 +19,7 @@
 //! # Ok(()) }
 //! ```
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -157,12 +158,53 @@ pub struct Connection {
     pub channel: Option<Channel>,
 }
 
+/// Why a [`Node::connect`] could not even reach a [`Connection`] outcome.
+///
+/// Distinct from a [`Connection`] whose `outcome` is `NotFound`/`TimedOut`/
+/// `Relayed` (the DHT *resolved*, but the peer wasn't reachable or punchable):
+/// these mean the connect never got that far — and, unlike [`Closed`], most of
+/// them don't mean the node itself is gone.
+#[derive(Debug)]
+pub enum ConnectError {
+    /// The node's background task has shut down.
+    Closed,
+    /// A connect to this target is already in flight on this node; only one at a
+    /// time is supported, and the in-flight one is left untouched.
+    InProgress,
+    /// Binding the local data socket for this connect failed.
+    Bind(io::Error),
+}
+
+impl std::fmt::Display for ConnectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectError::Closed => write!(f, "driver node has shut down"),
+            ConnectError::InProgress => write!(f, "a connect to this target is already in flight"),
+            ConnectError::Bind(e) => write!(f, "binding the local data socket failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ConnectError::Bind(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+/// What the actor sends back for a connect: the [`Connection`], or `Err(())`
+/// meaning a connect to that target was already in flight (mapped to
+/// [`ConnectError::InProgress`] by [`Node::connect`]).
+type ConnectReply = std::result::Result<Connection, ()>;
+
 enum Command {
     AddContact(Contact),
     Bootstrap(oneshot::Sender<()>),
     Announce(NodeId, oneshot::Sender<()>),
     Lookup(NodeId, oneshot::Sender<Vec<Contact>>),
-    Connect(NodeId, oneshot::Sender<Connection>),
+    Connect(NodeId, UdpSocket, SocketAddr, oneshot::Sender<ConnectReply>),
 }
 
 /// A handle to a running DHT node backed by a real UDP socket.
@@ -238,8 +280,25 @@ impl Node {
     /// signaling through a coordinator, and punch a data channel — all from one
     /// call. The returned [`Connection`] carries the reachability outcome and the
     /// live [`Channel`] when the punch succeeds.
-    pub async fn connect(&self, target: NodeId) -> Result<Connection> {
-        self.request(|tx| Command::Connect(target, tx)).await
+    ///
+    /// The data socket is bound here (not in the actor) so a local bind failure
+    /// surfaces as [`ConnectError::Bind`] rather than being conflated with the
+    /// node shutting down.
+    pub async fn connect(&self, target: NodeId) -> std::result::Result<Connection, ConnectError> {
+        let data_sock = UdpSocket::bind(SocketAddr::new(self.local_addr.ip(), 0))
+            .await
+            .map_err(ConnectError::Bind)?;
+        let data_addr = data_sock.local_addr().map_err(ConnectError::Bind)?;
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::Connect(target, data_sock, data_addr, tx))
+            .await
+            .map_err(|_| ConnectError::Closed)?;
+        match rx.await {
+            Ok(Ok(conn)) => Ok(conn),
+            Ok(Err(())) => Err(ConnectError::InProgress),
+            Err(_) => Err(ConnectError::Closed),
+        }
     }
 
     /// Await the next channel opened by a peer that connected *to us*. The peer
@@ -288,8 +347,9 @@ async fn run(
     let mut pending_lookup: HashMap<NodeId, Vec<oneshot::Sender<Vec<Contact>>>> = HashMap::new();
     // A connect holds a pre-bound data socket (whose address is advertised to the
     // peer) until reachability resolves, then punches on it. One connect per
-    // target at a time: a second overwrites the first (whose waiter sees Closed).
-    let mut pending_connect: HashMap<NodeId, (UdpSocket, oneshot::Sender<Connection>)> =
+    // target at a time: a second is rejected with `InProgress`, leaving the
+    // in-flight one untouched.
+    let mut pending_connect: HashMap<NodeId, (UdpSocket, oneshot::Sender<ConnectReply>)> =
         HashMap::new();
 
     loop {
@@ -381,13 +441,16 @@ async fn run(
                             dht.lookup(topic, now());
                         }
                     }
-                    Some(Command::Connect(target, tx)) => {
-                        // Bind the data socket up front: its address is what the
-                        // target learns to punch back to. On bind failure we drop
-                        // the waiter (caller sees Closed).
-                        if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
-                            if let Ok(data_addr) = data_sock.local_addr() {
-                                pending_connect.insert(target, (data_sock, tx));
+                    Some(Command::Connect(target, data_sock, data_addr, tx)) => {
+                        // The socket is already bound by `Node::connect`. Only one
+                        // connect per target at a time; reject a second rather than
+                        // displace the in-flight one's waiter.
+                        match pending_connect.entry(target) {
+                            Entry::Occupied(_) => {
+                                let _ = tx.send(Err(()));
+                            }
+                            Entry::Vacant(slot) => {
+                                slot.insert((data_sock, tx));
                                 dht.connect(target, data_addr, now());
                             }
                         }
@@ -429,7 +492,7 @@ fn spawn_connect_punch(
     outcome: ConnectOutcome,
     peer_data_addr: Option<SocketAddr>,
     cfg: PunchConfig,
-    tx: oneshot::Sender<Connection>,
+    tx: oneshot::Sender<ConnectReply>,
 ) {
     tokio::spawn(async move {
         let channel = match (outcome, peer_data_addr) {
@@ -441,7 +504,7 @@ fn spawn_connect_punch(
             }
             _ => None,
         };
-        let _ = tx.send(Connection { outcome, channel });
+        let _ = tx.send(Ok(Connection { outcome, channel }));
     });
 }
 

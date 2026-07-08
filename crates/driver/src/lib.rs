@@ -148,8 +148,9 @@ pub type Result<T> = std::result::Result<T, Closed>;
 /// live [`Channel`] if the punch to the peer's data socket succeeded.
 ///
 /// `channel` is `None` when the target wasn't found, signaling timed out, the
-/// path is `Relayed` (no direct data path yet — future work), or the punch to an
-/// otherwise-reachable peer didn't complete in time.
+/// outcome is `Punched` or `Relayed` (the real-NAT birthday punch and the relay
+/// data path are future work), or the direct punch to a reachable peer didn't
+/// complete in time.
 #[derive(Debug)]
 pub struct Connection {
     /// How the DHT resolved the connection.
@@ -405,16 +406,22 @@ async fn run(
                     ..
                 } => {
                     // Stand up a data socket, tell the core where to punch back,
-                    // and accept a punch from the initiator on it.
-                    if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
-                        if let Ok(data_addr) = data_sock.local_addr() {
-                            dht.accept_connect(initiator, data_addr, now());
-                            spawn_accept_punch(
-                                data_sock,
-                                initiator_data_addr.ip(),
-                                punch_cfg,
-                                incoming_tx.clone(),
-                            );
+                    // and accept a punch from the initiator on it. Decline if the
+                    // node is bound to an unspecified address: the data socket's
+                    // address would be unspecified too, unpunchable by the peer
+                    // (mirrors the outbound `UnspecifiedLocalAddr` check). The
+                    // initiator simply times out.
+                    if !data_ip.is_unspecified() {
+                        if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
+                            if let Ok(data_addr) = data_sock.local_addr() {
+                                dht.accept_connect(initiator, data_addr, now());
+                                spawn_accept_punch(
+                                    data_sock,
+                                    initiator_data_addr.ip(),
+                                    punch_cfg,
+                                    incoming_tx.clone(),
+                                );
+                            }
                         }
                     }
                 }
@@ -501,8 +508,13 @@ async fn run(
 
 /// Punch a data channel to the peer that a `connect` resolved, then report the
 /// [`Connection`] to the waiting caller. Runs in its own task so the punch's
-/// wait doesn't block the actor loop. Only the directly-punchable outcomes dial
-/// the peer's data socket; `Relayed`/`NotFound`/`TimedOut` report no channel.
+/// wait doesn't block the actor loop.
+///
+/// Only `Direct` dials the peer's data socket. `Punched` is the one-sided-random
+/// *birthday* strategy (spray / open birthday sockets), which this path does not
+/// yet run — dialing a single advertised address would just burn the puncher
+/// timeout — so it reports no channel for now (birthday-in-connect is the next
+/// slice). `Relayed`/`NotFound`/`TimedOut` likewise report no channel.
 fn spawn_connect_punch(
     data_sock: UdpSocket,
     outcome: ConnectOutcome,
@@ -512,7 +524,7 @@ fn spawn_connect_punch(
 ) {
     tokio::spawn(async move {
         let channel = match (outcome, peer_data_addr) {
-            (ConnectOutcome::Direct | ConnectOutcome::Punched, Some(peer)) => {
+            (ConnectOutcome::Direct, Some(peer)) => {
                 match puncher::connect_to(data_sock, peer, &cfg).await {
                     Ok(est) => connect_channel(est).await.ok().flatten(),
                     Err(_) => None,

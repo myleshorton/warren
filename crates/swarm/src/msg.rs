@@ -17,7 +17,6 @@ const KIND_PONG: u8 = 2;
 const KIND_FIND_NODE: u8 = 3;
 const KIND_NODES: u8 = 4;
 const KIND_ANNOUNCE: u8 = 5;
-const KIND_ANNOUNCE_OK: u8 = 6;
 const KIND_SIGNAL: u8 = 7;
 
 const ADDR_V4: u8 = 4;
@@ -52,9 +51,8 @@ pub enum Message {
         peers: Vec<Contact>,
     },
     /// Ask the recipient to store the sender as an announcer under `topic`.
+    /// One-way (best-effort); the announcer does not wait for confirmation.
     Announce { topic: NodeId },
-    /// Acknowledge an [`Message::Announce`].
-    AnnounceOk,
     /// Coordinate a hole punch: relayed initiator↔target through a coordinator
     /// that holds the target's announce record.
     Signal {
@@ -109,9 +107,6 @@ impl Packet {
                 enc.u8(KIND_ANNOUNCE);
                 enc.raw(topic.as_bytes());
             }
-            Message::AnnounceOk => {
-                enc.u8(KIND_ANNOUNCE_OK);
-            }
             Message::Signal {
                 target,
                 initiator,
@@ -154,7 +149,6 @@ impl Packet {
                 let topic = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 Message::Announce { topic }
             }
-            KIND_ANNOUNCE_OK => Message::AnnounceOk,
             KIND_SIGNAL => {
                 let target = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 let initiator = NodeId::from_bytes(dec.array::<ID_LEN>()?);
@@ -310,11 +304,6 @@ mod tests {
             sender: id(5),
             rid: 1,
             msg: Message::Announce { topic: id(99) },
-        });
-        roundtrip(&Packet {
-            sender: id(5),
-            rid: 2,
-            msg: Message::AnnounceOk,
         });
     }
 

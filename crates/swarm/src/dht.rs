@@ -57,7 +57,8 @@ pub enum ConnectOutcome {
     Relayed,
     /// The target could not be found on the DHT (not announced).
     NotFound,
-    /// The target was found but signaling did not complete before the deadline.
+    /// The connect did not complete before its deadline — discovery or the
+    /// coordinator-brokered signaling did not finish in time.
     TimedOut,
 }
 
@@ -348,10 +349,12 @@ impl Dht {
                 self.on_nodes_response(packet.rid, packet.sender, from, contacts, peers, now);
             }
             Message::Announce { topic } => {
-                self.store_announce(topic, Contact::new(packet.sender, from));
-                self.send(from, packet.rid, Message::AnnounceOk);
+                // Only store if we're plausibly responsible for the topic, so a
+                // remote can't grow our store with announces for arbitrary keys.
+                if self.responsible_for(&topic) {
+                    self.store_announce(topic, Contact::new(packet.sender, from));
+                }
             }
-            Message::AnnounceOk => {}
             Message::Signal {
                 target,
                 initiator,
@@ -396,6 +399,9 @@ impl Dht {
             .collect();
         for target in stale {
             self.connecting.remove(&target);
+            // Stop any still-running discovery for this target so it can't emit
+            // a late Signal after we've already reported TimedOut.
+            self.cancel_connect_queries(&target);
             self.events.push(Event::Connected {
                 target,
                 outcome: ConnectOutcome::TimedOut,
@@ -487,6 +493,36 @@ impl Dht {
         } else if records.len() < K {
             records.push(announcer);
         }
+    }
+
+    /// Whether we are plausibly among the K closest nodes to `topic` — i.e.
+    /// fewer than K known contacts are closer to it than we are. Announce
+    /// records should live near their topic, so this bounds what we store.
+    fn responsible_for(&self, topic: &NodeId) -> bool {
+        let my_dist = self.id.distance(topic);
+        let closer = self
+            .table
+            .closest(topic, K)
+            .into_iter()
+            .filter(|c| c.id.distance(topic) < my_dist)
+            .count();
+        closer < K
+    }
+
+    /// Drop any in-flight connect query (and its pending requests) for `target`,
+    /// so a query that finishes after the connect already resolved can't send a
+    /// stray `Signal`.
+    fn cancel_connect_queries(&mut self, target: &NodeId) {
+        let qids: Vec<QueryId> = self
+            .queries
+            .iter()
+            .filter(|(_, q)| q.kind == QueryKind::Connect && q.target == *target)
+            .map(|(id, _)| *id)
+            .collect();
+        for qid in &qids {
+            self.queries.remove(qid);
+        }
+        self.pending.retain(|_, p| !qids.contains(&p.query));
     }
 
     fn alloc_rid(&mut self) -> u64 {

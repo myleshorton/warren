@@ -49,7 +49,13 @@ impl NatBox {
     }
 
     /// Create a NAT with an explicit external-port range.
+    ///
+    /// Panics if `port_min > port_max`.
     pub fn with_range(kind: Firewall, host: IpAddr, port_min: u16, port_max: u16) -> Self {
+        assert!(
+            port_min <= port_max,
+            "invalid external port range: {port_min} > {port_max}"
+        );
         Self {
             kind,
             host,
@@ -77,7 +83,10 @@ impl NatBox {
     }
 
     fn alloc_port(&mut self) -> u16 {
-        loop {
+        // Bound the scan to the range size so an exhausted range fails fast
+        // instead of spinning forever.
+        let span = (self.port_max - self.port_min) as usize + 1;
+        for _ in 0..span {
             let p = self.next_port;
             self.next_port = if self.next_port >= self.port_max {
                 self.port_min
@@ -88,6 +97,10 @@ impl NatBox {
                 return p;
             }
         }
+        panic!(
+            "NAT external port range {}..={} exhausted",
+            self.port_min, self.port_max
+        );
     }
 
     /// Send from `socket` to `dest`; returns the external source address the

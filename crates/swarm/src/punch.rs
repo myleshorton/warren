@@ -204,11 +204,12 @@ fn one_sided_random(
     let cs = consistent.open_socket();
     let c_ext = consistent.send(cs, RENDEZVOUS);
 
-    let mut opened = HashSet::new();
+    // Open one socket per birthday probe toward the consistent peer's known
+    // port; each mints a fresh external port in the random NAT. The NatBox
+    // records these mappings, so a hit is detected via `random.recv` below.
     for _ in 0..params.birthday_sockets {
         let s = random.open_socket();
-        let ext = random.send(s, c_ext);
-        opened.insert(ext.port());
+        random.send(s, c_ext);
     }
 
     let r_host = random.host();

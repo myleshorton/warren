@@ -762,15 +762,28 @@ async fn reflexive_addr(
         if sock.send_to(&probe, reflector).await.is_err() {
             continue;
         }
-        if let Ok(Ok((n, from))) = timeout(REFLECT_TIMEOUT, sock.recv_from(&mut buf)).await {
-            if from == reflector {
-                if let Ok(Packet {
-                    msg: Message::Reflected { observed },
-                    ..
-                }) = Packet::decode(&buf[..n])
-                {
-                    return observed;
+        // Read until this reflector's window elapses, ignoring stray datagrams,
+        // so an unrelated packet arriving first can't cause a false fallback.
+        let deadline = Instant::now() + REFLECT_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break; // window over: try the next reflector
+            }
+            match timeout(remaining, sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) if from == reflector => {
+                    if let Ok(Packet {
+                        msg: Message::Reflected { observed },
+                        ..
+                    }) = Packet::decode(&buf[..n])
+                    {
+                        return observed;
+                    }
+                    // From the reflector but not a Reflected: keep reading.
                 }
+                Ok(Ok(_)) => {}      // stray datagram from elsewhere: keep reading
+                Ok(Err(_)) => break, // socket error: try the next reflector
+                Err(_) => break,     // window elapsed
             }
         }
     }

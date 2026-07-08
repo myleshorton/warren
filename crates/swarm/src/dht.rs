@@ -433,7 +433,7 @@ impl Dht {
         // fold it into the routing table. A `Reflect` is the exception: it comes
         // from a transient data socket (a reflexive probe), not a routable peer,
         // so inserting it would poison routing with an ephemeral address.
-        if packet.sender != self.id && !matches!(packet.msg, Message::Reflect) {
+        if packet.sender != self.id && !matches!(&packet.msg, Message::Reflect) {
             self.table.insert(Contact::new(packet.sender, from));
         }
 

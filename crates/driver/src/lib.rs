@@ -414,8 +414,12 @@ impl Node {
         }
         let node = self.clone();
         let task = tokio::spawn(async move {
-            // Start one interval out: the initial round above already ran.
-            let start = tokio::time::Instant::now() + interval;
+            // Start one interval out: the initial round above already ran. Use a
+            // checked add so an absurdly large interval can't panic the task on
+            // overflow; falling back to "now" just fires the first tick sooner.
+            let start = tokio::time::Instant::now()
+                .checked_add(interval)
+                .unwrap_or_else(tokio::time::Instant::now);
             let mut ticker = tokio::time::interval_at(start, interval);
             // After a scheduling stall, keep pacing at the interval rather than
             // firing a catch-up burst of announces (the default `Burst`).

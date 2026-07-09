@@ -281,6 +281,22 @@ pub struct Node {
     incoming: Arc<Mutex<mpsc::Receiver<Channel>>>,
 }
 
+/// A running periodic re-announce started by [`Node::keep_announced`]. Hold it
+/// for as long as the content should stay discoverable; dropping it stops the
+/// loop. (Announce records don't expire on their own, so a long-lived provider
+/// re-announces both to survive DHT churn — the closest-K set near a topic
+/// changes as peers come and go — and to follow a topic that rotates by epoch.)
+#[must_use = "dropping the Announcer immediately stops the re-announce loop; bind it to a variable that lives as long as you want to stay discoverable"]
+pub struct Announcer {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Announcer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 impl Node {
     /// Bind a UDP socket at `bind_addr` and start the node with the given id,
     /// using default punch tuning.
@@ -369,6 +385,41 @@ impl Node {
     /// Look up peers announced under `topic`.
     pub async fn lookup(&self, topic: NodeId) -> Result<Vec<Contact>> {
         self.request(|tx| Command::Lookup(topic, tx)).await
+    }
+
+    /// Keep re-announcing under a set of topics until the returned [`Announcer`]
+    /// is dropped. `topics` is called once now and then once per `interval`; each
+    /// call returns the topics to announce *at that moment*, so a caller can
+    /// rotate them over time (e.g. return the current and next epoch's blinded
+    /// topic — see the `stream` example). The clock and any rotation live in the
+    /// caller's closure; this method only schedules the repetition.
+    ///
+    /// The initial round is awaited, so the node is announced by the time this
+    /// returns; later rounds run in the background. Per-round announce errors are
+    /// ignored (the next round retries), but if the node has shut down the loop
+    /// exits rather than spin.
+    pub async fn keep_announced<F>(&self, interval: Duration, topics: F) -> Announcer
+    where
+        F: Fn() -> Vec<NodeId> + Send + 'static,
+    {
+        for topic in topics() {
+            let _ = self.announce(topic).await;
+        }
+        let node = self.clone();
+        let task = tokio::spawn(async move {
+            // Start one interval out: the initial round above already ran.
+            let start = tokio::time::Instant::now() + interval;
+            let mut ticker = tokio::time::interval_at(start, interval);
+            loop {
+                ticker.tick().await;
+                for topic in topics() {
+                    if node.announce(topic).await.is_err() {
+                        return; // node shut down; nothing left to announce
+                    }
+                }
+            }
+        });
+        Announcer { task }
     }
 
     /// Connect to `target` by id, coordinated over the DHT: discover it, broker

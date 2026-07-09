@@ -72,6 +72,9 @@ crates/
               birthday spray/open-sockets punch, chosen by the resolved strategy
             + reflexive discovery: both dialer and target probe a reflector to
               advertise their data socket's external address (NATed peers punchable)
+            + keep_announced: a background loop that re-announces a (rotating)
+              topic set on an interval until its handle drops, so a provider stays
+              discoverable across DHT churn and epoch rotation
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
   feed      signed append-only log (the "log"/hypercore role): BLAKE3 Merkle tree
             over blocks, a signed (len, root) head, and per-block inclusion proofs

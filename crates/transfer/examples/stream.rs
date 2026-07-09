@@ -35,6 +35,9 @@ const T: Duration = Duration::from_secs(20);
 /// How long a topic stays fixed before rotating. Tunable: shorter tightens the
 /// window a crawler gets but adds re-announce churn. An hour is a demo value.
 const EPOCH_LEN_SECS: u64 = 3600;
+/// How often to re-announce — well under `EPOCH_LEN_SECS`, so the publisher stays
+/// discoverable as the DHT churns and rolls smoothly across each epoch boundary.
+const REANNOUNCE_INTERVAL: Duration = Duration::from_secs(900);
 
 /// First six bytes of an id as hex, for readable logging.
 fn short(bytes: &[u8]) -> String {
@@ -119,14 +122,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let publisher = Node::bind(lo, node_id).await?;
     publisher.add_contact(bootstrap).await?;
     timeout(T, publisher.bootstrap()).await??;
-    // Register the node (reachability, so a coordinated connect can reach it) and
-    // the content under the current and next epoch's blinded topic (boundary
-    // overlap, so a viewer whose clock has ticked over still finds it).
-    timeout(T, publisher.announce(node_id)).await??;
-    timeout(T, publisher.announce(topic(ep))).await??;
-    timeout(T, publisher.announce(topic(ep + 1))).await??;
+    // Keep re-announcing rather than announcing once: the node id (reachability,
+    // so a coordinated connect can reach it) plus the current and next epoch's
+    // blinded topic (boundary overlap). The closure recomputes the epoch from the
+    // wall clock each round, so the announces follow the rotation on their own;
+    // holding `_announcer` keeps the loop alive for the run.
+    let _announcer = publisher
+        .keep_announced(REANNOUNCE_INTERVAL, move || {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let e = epoch(now, EPOCH_LEN_SECS);
+            vec![
+                node_id,
+                NodeId::from_bytes(feed_pk.blinded_topic(e)),
+                NodeId::from_bytes(feed_pk.blinded_topic(e + 1)),
+            ]
+        })
+        .await;
     println!(
-        "[publish] announced: reachable as node 0x{}…, serving under blinded topics for epochs {ep} and {}",
+        "[publish] announced (and re-announcing every {}s): reachable as node 0x{}…, serving under blinded topics for epochs {ep} and {}",
+        REANNOUNCE_INTERVAL.as_secs(),
         short(node_id.as_bytes()),
         ep + 1
     );

@@ -48,7 +48,7 @@ accept weaker guarantees.
 | **Real-socket punching** | Actual UDP hole punching on one host — direct, dial, and a real birthday port-collision | `puncher` |
 | **Fault injection** (planned) | Drops, reorders, corruption, partitions | `swarm`, `feed` |
 | **Corpus / golden files** (planned) | Wire format stays stable across versions | `wire`, `feed` |
-| **Live demo** | A human can watch the whole stack work: DHT forms, a viewer discovers a publisher by looking up a *blinded, rotating topic* (conceptually `H(feed key ‖ epoch)`; concretely a per-epoch keyed-BLAKE3 hash — the key is neither the publisher's node id nor the cleartext topic), punches a connection, streams a signed feed, verifies every frame | `transfer` |
+| **Live demo** | A human can watch the whole stack work: DHT forms, a viewer discovers a publisher by looking up a *blinded, rotating topic* (conceptually `H(feed key ‖ epoch)`; concretely a per-epoch keyed-BLAKE3 hash — so the feed key itself is never announced: it is neither the publisher's node id nor the announced topic), punches a connection, streams a signed feed, verifies every frame | `transfer` |
 
 ## Layout
 

@@ -4,7 +4,8 @@
 //!   cargo run -p transfer --example stream
 //!
 //! A publisher writes a short "video" as a signed feed and announces it on the
-//! DHT under a *blinded, rotating topic* — `H(feed_key ‖ epoch)`, not the
+//! DHT under a *blinded, rotating topic* — conceptually `H(feed_key ‖ epoch)`
+//! (concretely `crypto`'s per-epoch keyed-BLAKE3 `blinded_topic`), not the
 //! cleartext key. A viewer, knowing only the feed key, computes the same topic,
 //! looks it up to discover *who* serves the content, punches a direct connection
 //! to that node, and streams the video back — verifying every frame against the
@@ -105,7 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         short(node_id.as_bytes())
     );
     println!(
-        "[publish] blinded topic 0x{}…  (= H(feed key ‖ epoch {ep}); a crawler without the key sees only this, and it rotates each epoch)",
+        "[publish] blinded topic 0x{}…  (derived from the feed key for epoch {ep}; a crawler without the key sees only this, and it rotates each epoch)",
         short(topic(ep).as_bytes())
     );
     println!(
@@ -162,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         EPOCH_LEN_SECS,
     );
     println!(
-        "[viewer]  computing H(feed key ‖ epoch {viewer_ep}) = 0x{}… and looking it up (+ previous epoch)...",
+        "[viewer]  deriving the blinded topic from the feed key for epoch {viewer_ep} = 0x{}… and looking it up (+ previous epoch)...",
         short(topic(viewer_ep).as_bytes())
     );
     // Always query both the current and previous epoch and merge — the publisher

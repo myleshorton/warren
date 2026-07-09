@@ -91,11 +91,14 @@ crates/
             carry, syncs unchanged. Reliability is selective repeat: a stalled
             receiver NACKs the fragment indices it's missing and the sender
             resends only those, so one lost fragment costs one datagram to
-            recover, not the whole message. The seam where the data layer finally
-            rides the transport over a real connection.
+            recover, not the whole message. Sends are paced by an AIMD congestion
+            window (slow-start, halve-on-loss from NACK feedback) so a large
+            message goes out in bounded bursts instead of one blast. The seam
+            where the data layer finally rides the transport over a real
+            connection.
 
-  next: congestion control / pacing (bound fragments in flight), port mapping,
-        an incremental Merkle accumulator for feed, ...
+  next: multi-peer swarming (fetch a blob's chunks from many providers), RTT-
+        based pacing, port mapping, an incremental Merkle accumulator for feed, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

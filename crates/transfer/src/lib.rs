@@ -150,7 +150,12 @@ pub async fn download_feed<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<Vec<u8>>, TransferError> {
     let mut dl = FeedDownload::new(public_key);
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, 0);
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -166,7 +171,12 @@ pub async fn download_blob<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
     let mut dl = BlobDownload::new(id);
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, 0);
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -182,11 +192,22 @@ struct ChunkOutcome {
     alive: bool,
 }
 
-/// A provider in a swarm download: its channel plus its outbound message-id
-/// counter, kept monotonic across rounds (see [`Wire::new`]).
+/// The per-channel session state a swarm carries across rounds: the next
+/// outbound message id and the inbound accepted-watermark. Recreating a `Wire`
+/// each round (a fresh [`frame::Reassembler`]) would reset both — replaying ids
+/// the server drops as stale, and losing straggler protection on the response
+/// side — so the driver threads a `Cursor` through each provider's fetches.
+#[derive(Default, Clone, Copy)]
+struct Cursor {
+    next_id: u64,
+    accepted: Option<u64>,
+}
+
+/// A provider in a swarm download: its channel plus the session `Cursor` carried
+/// across rounds.
 struct Provider {
     channel: Channel,
-    next_id: u64,
+    cursor: Cursor,
 }
 
 /// Download and verify a blob by fetching its chunks from **several** providers
@@ -214,7 +235,7 @@ pub async fn download_blob_swarm(
         .into_iter()
         .map(|channel| Provider {
             channel,
-            next_id: 0,
+            cursor: Cursor::default(),
         })
         .collect();
 
@@ -225,7 +246,7 @@ pub async fn download_blob_swarm(
     let mut live = Vec::with_capacity(providers.len());
     let mut rest = providers.into_iter();
     for mut provider in rest.by_ref() {
-        match fetch_manifest(&mut provider.channel, id, cfg, &mut provider.next_id).await {
+        match fetch_manifest(&mut provider.channel, id, cfg, &mut provider.cursor).await {
             Ok(m) => {
                 manifest = Some(m);
                 live.push(provider);
@@ -255,7 +276,7 @@ pub async fn download_blob_swarm(
                     &mut provider.channel,
                     &assignment,
                     &cfg,
-                    &mut provider.next_id,
+                    &mut provider.cursor,
                 )
                 .await;
                 (provider, outcome)
@@ -287,36 +308,37 @@ pub async fn download_blob_swarm(
     plan.reassemble().ok_or(TransferError::Incomplete)
 }
 
-/// Fetch and verify a blob's manifest from one provider, advancing `next_id`.
+/// Fetch and verify a blob's manifest from one provider, advancing its `cursor`.
 async fn fetch_manifest<L: Link>(
     channel: &mut L,
     id: Hash,
     cfg: &Config,
-    next_id: &mut u64,
+    cursor: &mut Cursor,
 ) -> Result<Manifest, TransferError> {
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *next_id);
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *cursor);
     let result = match exchange(&mut wire, &Message::GetManifest { id }, cfg).await {
         Ok(Message::Manifest(manifest)) if manifest.id() == id => Ok(manifest),
         Ok(Message::Manifest(_)) => Err(TransferError::Sync(SyncError::BadManifest)),
         Ok(_) => Err(TransferError::Sync(SyncError::Absent)),
         Err(e) => Err(e),
     };
-    *next_id = wire.next_id;
+    *cursor = wire.cursor();
     result
 }
 
-/// Fetch the listed chunks from one provider over a single session (so its ids
-/// stay monotonic), verifying each by its hash. A chunk the provider lacks or
-/// sends wrong is skipped — left for another provider — and a provider that
-/// stops responding (a channel error or a timeout) is retired (`alive = false`).
-/// Advances `next_id`.
+/// Fetch the listed chunks from one provider over a single session, verifying
+/// each by its hash. A chunk the provider lacks or sends wrong is skipped — left
+/// for another provider — and a provider that stops responding (a channel error
+/// or a timeout) is retired (`alive = false`). Advances the `cursor` so the next
+/// round on this channel keeps ids monotonic and preserves the straggler
+/// watermark.
 async fn download_chunks<L: Link>(
     channel: &mut L,
     wanted: &[Hash],
     cfg: &Config,
-    next_id: &mut u64,
+    cursor: &mut Cursor,
 ) -> ChunkOutcome {
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *next_id);
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *cursor);
     let mut fetched = Vec::new();
     let mut alive = true;
     for &hash in wanted {
@@ -334,7 +356,7 @@ async fn download_chunks<L: Link>(
             }
         }
     }
-    *next_id = wire.next_id;
+    *cursor = wire.cursor();
     ChunkOutcome { fetched, alive }
 }
 
@@ -434,7 +456,12 @@ async fn serve<L: Link>(
         cfg.initial_rtt,
         cfg.request_timeout
     );
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, 0);
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
     // Idle is measured from the last *valid* activity, so a peer can't hold the
     // session open by sending undecodable junk.
     let mut deadline = Instant::now() + cfg.idle;
@@ -537,19 +564,28 @@ struct Wire<'a, L: Link> {
 
 impl<'a, L: Link> Wire<'a, L> {
     /// `max_rtt` caps the pacing RTT (the caller passes `request_timeout`) so a
-    /// pacing pause can't be mistaken for a stall. `start_id` seeds the outbound
-    /// message-id counter: a fresh session starts at 0, but a swarm reuses one
-    /// channel across several `Wire`s (a round per provider) and must keep ids
-    /// monotonic, or the server would drop a reset id as a stale duplicate.
-    fn new(link: &'a L, initial_rtt: Duration, max_rtt: Duration, start_id: u64) -> Self {
+    /// pacing pause can't be mistaken for a stall. `cursor` seeds the session
+    /// state: a fresh session starts at `Cursor::default()`, but a swarm reuses
+    /// one channel across several `Wire`s (a round per provider) and threads a
+    /// `Cursor` so the outbound ids stay monotonic (or the server drops a reset
+    /// id as a stale duplicate) and the inbound straggler watermark survives.
+    fn new(link: &'a L, initial_rtt: Duration, max_rtt: Duration, cursor: Cursor) -> Self {
         Self {
             link,
-            next_id: start_id,
-            inbound: Reassembler::new(),
+            next_id: cursor.next_id,
+            inbound: Reassembler::resume(cursor.accepted),
             buf: vec![0u8; MAX_DATAGRAM],
             last_sent: None,
             cong: Congestion::new(),
             rtt: Rtt::new(initial_rtt, max_rtt),
+        }
+    }
+
+    /// Export the session state to carry into the next `Wire` on this channel.
+    fn cursor(&self) -> Cursor {
+        Cursor {
+            next_id: self.next_id,
+            accepted: self.inbound.accepted(),
         }
     }
 

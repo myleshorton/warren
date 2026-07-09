@@ -416,6 +416,9 @@ impl Node {
             // Start one interval out: the initial round above already ran.
             let start = tokio::time::Instant::now() + interval;
             let mut ticker = tokio::time::interval_at(start, interval);
+            // After a scheduling stall, keep pacing at the interval rather than
+            // firing a catch-up burst of announces (the default `Burst`).
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 ticker.tick().await;
                 for topic in topics() {

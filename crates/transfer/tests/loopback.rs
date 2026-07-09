@@ -41,7 +41,8 @@ async fn downloads_a_feed_over_a_channel() {
     let expected: Vec<Vec<u8>> = (0..15u8).map(|i| vec![i; (i as usize % 5) + 1]).collect();
 
     // Server answers in the background; client pulls the whole feed.
-    tokio::spawn(async move { serve_feed(&server_ch, &log, &Config::default()).await });
+    let _server =
+        tokio::spawn(async move { serve_feed(&server_ch, &log, &Config::default()).await });
     let blocks = timeout(T, download_feed(&client_ch, public_key, &Config::default()))
         .await
         .expect("download should finish")
@@ -64,7 +65,8 @@ async fn downloads_a_blob_over_a_channel() {
     }
     let id = store.put(manifest.encode());
 
-    tokio::spawn(async move { serve_blob(&server_ch, &store, &Config::default()).await });
+    let _server =
+        tokio::spawn(async move { serve_blob(&server_ch, &store, &Config::default()).await });
     let got = timeout(T, download_blob(&client_ch, id, &Config::default()))
         .await
         .expect("download should finish")

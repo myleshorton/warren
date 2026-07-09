@@ -23,12 +23,14 @@ use crypto::{Hash, PublicKey};
 use driver::Channel;
 use sync::{BlobDownload, FeedDownload, Message, SyncError};
 use thiserror::Error;
-use tokio::time::timeout;
+use tokio::time::{timeout, Instant};
 
-/// Largest datagram exchanged. A single [`sync::Message`] must fit within this,
-/// so a feed block or blob chunk (plus wire overhead) must stay comfortably
-/// under it — UDP itself caps a datagram near 64 KiB.
-pub const MAX_DATAGRAM: usize = 64 * 1024;
+/// Largest datagram exchanged — the maximum UDP payload for IPv4
+/// (65535 − 20-byte IP − 8-byte UDP headers). A single encoded [`sync::Message`]
+/// must fit within this, so a feed block or blob chunk (plus wire overhead) has
+/// to stay under it; a message that doesn't is a [`TransferError::MessageTooLarge`]
+/// rather than an opaque socket error.
+pub const MAX_DATAGRAM: usize = 65_507;
 
 /// Timing for a transfer over an unreliable channel.
 #[derive(Debug, Clone, Copy)]
@@ -114,7 +116,7 @@ async fn exchange(
     buf: &mut [u8],
     cfg: &Config,
 ) -> Result<Message, TransferError> {
-    let bytes = request.encode();
+    let bytes = encode_bounded(request)?;
     for _ in 0..=cfg.retries {
         channel.send(&bytes).await?;
         match timeout(cfg.request_timeout, channel.recv(buf)).await {
@@ -140,18 +142,38 @@ async fn serve(
     respond: impl Fn(&Message) -> Message,
 ) -> Result<(), TransferError> {
     let mut buf = vec![0u8; MAX_DATAGRAM];
+    // Idle is measured from the last *valid* request, so a peer can't hold the
+    // session open by sending undecodable junk.
+    let mut deadline = Instant::now() + cfg.idle;
     loop {
-        match timeout(cfg.idle, channel.recv(&mut buf)).await {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(()); // idle: the client has stopped asking
+        }
+        match timeout(remaining, channel.recv(&mut buf)).await {
             Ok(Ok(n)) => {
                 if let Ok(request) = Message::decode(&buf[..n]) {
-                    channel.send(&respond(&request).encode()).await?;
+                    channel.send(&encode_bounded(&respond(&request))?).await?;
+                    deadline = Instant::now() + cfg.idle;
                 }
-                // Undecodable datagrams are ignored.
+                // Undecodable datagrams are ignored and do not extend the idle
+                // deadline.
             }
             Ok(Err(e)) => return Err(TransferError::Io(e)),
-            Err(_) => return Ok(()), // idle: the client has stopped asking
+            Err(_) => return Ok(()),
         }
     }
+}
+
+/// Encode a message, erroring if it wouldn't fit in one datagram — so an
+/// oversize block/chunk surfaces as [`TransferError::MessageTooLarge`] rather
+/// than an opaque socket error.
+fn encode_bounded(message: &Message) -> Result<Vec<u8>, TransferError> {
+    let bytes = message.encode();
+    if bytes.len() > MAX_DATAGRAM {
+        return Err(TransferError::MessageTooLarge(bytes.len()));
+    }
+    Ok(bytes)
 }
 
 /// Why a transfer failed.
@@ -163,6 +185,10 @@ pub enum TransferError {
     /// A request went unanswered after all retransmits.
     #[error("peer did not respond")]
     Timeout,
+    /// An encoded message exceeded [`MAX_DATAGRAM`] and can't be sent in one
+    /// datagram (a block/chunk too large for this transport — see the crate docs).
+    #[error("message of {0} bytes exceeds the datagram limit")]
+    MessageTooLarge(usize),
     /// The download finished but the blob couldn't be reassembled.
     #[error("blob incomplete")]
     Incomplete,

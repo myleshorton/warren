@@ -4,7 +4,9 @@
 
 A fully decentralized, serverless peer-to-peer stack in Rust — the substrate for a
 P2P video platform for non-copyrighted content. Design rationale lives in
-[`PEAR-ARCHITECTURE-AND-RUST-DESIGN.md`](./PEAR-ARCHITECTURE-AND-RUST-DESIGN.md).
+[`PEAR-ARCHITECTURE-AND-RUST-DESIGN.md`](./PEAR-ARCHITECTURE-AND-RUST-DESIGN.md);
+the system's advantages and its censorship threat model are in
+[`docs/design.md`](./docs/design.md).
 
 This repo is built layer by layer, and **every layer ships with the means to
 verify it**. Correctness is not asserted; it is demonstrated.

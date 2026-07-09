@@ -124,16 +124,26 @@ async fn exchange(
     let bytes = encode_bounded(request)?;
     for _ in 0..=cfg.retries {
         channel.send(&bytes).await?;
-        match timeout(cfg.request_timeout, channel.recv(buf)).await {
-            Ok(Ok(n)) => {
-                // A datagram that doesn't decode (corruption, a stray packet) is
-                // treated like a lost round: retransmit and keep waiting.
-                if let Ok(message) = Message::decode(&buf[..n]) {
-                    return Ok(message);
-                }
+        // Read until this attempt's window elapses, ignoring undecodable
+        // datagrams (corruption, strays) rather than retransmitting on each —
+        // otherwise a peer could trigger rapid-fire resends with junk, and
+        // `request_timeout` would no longer bound the retransmit rate.
+        let deadline = Instant::now() + cfg.request_timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break; // window over: retransmit
             }
-            Ok(Err(e)) => return Err(TransferError::Io(e)),
-            Err(_) => {} // timed out: retransmit
+            match timeout(remaining, channel.recv(buf)).await {
+                Ok(Ok(n)) => {
+                    if let Ok(message) = Message::decode(&buf[..n]) {
+                        return Ok(message);
+                    }
+                    // Undecodable: keep waiting out this window, don't resend.
+                }
+                Ok(Err(e)) => return Err(TransferError::Io(e)),
+                Err(_) => break, // window elapsed: retransmit
+            }
         }
     }
     Err(TransferError::Timeout)

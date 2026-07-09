@@ -4,25 +4,25 @@
 //!   cargo run -p transfer --example stream
 //!
 //! A publisher writes a short "video" as a signed feed and announces it on the
-//! DHT under a *topic* (the feed's public key). A viewer, knowing only that key,
-//! looks the topic up to discover *who* serves it, punches a direct connection to
-//! that node, and streams the video back — verifying every frame against the
+//! DHT under a *blinded, rotating topic* — conceptually `H(feed_key ‖ epoch)`
+//! (concretely `crypto`'s per-epoch keyed-BLAKE3 `blinded_topic`), not the
+//! cleartext key. A viewer, knowing only the feed key, computes the same topic,
+//! looks it up to discover *who* serves the content, punches a direct connection
+//! to that node, and streams the video back — verifying every frame against the
 //! publisher's signature.
 //!
-//! The feed's public key is the video's id and its discovery topic, but the
-//! publisher's DHT node id is *random and independent*. So the key does not
-//! double as the *publisher's* node id: the publisher never runs the feed key as
-//! its node id (its content announce under that topic carries a random id), so
-//! `connect(feed_key)` doesn't reach the publisher — the demo shows it finding
-//! nothing (no node here runs that id) before the topic lookup reveals the real
-//! (random-id) provider. (The lookup still returns the provider's contact;
-//! decoupling the node id is not the same as hiding the provider — that is a job
-//! for blinded topics.)
+//! Two censorship properties are visible in the log:
+//!  * the publisher's DHT node id is random, so the feed key is not a node id —
+//!    dialing the key directly reaches no one (node-id decoupling);
+//!  * discovery goes through the blinded topic, so a DHT crawler who does not
+//!    hold the feed key sees only an opaque id that rotates every epoch. (A censor
+//!    who *does* hold the key can still recompute it — hiding it from them is the
+//!    PSK-blinded variant's job, not shown here.)
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crypto::Keypair;
+use crypto::{epoch, Keypair};
 use driver::Node;
 use feed::Log;
 use swarm::sim::Rng;
@@ -32,6 +32,9 @@ use transfer::{download_feed, serve_feed, Config};
 
 const LO: &str = "127.0.0.1:0";
 const T: Duration = Duration::from_secs(20);
+/// How long a topic stays fixed before rotating. Tunable: shorter tightens the
+/// window a crawler gets but adds re-announce churn. An hour is a demo value.
+const EPOCH_LEN_SECS: u64 = 3600;
 
 /// First six bytes of an id as hex, for readable logging.
 fn short(bytes: &[u8]) -> String {
@@ -60,17 +63,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Publisher ------------------------------------------------------------
     let feed_kp = Keypair::from_seed(&[42u8; 32]);
     let feed_pk = feed_kp.public();
-    // The feed key is the video id and the discovery topic. The node id is
-    // random — deliberately unrelated to the key — so the key can't be dialed as
-    // a node id; discovery goes through a topic lookup instead.
-    let topic = NodeId::from_bytes(feed_pk.to_bytes());
+    // The feed key is the video id and the content key you verify against. The
+    // node id is random — the key is not the publisher's node id. Content is
+    // discovered under a blinded topic that rotates with the epoch, not the key.
     let node_id = rng.node_id();
-    // Independent by construction; assert it (as the end-to-end test does) so the
-    // demo can't silently drift from the property it illustrates.
     assert_ne!(
-        node_id, topic,
+        node_id.as_bytes(),
+        &feed_pk.to_bytes(),
         "the publisher's node id is independent of the feed key"
     );
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before 1970")
+        .as_secs();
+    let ep = epoch(now_secs, EPOCH_LEN_SECS);
+    let topic = |e: u64| NodeId::from_bytes(feed_pk.blinded_topic(e));
+
     // Each "frame" is ~40 KiB — larger than a single UDP datagram — so streaming
     // it exercises the transport's fragmentation: every block is split across
     // many datagrams and reassembled (then verified) on the viewer's side.
@@ -90,12 +98,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let log = Arc::new(log);
 
     println!(
-        "[publish] feed key  0x{}…  (the video id and the discovery topic)",
-        short(&topic.as_bytes()[..])
+        "[publish] feed key    0x{}…  (the video id and the key every frame is verified against)",
+        short(feed_pk.as_bytes())
     );
     println!(
-        "[publish] node id   0x{}…  (random — unrelated to the key, so the key doesn't point here)",
-        short(&node_id.as_bytes()[..])
+        "[publish] node id     0x{}…  (random — the feed key is not this node's id)",
+        short(node_id.as_bytes())
+    );
+    println!(
+        "[publish] blinded topic 0x{}…  (derived from the feed key for epoch {ep}; a crawler without the key sees only this, and it rotates each epoch)",
+        short(topic(ep).as_bytes())
     );
     println!(
         "[publish] wrote {} frames ({} KiB total, ~{} KiB each — a frame is larger than one datagram) to a signed feed",
@@ -107,14 +119,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let publisher = Node::bind(lo, node_id).await?;
     publisher.add_contact(bootstrap).await?;
     timeout(T, publisher.bootstrap()).await??;
-    // Two announces: register the node so a coordinated connect can reach it, and
-    // register the content under its topic so a viewer can discover who serves it.
+    // Register the node (reachability, so a coordinated connect can reach it) and
+    // the content under the current and next epoch's blinded topic (boundary
+    // overlap, so a viewer whose clock has ticked over still finds it).
     timeout(T, publisher.announce(node_id)).await??;
-    timeout(T, publisher.announce(topic)).await??;
+    timeout(T, publisher.announce(topic(ep))).await??;
+    timeout(T, publisher.announce(topic(ep + 1))).await??;
     println!(
-        "[publish] announced: reachable as node 0x{}…, serving the feed under topic 0x{}…",
-        short(&node_id.as_bytes()[..]),
-        short(&topic.as_bytes()[..])
+        "[publish] announced: reachable as node 0x{}…, serving under blinded topics for epochs {ep} and {}",
+        short(node_id.as_bytes()),
+        ep + 1
     );
 
     // Serve one inbound viewer.
@@ -132,29 +146,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     viewer.add_contact(bootstrap).await?;
     timeout(T, viewer.bootstrap()).await??;
 
-    // Decoupling, made visible: trying to dial the feed key *as a node id* — what
-    // a censor who only scraped the key would do — finds no one, because no node
-    // runs the feed key as its id.
-    println!(
-        "[viewer]  first, dialing the feed key as if it were a node id (as a censor would)..."
-    );
-    let by_key = timeout(T, viewer.connect(topic)).await??;
-    println!(
-        "[viewer]  → {:?}: the key is not a node id; you can't dial the publisher by it",
-        by_key.outcome
-    );
+    // Decoupling, made visible: the feed key is not a node id, so dialing it
+    // directly (what a censor who scraped the key would try) reaches no one.
+    println!("[viewer]  the feed key is not a node id — dialing it directly finds no publisher:");
+    let by_key = timeout(T, viewer.connect(NodeId::from_bytes(feed_pk.to_bytes()))).await??;
+    println!("[viewer]  → {:?}", by_key.outcome);
 
-    // The real path: look the topic up to learn which node serves the content,
-    // then connect to that node by its (random) id and punch a channel.
-    println!("[viewer]  now looking the feed key up as a topic to discover who serves it...");
-    let providers = timeout(T, viewer.lookup(topic)).await??;
+    // The real path: compute the same blinded topic from the feed key and look it
+    // up (current + previous epoch, for boundary overlap), then connect to the
+    // discovered random-id provider.
+    let viewer_ep = epoch(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before 1970")
+            .as_secs(),
+        EPOCH_LEN_SECS,
+    );
+    println!(
+        "[viewer]  deriving the blinded topic from the feed key for epoch {viewer_ep} = 0x{}… and looking it up (+ previous epoch)...",
+        short(topic(viewer_ep).as_bytes())
+    );
+    // Always query both the current and previous epoch and merge — the publisher
+    // might be present under one but not the other (partial DHT replication), and
+    // `saturating_sub` keeps epoch 0 from underflowing.
+    let mut providers = timeout(T, viewer.lookup(topic(viewer_ep))).await??;
+    for c in timeout(T, viewer.lookup(topic(viewer_ep.saturating_sub(1)))).await?? {
+        if !providers.iter().any(|p| p.id == c.id) {
+            providers.push(c);
+        }
+    }
     let provider = providers
         .iter()
         .find(|c| c.id == node_id)
-        .ok_or("no provider announced under the topic")?;
+        .ok_or("no provider announced under the blinded topic")?;
     println!(
         "[viewer]  found provider node 0x{}… — connecting and hole-punching a direct channel...",
-        short(&provider.id.as_bytes()[..])
+        short(provider.id.as_bytes())
     );
     let conn = timeout(T, viewer.connect(provider.id)).await??;
     let outcome = conn.outcome;

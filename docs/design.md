@@ -147,24 +147,31 @@ random-id node
 serves the content, then connects to *that* node. This does not by itself hide
 the provider — a topic lookup still returns its contact, address and all — but it
 removes the direct key→node coupling and confines the content→node mapping to the
-topic record, which blinded topics (next) then protect. The node's reachability
+topic record, which blinded topics (below) then protect. The node's reachability
 registration (a self-announce under its own random id) and the content
 registration (an announce under the topic) are kept separate for exactly that
 reason. Random node ids also spread the DHT's coordinator/keyspace roles across
 unrelated identities rather than concentrating them on content keys.
 
-**Blinded, rotating topics.** Announce and look content up under a *derived* topic
-rather than the cleartext content id, so a crawler near the key-space sees opaque,
-rotating identifiers instead of "provider of banned content X." Two regimes:
+**Blinded, rotating topics. (Implemented — key-blinded; PSK-blinded available.)**
+Announce and look content up under a *derived* topic rather than the cleartext
+content id, so a crawler near the key-space sees opaque, rotating identifiers
+instead of "provider of banned content X." Two regimes:
 
-- *Key-blinded* — `topic = H(feed_key ‖ epoch)`. Any viewer who knows the feed
-  key (as they must, to verify) can compute it; a censor who does *not* have that
-  specific key sees only rotating opaque ids and cannot cheaply catalogue the
-  network or keep a pre-computed blocklist current. Free — no extra coordination.
-- *PSK-blinded* — `topic = HMAC(PSK, feed_key ‖ epoch)`. Only holders of a channel
-  pre-shared key can derive the topic, so a censor with the feed key but not the
-  PSK is blind. Stronger, at the cost of distributing the PSK out-of-band (the
-  classic bootstrapping problem); opt-in, for private channels.
+- *Key-blinded* — conceptually `topic = H(feed_key ‖ epoch)`. Any viewer who knows
+  the feed key (as they must, to verify) can compute it; a censor who does *not*
+  have that specific key sees only rotating opaque ids and cannot cheaply
+  catalogue the network or keep a pre-computed blocklist current. Free — no extra
+  coordination.
+- *PSK-blinded* — conceptually `topic = MAC(PSK, feed_key ‖ epoch)`. Only holders
+  of a channel pre-shared key can derive the topic, so a censor with the feed key
+  but not the PSK is blind. Stronger, at the cost of distributing the PSK
+  out-of-band (the classic bootstrapping problem); opt-in, for private channels.
+
+Both are **keyed BLAKE3, not HMAC**, domain-separated, with the epoch encoded
+little-endian: key-blinded keys the hash with the feed key over `domain ‖ epoch`;
+PSK-blinded keys it with `derive_key(context, PSK)` over `feed_key ‖ epoch`. The
+exact bytes are pinned by a KAT in `crypto` so independent implementations agree.
 
 Rotation is **time-synchronized**: `epoch = floor(now / epoch_len)`, so every
 participant computes the *same* topic in a given epoch — the provider set does
@@ -175,6 +182,15 @@ viewers look up the current *and* previous — so clock skew never opens an
 availability gap. `epoch_len` is **tunable**: shorter tightens the correlation
 window a censor gets but adds re-announce churn; longer reduces churn but widens
 the window.
+
+*What's built:* the derivations are `crypto::PublicKey::blinded_topic` (key-blinded)
+and `blinded_topic_psk` (PSK-blinded) — pure, domain-separated, property-tested,
+with a wire-format KAT so participants on different versions can't silently
+compute different topics; the epoch (`crypto::epoch`) and the announce/lookup
+overlap live at the I/O edge, exercised by the `stream` example and the
+end-to-end test (which includes an epoch-boundary case). Folding the per-epoch
+re-announce into an automatic loop in the driver is future work — today callers
+announce the current+next and look up the current+previous epoch explicitly.
 
 **Ephemeral / query-only clients.** A pure fetcher never joins others' routing
 tables, so it isn't enumerable *as a node*.
@@ -212,7 +228,8 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Reliable transport: fragmentation, selective repeat, AIMD + RTT pacing | built |
 | Multi-peer swarming (full seeders, round-based) | built |
 | Decoupled node id (random id + topic-based discovery) | built |
-| Blinded, rotating topics | planned |
+| Blinded, rotating topics (key-blinded + PSK-blinded, epoch overlap) | built |
+| Automatic per-epoch re-announce loop in the driver | planned |
 | Ephemeral/query-only client mode | planned |
 | Obfuscated transport, cover-DHT rendezvous | planned |
 | Holdings-aware (partial-seeder) swarming, rarest-first | planned |

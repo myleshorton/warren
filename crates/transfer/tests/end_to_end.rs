@@ -1,26 +1,32 @@
 //! The whole stack in one test: a viewer discovers a publisher over the DHT by a
-//! *content topic*, punches a channel to it, and streams a signed feed across it
-//! — verifying every block — with no server in the path.
+//! *blinded, rotating topic* derived from the feed key and the current epoch,
+//! punches a channel to it, and streams a signed feed across it — verifying
+//! every block — with no server in the path.
 //!
-//! The feed's public key is the content id and the discovery topic, but the
-//! publisher's DHT node id is *independent* (random). So the key no longer
-//! doubles as a node id: no node runs the feed key as its node id (no
-//! self-announce record has that id), so `connect(feed_key)` — dialing the
-//! scraped key — resolves `NotFound`. Discovery instead goes through a *topic*
-//! lookup, which reveals which (random-id) node serves the content.
-//! (That lookup still returns the provider's contact, so decoupling the node id
-//! is not the same as hiding the provider — that is what blinded topics harden.)
-//! This test asserts the decoupling: connecting by the feed key finds nothing,
-//! while the topic-lookup path streams and verifies the whole feed.
+//! Discovery is both decoupled and blinded:
+//!  * the publisher's DHT node id is random, independent of the feed key, so the
+//!    key is not a node id — dialing the cleartext key (`connect(feed_key)`)
+//!    reaches no one (PR #22);
+//!  * content is announced under `blinded_topic(feed_key, epoch)`, not the
+//!    cleartext key, so a DHT crawler who does not hold the feed key sees only an
+//!    opaque id that rotates each epoch — it cannot map the topic to the content
+//!    or keep a static blocklist. A viewer who knows the key computes the same
+//!    topic.
+//!
+//! Epoch boundaries are covered by *overlap*: the publisher announces the
+//! current *and* next epoch, a viewer looks up the current *and* previous — so a
+//! clock that has ticked over still finds the provider. Both the steady state
+//! and the boundary are exercised.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crypto::Keypair;
+use crypto::{Keypair, PublicKey};
 use driver::{ConnectOutcome, Node};
 use feed::Log;
 use swarm::sim::Rng;
-use swarm::NodeId;
+use swarm::{Contact, NodeId};
 use tokio::time::timeout;
 use transfer::{download_feed, serve_feed, Config};
 
@@ -51,21 +57,26 @@ async fn network(n: usize, seed: u64) -> (Node, Vec<Node>) {
     (boot, peers)
 }
 
-#[tokio::test]
-async fn discover_by_topic_connect_and_stream_a_feed() {
-    // Keep the peers alive (they populate the DHT); bootstrap new nodes off the
-    // boot node, as the other loopback tests do.
-    let (boot, _peers) = network(6, 0x5EED).await;
-    let bootstrap = boot.contact();
+/// The blinded topic for `epoch` as a DHT key.
+fn topic(feed_pk: &PublicKey, epoch: u64) -> NodeId {
+    NodeId::from_bytes(feed_pk.blinded_topic(epoch))
+}
 
-    // Publisher: a signed feed. Its public key is the content id and the DHT
-    // discovery *topic* — but its node id is random and unrelated to the key.
+/// Bring up a publisher that serves a small signed feed. It announces its random
+/// node id (reachability, so a coordinated connect can reach it) and the content
+/// under each of `epochs`' blinded topics. Returns the node, its id, the feed key
+/// (the content id / verification key), and the frames it serves.
+async fn publish(
+    bootstrap: Contact,
+    node_seed: u64,
+    epochs: &[u64],
+) -> (Node, NodeId, PublicKey, Vec<Vec<u8>>) {
     let feed_kp = Keypair::from_seed(&[42u8; 32]);
     let feed_pk = feed_kp.public();
-    let topic = NodeId::from_bytes(feed_pk.to_bytes());
-    let node_id = Rng::new(0xDEC0DE).node_id();
+    let node_id = Rng::new(node_seed).node_id();
     assert_ne!(
-        node_id, topic,
+        node_id.as_bytes(),
+        &feed_pk.to_bytes(),
         "the publisher's node id must be independent of its feed key"
     );
 
@@ -79,19 +90,17 @@ async fn discover_by_topic_connect_and_stream_a_feed() {
     let publisher = Node::bind(LO.parse().unwrap(), node_id).await.unwrap();
     publisher.add_contact(bootstrap).await.unwrap();
     timeout(T, publisher.bootstrap()).await.unwrap().unwrap();
-    // Two announces, distinct in purpose: register the (random-id) node so a
-    // coordinated connect can reach it, and register the content under its topic
-    // so a viewer holding only the feed key can discover who serves it.
     timeout(T, publisher.announce(node_id))
         .await
         .unwrap()
         .unwrap();
-    timeout(T, publisher.announce(topic))
-        .await
-        .unwrap()
-        .unwrap();
+    for &e in epochs {
+        timeout(T, publisher.announce(topic(&feed_pk, e)))
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
-    // Serve one inbound pull.
     let serve_log = log.clone();
     let serve_node = publisher.clone();
     tokio::spawn(async move {
@@ -100,19 +109,64 @@ async fn discover_by_topic_connect_and_stream_a_feed() {
         }
     });
 
-    // Viewer: knows only the feed key.
+    (publisher, node_id, feed_pk, frames)
+}
+
+/// Look content up under any of `topics`, merged and de-duplicated by node id —
+/// the viewer-side boundary overlap (current + previous epoch).
+async fn discover(node: &Node, topics: &[NodeId]) -> Vec<Contact> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for t in topics {
+        for c in timeout(T, node.lookup(*t)).await.unwrap().unwrap() {
+            if seen.insert(c.id) {
+                out.push(c);
+            }
+        }
+    }
+    out
+}
+
+/// Connect to `provider` and stream the feed, checking it verifies to `frames`.
+async fn fetch_and_verify(viewer: &Node, provider: NodeId, feed_pk: PublicKey, frames: &[Vec<u8>]) {
+    let conn = timeout(T, viewer.connect(provider))
+        .await
+        .unwrap()
+        .expect("connect");
+    assert_eq!(conn.outcome, ConnectOutcome::Direct);
+    let mut channel = conn.channel.expect("a direct connect yields a channel");
+    let received = timeout(T, download_feed(&mut channel, feed_pk, &Config::default()))
+        .await
+        .expect("download finishes")
+        .expect("download verifies");
+    assert_eq!(received, frames);
+}
+
+#[tokio::test]
+async fn discover_by_blinded_topic_and_stream_a_feed() {
+    // Keep the peers alive (they populate the DHT); bootstrap new nodes off the
+    // boot node, as the other loopback tests do.
+    let (boot, _peers) = network(6, 0x5EED).await;
+    let bootstrap = boot.contact();
+
+    // A fixed epoch stands in for wall-clock time; the derivation is pure, so the
+    // test needs no clock. The publisher announces the current and next epoch.
+    const EPOCH: u64 = 100;
+    let (_publisher, node_id, feed_pk, frames) =
+        publish(bootstrap, 0xDEC0DE, &[EPOCH, EPOCH + 1]).await;
+
+    // The blinded topic is opaque — not the cleartext feed key.
+    assert_ne!(topic(&feed_pk, EPOCH).as_bytes(), &feed_pk.to_bytes());
+
     let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xF00).node_id())
         .await
         .unwrap();
     viewer.add_contact(bootstrap).await.unwrap();
     timeout(T, viewer.bootstrap()).await.unwrap().unwrap();
 
-    // Decoupling, proven: connecting *by the feed key as a node id* — what a
-    // censor who scraped the key would try — reaches no one, because no node runs
-    // the feed key as its node id. The content record living near that key carries
-    // a random node's id, not the feed key's, so it is not a self-announce and
-    // thus not a coordinator for a connect-by-id.
-    let by_key = timeout(T, viewer.connect(topic))
+    // Decoupling still holds: the cleartext feed key is neither a node id nor an
+    // announced topic, so dialing it as a node reaches no one.
+    let by_key = timeout(T, viewer.connect(NodeId::from_bytes(feed_pk.to_bytes())))
         .await
         .unwrap()
         .expect("connect resolves");
@@ -123,24 +177,46 @@ async fn discover_by_topic_connect_and_stream_a_feed() {
     );
     assert!(by_key.channel.is_none());
 
-    // The real path: look the topic up to learn which node serves it, then
-    // connect to that node by its (random) id.
-    let providers = timeout(T, viewer.lookup(topic)).await.unwrap().unwrap();
+    // Discover under the current and previous epoch (viewer-side overlap), then
+    // connect to the random-id provider and stream.
+    let providers = discover(
+        &viewer,
+        &[topic(&feed_pk, EPOCH), topic(&feed_pk, EPOCH - 1)],
+    )
+    .await;
     let provider = providers
         .iter()
         .find(|c| c.id == node_id)
-        .expect("the publisher announced the content under its topic");
+        .expect("the publisher announced the content under its blinded topic");
 
-    let conn = timeout(T, viewer.connect(provider.id))
-        .await
-        .unwrap()
-        .expect("connect");
-    assert_eq!(conn.outcome, ConnectOutcome::Direct);
-    let mut channel = conn.channel.expect("a direct connect yields a channel");
+    fetch_and_verify(&viewer, provider.id, feed_pk, &frames).await;
+}
 
-    let received = timeout(T, download_feed(&mut channel, feed_pk, &Config::default()))
+#[tokio::test]
+async fn discovery_survives_an_epoch_boundary() {
+    // The publisher announced the current and next epoch (E, E+1) at some earlier
+    // instant. A viewer whose clock has since ticked to E+1 looks up its current
+    // and previous epoch (E+1, E). The publisher's *next*-epoch announce (E+1)
+    // meets the viewer's *current* (E+1), so the boundary opens no gap — even
+    // though the two disagree about which epoch "now" is.
+    let (boot, _peers) = network(6, 0xB0475).await;
+    let bootstrap = boot.contact();
+
+    const E: u64 = 100;
+    let (_publisher, node_id, feed_pk, frames) = publish(bootstrap, 0xACE, &[E, E + 1]).await;
+
+    let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xBEE).node_id())
         .await
-        .expect("download finishes")
-        .expect("download verifies");
-    assert_eq!(received, frames);
+        .unwrap();
+    viewer.add_contact(bootstrap).await.unwrap();
+    timeout(T, viewer.bootstrap()).await.unwrap().unwrap();
+
+    // Viewer is one epoch ahead: current = E+1, previous = E.
+    let providers = discover(&viewer, &[topic(&feed_pk, E + 1), topic(&feed_pk, E)]).await;
+    let provider = providers
+        .iter()
+        .find(|c| c.id == node_id)
+        .expect("overlap should bridge the epoch boundary");
+
+    fetch_and_verify(&viewer, provider.id, feed_pk, &frames).await;
 }

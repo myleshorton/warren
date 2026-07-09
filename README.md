@@ -42,7 +42,7 @@ accept weaker guarantees.
 | **Deterministic sim** | Multi-node behavior under a controlled clock/network — no flakes | `swarm` |
 | **Oracle checks** | Lookup results verified against a brute-force ground truth | `swarm` |
 | **Statistical guardrails** | Probabilistic behavior (birthday punch) measured against its analytic bound; fails if constants weaken | `swarm` |
-| **Loopback integration** | Real `tokio` UDP sockets on one host: bootstrap, announce, lookup, and a one-call `connect(id)` that punches a live channel | `driver` |
+| **Loopback integration** | Real `tokio` UDP sockets on one host: bootstrap, announce, lookup, a one-call `connect(id)` that punches a live channel, and a feed/blob downloaded + verified over a punched channel | `driver`, `transfer` |
 | **Real-socket punching** | Actual UDP hole punching on one host — direct, dial, and a real birthday port-collision | `puncher` |
 | **Fault injection** (planned) | Drops, reorders, corruption, partitions | `swarm`, `feed` |
 | **Corpus / golden files** (planned) | Wire format stays stable across versions | `wire`, `feed` |
@@ -83,9 +83,13 @@ crates/
             BlobDownload (manifest + chunks, verified by content hash), with
             serve_feed/serve_blob answering from a local Log/Store. Pure
             request/response messages — the driver pumps them over a channel.
+  transfer  runs sync over a punched driver::Channel: download_feed/download_blob
+            (client) and serve_feed/serve_blob (server), framing each message as a
+            datagram with per-request retransmit + idle timeout. The seam where
+            the data layer finally rides the transport over a real connection.
 
-  next: wire sync over a driver channel (the pure message loop -> a real download
-        over a punched connection); relay data path, port mapping, ...
+  next: relay data path (symmetric-symmetric), a stream transport lifting the
+        one-message-per-datagram limit, port mapping, a live end-to-end demo, ...
 ```
 
 Try it:

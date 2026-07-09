@@ -1,0 +1,20 @@
+[package]
+name = "transfer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+crypto = { path = "../crypto" }
+feed = { path = "../feed" }
+blob = { path = "../blob" }
+sync = { path = "../sync" }
+driver = { path = "../driver" }
+tokio = { version = "1", features = ["time"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }

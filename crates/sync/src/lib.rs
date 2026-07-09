@@ -185,6 +185,20 @@ impl Message {
         dec.finish()?;
         Ok(msg)
     }
+
+    /// Whether this is a client→server *request* (rather than a server→client
+    /// response). The transport uses this to drop a message arriving in the
+    /// wrong direction — a stray request delivered to a downloading client, or a
+    /// response delivered to a server — instead of mishandling it.
+    pub fn is_request(&self) -> bool {
+        matches!(
+            self,
+            Message::GetHead
+                | Message::GetBlock { .. }
+                | Message::GetManifest { .. }
+                | Message::GetChunk { .. }
+        )
+    }
 }
 
 /// Answer a sync request from a local feed. Requests the server can't satisfy
@@ -627,6 +641,32 @@ mod tests {
             serve_feed(&Message::GetBlock { index: 5 }, &server),
             Message::Absent
         );
+    }
+
+    #[test]
+    fn is_request_classifies_by_direction() {
+        let (manifest, _) = blob::split(b"x");
+        for req in [
+            Message::GetHead,
+            Message::GetBlock { index: 0 },
+            Message::GetManifest {
+                id: crypto::hash(b"i"),
+            },
+            Message::GetChunk {
+                hash: crypto::hash(b"c"),
+            },
+        ] {
+            assert!(req.is_request(), "{req:?} is a request");
+        }
+        for resp in [
+            Message::Head(log_with(1, 0).head()),
+            serve_feed(&Message::GetBlock { index: 0 }, &log_with(1, 0)),
+            Message::Manifest(manifest),
+            Message::Chunk { data: vec![1] },
+            Message::Absent,
+        ] {
+            assert!(!resp.is_request(), "{resp:?} is a response");
+        }
     }
 
     #[test]

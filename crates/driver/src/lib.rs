@@ -193,8 +193,10 @@ pub type Result<T> = std::result::Result<T, Closed>;
 ///
 /// A `Direct` or `Punched` outcome normally carries a live `channel` (dialed or
 /// birthday-punched, respectively). `channel` is `None` when the target wasn't
-/// found, signaling timed out, the outcome is `Relayed` (no direct data path
-/// yet — future work), or the punch to a reachable peer didn't complete in time.
+/// found, signaling timed out, the outcome is `Relayed` (both peers symmetric —
+/// no direct path is possible, and a relay data path is intentionally not built,
+/// as it would load relays too heavily for a serverless model), or the punch to
+/// a reachable peer didn't complete in time.
 #[derive(Debug)]
 pub struct Connection {
     /// How the DHT resolved the connection.
@@ -763,7 +765,8 @@ fn spawn_connect_punch(job: PunchJob) {
                 drop(data_sock);
                 punch_open(own_host, peer.ip(), &cfg, birthday, seed).await
             }
-            // Relay (no direct data path yet) / no peer to punch to.
+            // Relay (symmetric↔symmetric: no direct path, and relaying is not
+            // built by design) / no peer to punch to.
             _ => {
                 drop(data_sock);
                 None

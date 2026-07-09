@@ -245,11 +245,14 @@ async fn keep_announced_reannounces_across_rotation_and_stops_on_drop() {
     let ep = Arc::new(AtomicU64::new(0));
     let ep_c = ep.clone();
     let interval = Duration::from_millis(200);
-    let announcer = provider
-        .keep_announced(interval, move || {
+    let announcer = timeout(
+        T,
+        provider.keep_announced(interval, move || {
             vec![topic(&feed_pk, ep_c.load(Ordering::Relaxed))]
-        })
-        .await;
+        }),
+    )
+    .await
+    .expect("keep_announced initial round finishes within the deadline");
 
     let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xF00).node_id())
         .await

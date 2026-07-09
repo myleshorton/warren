@@ -645,6 +645,7 @@ dependencies = [
 name = "sync"
 version = "0.0.0"
 dependencies = [
+ "blob",
  "crypto",
  "feed",
  "proptest",

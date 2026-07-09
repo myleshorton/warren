@@ -1,11 +1,11 @@
-//! Property tests for feed sync: an honest server always yields the exact feed,
-//! a tampered block is always rejected, and the message codec is panic-free and
+//! Property tests for sync: an honest server always yields the exact feed/blob,
+//! tampered data is always rejected, and the message codec is panic-free and
 //! round-trips.
 
 use crypto::Keypair;
 use feed::Log;
 use proptest::prelude::*;
-use sync::{serve_feed, FeedDownload, Message, SyncError};
+use sync::{serve_blob, serve_feed, BlobDownload, FeedDownload, Message, SyncError};
 
 fn arb_blocks() -> impl Strategy<Value = Vec<Vec<u8>>> {
     prop::collection::vec(prop::collection::vec(any::<u8>(), 0..40), 0..40)
@@ -90,5 +90,55 @@ proptest! {
         for m in msgs {
             prop_assert_eq!(Message::decode(&m.encode()).unwrap(), m);
         }
+    }
+
+    /// Syncing a blob from an honest server reproduces the bytes exactly, for any
+    /// data and chunk size.
+    #[test]
+    fn honest_blob_sync_reproduces_the_data(
+        data in prop::collection::vec(any::<u8>(), 0..4000),
+        chunk_size in 1usize..=300,
+    ) {
+        // Publish the blob into a server store (chunks + manifest under its id).
+        let (manifest, chunks) = blob::split_with(&data, chunk_size);
+        let mut server = blob::Store::new();
+        for c in &chunks {
+            server.put(c.clone());
+        }
+        let id = server.put(manifest.encode());
+
+        let mut dl = BlobDownload::new(id);
+        let mut steps: u64 = 0;
+        while let Some(request) = dl.poll_request() {
+            dl.handle_response(&serve_blob(&request, &server)).unwrap();
+            steps += 1;
+            prop_assert!(steps < 100_000, "blob sync must terminate");
+        }
+        prop_assert!(dl.is_complete());
+        prop_assert_eq!(dl.reassemble(), Some(data));
+    }
+
+    /// A chunk whose bytes were tampered no longer belongs to the blob and is
+    /// rejected — content addressing is self-verifying.
+    #[test]
+    fn a_tampered_blob_chunk_is_rejected(
+        data in prop::collection::vec(any::<u8>(), 1..3000),
+        chunk_size in 1usize..=200,
+    ) {
+        let (manifest, chunks) = blob::split_with(&data, chunk_size);
+        let mut dl = BlobDownload::new(manifest.id());
+        dl.handle_response(&Message::Manifest(manifest)).unwrap();
+
+        // Make the bytes longer than any chunk, so they can't collide with a
+        // real chunk (every chunk is <= chunk_size) — a genuinely foreign chunk
+        // that must be rejected. (A mere bit-flip could, for tiny chunks, land on
+        // another valid chunk of the blob, which content addressing would rightly
+        // accept — so we tamper unambiguously.)
+        let mut bad = chunks[0].clone();
+        bad.resize(chunk_size + 1, 0xff);
+        prop_assert_eq!(
+            dl.handle_response(&Message::Chunk { data: bad }),
+            Err(SyncError::BadChunk)
+        );
     }
 }

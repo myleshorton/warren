@@ -36,7 +36,7 @@ accept weaker guarantees.
 | Technique | What it proves | Where |
 |---|---|---|
 | **Unit tests** | Hand-picked cases, edge conditions, error paths | every crate |
-| **Property tests** (proptest) | Invariants hold for *all* inputs; no panics on adversarial bytes | `wire`, `crypto` |
+| **Property tests** (proptest) | Invariants hold for *all* inputs; no panics on adversarial bytes; every Merkle proof verifies and tampering always fails | `wire`, `crypto`, `log` |
 | **Known-answer tests** | Bit-exact match to published spec vectors (RFC 8032, BLAKE3) | `crypto` |
 | **Deterministic sim** | Multi-node behavior under a controlled clock/network — no flakes | `swarm` |
 | **Oracle checks** | Lookup results verified against a brute-force ground truth | `swarm` |
@@ -66,12 +66,15 @@ crates/
               coordinate + punch in one call; inbound channels surfaced via
               Node::next_incoming; symmetric-NAT (Punched) connects run the
               birthday spray/open-sockets punch, chosen by the resolved strategy
-            + reflexive discovery: connect probes a reflector to advertise the
-              data socket's external address (so a NATed dialer is punchable)
+            + reflexive discovery: both dialer and target probe a reflector to
+              advertise their data socket's external address (NATed peers punchable)
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
+  log       signed append-only log: BLAKE3 Merkle tree over blocks, a signed
+            (len, root) head, and per-block inclusion proofs a peer verifies with
+            only the owner's public key — the basis for sparse random-access sync
 
-  next: reflexive discovery on the accept side too (a NATed target advertises
-        its external data address in the reply), port mapping, blob, log, ...
+  next: blob (content-addressed store) + the log sync protocol (request blocks/
+        proofs from peers over the driver), relay data path, port mapping, ...
 ```
 
 Try it:

@@ -31,7 +31,7 @@ const T: Duration = Duration::from_secs(20);
 
 /// First six bytes of an id as hex, for readable logging.
 fn short(bytes: &[u8]) -> String {
-    bytes[..6].iter().map(|b| format!("{b:02x}")).collect()
+    bytes.iter().take(6).map(|b| format!("{b:02x}")).collect()
 }
 
 #[tokio::main]

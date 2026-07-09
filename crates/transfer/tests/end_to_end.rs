@@ -28,8 +28,17 @@ async fn network(n: usize, seed: u64) -> (Node, Vec<Node>) {
     for _ in 0..n {
         let node = Node::bind(lo, rng.node_id()).await.unwrap();
         node.add_contact(boot.contact()).await.unwrap();
-        timeout(T, node.bootstrap()).await.unwrap().unwrap();
         peers.push(node);
+    }
+    // Bootstrap the peers concurrently: a stuck bootstrap then surfaces in ~T
+    // rather than n*T, keeping CI failure feedback fast.
+    let mut joins = tokio::task::JoinSet::new();
+    for node in &peers {
+        let node = node.clone();
+        joins.spawn(async move { timeout(T, node.bootstrap()).await });
+    }
+    while let Some(joined) = joins.join_next().await {
+        joined.unwrap().unwrap().unwrap();
     }
     (boot, peers)
 }

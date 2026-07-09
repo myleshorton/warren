@@ -41,15 +41,18 @@
 
 mod congestion;
 mod frame;
+mod plan;
 
 use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
 
+use blob::Manifest;
 use congestion::{Congestion, Rtt};
 use crypto::{Hash, PublicKey};
 use driver::Channel;
 use frame::{Packet, Reassembler};
+use plan::Plan;
 use sync::{BlobDownload, FeedDownload, Message, SyncError};
 use thiserror::Error;
 use tokio::time::{sleep, timeout, Instant};
@@ -147,7 +150,7 @@ pub async fn download_feed<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<Vec<u8>>, TransferError> {
     let mut dl = FeedDownload::new(public_key);
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout);
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, 0);
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -163,12 +166,153 @@ pub async fn download_blob<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
     let mut dl = BlobDownload::new(id);
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout);
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, 0);
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
     }
     dl.reassemble().ok_or(TransferError::Incomplete)
+}
+
+/// One provider's result for a round of chunk fetches.
+struct ChunkOutcome {
+    /// Chunks fetched and verified this round.
+    fetched: Vec<(Hash, Vec<u8>)>,
+    /// Whether the channel is still usable; a broken one retires the provider.
+    alive: bool,
+}
+
+/// A provider in a swarm download: its channel plus its outbound message-id
+/// counter, kept monotonic across rounds (see [`Wire::new`]).
+struct Provider {
+    channel: Channel,
+    next_id: u64,
+}
+
+/// Download and verify a blob by fetching its chunks from **several** providers
+/// concurrently. A chunk is content-addressed, so any provider holding it is
+/// interchangeable and each is verified by its hash — a provider can neither
+/// corrupt the blob nor be trusted beyond the bytes it proves.
+///
+/// The manifest is fetched from whichever provider answers first; then the
+/// still-missing chunks are partitioned across the live providers and fetched in
+/// concurrent rounds. A chunk a provider was assigned but didn't return is
+/// re-partitioned to others, and a provider whose channel breaks is dropped.
+/// Returns [`TransferError::Incomplete`] if the survivors can't supply the rest.
+///
+/// v1 is round-based: a slow (but alive) provider can hold up its round — work
+/// isn't stolen mid-round yet — and chunks are chosen in manifest order
+/// (streaming-friendly), not rarest-first.
+pub async fn download_blob_swarm(
+    channels: Vec<Channel>,
+    id: Hash,
+    cfg: &Config,
+) -> Result<Vec<u8>, TransferError> {
+    let mut providers: Vec<Provider> = channels
+        .into_iter()
+        .map(|channel| Provider {
+            channel,
+            next_id: 0,
+        })
+        .collect();
+
+    // The manifest comes from the first provider that can serve it.
+    let mut manifest = None;
+    for provider in &mut providers {
+        if let Ok(m) = fetch_manifest(&mut provider.channel, id, cfg, &mut provider.next_id).await {
+            manifest = Some(m);
+            break;
+        }
+    }
+    let mut plan = Plan::new(manifest.ok_or(TransferError::Incomplete)?);
+
+    // Fetch chunks in rounds until complete, out of providers, or stuck.
+    while !plan.is_complete() && !providers.is_empty() && plan.pending() > 0 {
+        let share = plan.pending().div_ceil(providers.len());
+        let mut fetches = tokio::task::JoinSet::new();
+        for mut provider in std::mem::take(&mut providers) {
+            let assignment = plan.take(share);
+            let cfg = *cfg;
+            fetches.spawn(async move {
+                let outcome = download_chunks(
+                    &mut provider.channel,
+                    &assignment,
+                    &cfg,
+                    &mut provider.next_id,
+                )
+                .await;
+                (provider, assignment, outcome)
+            });
+        }
+
+        let mut progressed = false;
+        while let Some(joined) = fetches.join_next().await {
+            let (provider, assignment, outcome) = joined.expect("swarm fetch task panicked");
+            let delivered: HashSet<Hash> = outcome.fetched.iter().map(|(h, _)| *h).collect();
+            for (hash, data) in outcome.fetched {
+                progressed |= plan.store(hash, data);
+            }
+            plan.requeue(assignment.into_iter().filter(|h| !delivered.contains(h)));
+            if outcome.alive {
+                providers.push(provider); // survives to the next round
+            }
+        }
+        if !progressed {
+            break; // no live provider could supply any remaining chunk
+        }
+    }
+
+    plan.reassemble().ok_or(TransferError::Incomplete)
+}
+
+/// Fetch and verify a blob's manifest from one provider, advancing `next_id`.
+async fn fetch_manifest<L: Link>(
+    channel: &mut L,
+    id: Hash,
+    cfg: &Config,
+    next_id: &mut u64,
+) -> Result<Manifest, TransferError> {
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *next_id);
+    let result = match exchange(&mut wire, &Message::GetManifest { id }, cfg).await {
+        Ok(Message::Manifest(manifest)) if manifest.id() == id => Ok(manifest),
+        Ok(Message::Manifest(_)) => Err(TransferError::Sync(SyncError::BadManifest)),
+        Ok(_) => Err(TransferError::Sync(SyncError::Absent)),
+        Err(e) => Err(e),
+    };
+    *next_id = wire.next_id;
+    result
+}
+
+/// Fetch the listed chunks from one provider over a single session (so its ids
+/// stay monotonic), verifying each by its hash. A chunk the provider lacks or
+/// sends wrong is skipped — left for another provider — and only a broken
+/// channel retires the provider (`alive = false`). Advances `next_id`.
+async fn download_chunks<L: Link>(
+    channel: &mut L,
+    wanted: &[Hash],
+    cfg: &Config,
+    next_id: &mut u64,
+) -> ChunkOutcome {
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *next_id);
+    let mut fetched = Vec::new();
+    let mut alive = true;
+    for &hash in wanted {
+        match exchange(&mut wire, &Message::GetChunk { hash }, cfg).await {
+            Ok(Message::Chunk { data }) if crypto::hash(&data) == hash => {
+                fetched.push((hash, data));
+            }
+            // Absent, a mismatched chunk, or an unexpected message: this provider
+            // didn't give us this chunk (perhaps a straggler) — try another.
+            Ok(_) => {}
+            // The channel timed out or broke: stop and retire this provider.
+            Err(_) => {
+                alive = false;
+                break;
+            }
+        }
+    }
+    *next_id = wire.next_id;
+    ChunkOutcome { fetched, alive }
 }
 
 /// Serve feed sync requests on `channel` from a local [`feed::Log`] until the
@@ -267,7 +411,7 @@ async fn serve<L: Link>(
         cfg.initial_rtt,
         cfg.request_timeout
     );
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout);
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, 0);
     // Idle is measured from the last *valid* activity, so a peer can't hold the
     // session open by sending undecodable junk.
     let mut deadline = Instant::now() + cfg.idle;
@@ -370,11 +514,14 @@ struct Wire<'a, L: Link> {
 
 impl<'a, L: Link> Wire<'a, L> {
     /// `max_rtt` caps the pacing RTT (the caller passes `request_timeout`) so a
-    /// pacing pause can't be mistaken for a stall.
-    fn new(link: &'a L, initial_rtt: Duration, max_rtt: Duration) -> Self {
+    /// pacing pause can't be mistaken for a stall. `start_id` seeds the outbound
+    /// message-id counter: a fresh session starts at 0, but a swarm reuses one
+    /// channel across several `Wire`s (a round per provider) and must keep ids
+    /// monotonic, or the server would drop a reset id as a stale duplicate.
+    fn new(link: &'a L, initial_rtt: Duration, max_rtt: Duration, start_id: u64) -> Self {
         Self {
             link,
-            next_id: 0,
+            next_id: start_id,
             inbound: Reassembler::new(),
             buf: vec![0u8; MAX_DATAGRAM],
             last_sent: None,

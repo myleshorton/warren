@@ -94,12 +94,16 @@ crates/
             recover, not the whole message. Sends are paced by an AIMD congestion
             window (slow-start, halve-on-loss from NACK feedback), spread across a
             measured RTT, so a large message goes out at a path-appropriate rate
-            instead of one blast. The seam where the data layer finally rides the
-            transport over a real connection.
+            instead of one blast. And download_blob_swarm fetches a blob's chunks
+            from several providers at once — verified by hash, so any source is
+            interchangeable — re-partitioning a dropped provider's chunks to the
+            rest. The seam where the data layer finally rides the transport over a
+            real (and now multi-peer) connection.
 
-  next: multi-peer swarming (fetch a blob's chunks from many providers, verified
-        by hash so any source works), port mapping, an incremental Merkle
-        accumulator for feed, ...
+  next: holdings-aware swarming (providers advertise which chunks they have, so
+        partial seeders — no one holding the whole blob — assemble it; today's
+        round-based version assumes full seeders and can't work-steal mid-round),
+        rarest-first, port mapping, an incremental Merkle accumulator for feed, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

@@ -64,6 +64,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a node id; discovery goes through a topic lookup instead.
     let topic = NodeId::from_bytes(feed_pk.to_bytes());
     let node_id = rng.node_id();
+    // Independent by construction; assert it (as the end-to-end test does) so the
+    // demo can't silently drift from the property it illustrates.
+    assert_ne!(
+        node_id, topic,
+        "the publisher's node id is independent of the feed key"
+    );
     // Each "frame" is ~40 KiB — larger than a single UDP datagram — so streaming
     // it exercises the transport's fragmentation: every block is split across
     // many datagrams and reassembled (then verified) on the viewer's side.

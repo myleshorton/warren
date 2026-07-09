@@ -182,7 +182,9 @@ pub fn verify_block(
     block: &[u8],
     proof: &Proof,
 ) -> bool {
-    if !verify_head(public_key, head) || index >= head.len {
+    // Cheap bounds check first: an out-of-range index short-circuits before the
+    // (comparatively expensive) signature verification.
+    if index >= head.len || !verify_head(public_key, head) {
         return false;
     }
     // Convert to usize rather than cast: on a 32-bit target a huge signed `len`

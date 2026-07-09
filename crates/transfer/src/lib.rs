@@ -121,10 +121,10 @@ pub struct Config {
     /// request→reply→request round trip onward.
     ///
     /// The RTT used for pacing is capped at [`request_timeout`](Self::request_timeout)
-    /// (see the pacer), so a pacing pause stays safely under the receiver's stall
-    /// interval and can't be mistaken for loss — even if a stalled peer inflates
-    /// the estimate. Best kept well below the timeout regardless; the default —
-    /// 100 ms against a 2 s timeout — leaves ample margin.
+    /// (see the pacer), which bounds any single pacing pause below that interval —
+    /// so a pause can't be mistaken for a stall, even if a peer inflates the
+    /// estimate. Best kept well below the timeout regardless (that headroom is the
+    /// safety margin); the default — 100 ms against a 2 s timeout — has plenty.
     pub initial_rtt: Duration,
 }
 
@@ -257,10 +257,10 @@ async fn serve<L: Link>(
     cfg: &Config,
     respond: impl Fn(&Message) -> Message,
 ) -> Result<(), TransferError> {
-    // The RTT estimate bounds the pacing gap (≤ rtt/2 between fragments), so it
-    // must stay well under the peer's request_timeout or a pacing pause reads as
-    // a stall and draws spurious NACKs. Peers normally share a Config, so guard
-    // that common case in dev builds.
+    // The pacer caps the RTT it uses at request_timeout, so no single pacing
+    // pause reaches the peer's stall interval. This guards the usual shared-Config
+    // deployment against a mistuned initial_rtt that's already at/over the timeout
+    // (which would leave no headroom); real RTTs sit far below it.
     debug_assert!(
         cfg.initial_rtt < cfg.request_timeout,
         "initial_rtt ({:?}) must be well below request_timeout ({:?})",
@@ -408,19 +408,27 @@ impl<'a, L: Link> Wire<'a, L> {
     /// and paid in one pause (timer granularity), so a short-RTT path bursts and
     /// a long-RTT path spaces out; a message small relative to the rate goes out
     /// with no pause at all.
+    ///
+    /// The pause is taken *before* each fragment after the first — never after
+    /// the last — so a message doesn't end on a dead pause. That matters beyond
+    /// wasted time: the server times RTT from when a reply finishes sending, and
+    /// a trailing sleep would let the client's next request queue during it,
+    /// collapsing the sample toward zero.
     async fn paced_send(
         &self,
         fragments: impl Iterator<Item = Vec<u8>>,
     ) -> Result<(), TransferError> {
         let per_fragment = self.rtt.get() / self.cong.window() as u32;
         let mut owed = Duration::ZERO;
-        for fragment in fragments {
-            self.link.send(&fragment).await?;
-            owed += per_fragment;
-            if owed >= MIN_PACING_SLEEP {
-                sleep(owed).await;
-                owed = Duration::ZERO;
+        for (i, fragment) in fragments.enumerate() {
+            if i > 0 {
+                owed += per_fragment;
+                if owed >= MIN_PACING_SLEEP {
+                    sleep(owed).await;
+                    owed = Duration::ZERO;
+                }
             }
+            self.link.send(&fragment).await?;
         }
         Ok(())
     }

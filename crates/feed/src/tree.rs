@@ -36,13 +36,16 @@ fn node_hash(left: &Hash, right: &Hash) -> Hash {
 }
 
 /// The largest power of two strictly less than `n` (for `n >= 2`).
+///
+/// Computed in constant time from the bit width: doubling `k` in a loop would
+/// overflow `usize` to 0 for `n > 2^63` and spin forever — and `n` can come
+/// from an attacker-signed head, so this must never hang on a huge length.
 fn split_point(n: usize) -> usize {
     debug_assert!(n >= 2);
-    let mut k = 1;
-    while k << 1 < n {
-        k <<= 1;
-    }
-    k
+    // The highest set bit of `n - 1` is `floor(log2(n - 1))`; `1 << that` is the
+    // largest power of two `<= n - 1`, i.e. `< n`.
+    let highest_bit = usize::BITS - 1 - (n - 1).leading_zeros();
+    1usize << highest_bit
 }
 
 /// The Merkle root over `leaves` (each already a [`leaf_hash`]). An empty tree
@@ -145,6 +148,28 @@ mod tests {
         let mut path = audit_path(&l, 3);
         path.pop();
         assert_eq!(root_from_path(l[3], 3, 8, &path), None);
+    }
+
+    #[test]
+    fn split_point_is_the_largest_power_of_two_below_n() {
+        assert_eq!(split_point(2), 1);
+        assert_eq!(split_point(3), 2);
+        assert_eq!(split_point(4), 2);
+        assert_eq!(split_point(5), 4);
+        assert_eq!(split_point(9), 8);
+        // Large values must not overflow into an endless loop.
+        assert_eq!(split_point(1usize << 63), 1usize << 62);
+        assert_eq!(split_point((1usize << 63) + 1), 1usize << 63);
+        assert_eq!(split_point(usize::MAX), 1usize << (usize::BITS - 1));
+    }
+
+    #[test]
+    fn root_from_path_terminates_on_a_huge_length() {
+        // A forged head can carry a length near usize::MAX; verification must
+        // return (here, reject) rather than hang splitting the range.
+        let leaf = leaf_hash(b"x");
+        let path = [leaf_hash(b"sibling")];
+        assert_eq!(root_from_path(leaf, 0, usize::MAX, &path), None);
     }
 
     #[test]

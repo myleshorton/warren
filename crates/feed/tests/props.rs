@@ -34,8 +34,8 @@ proptest! {
         }
     }
 
-    /// Flipping any bit of a block makes its proof fail (unless the flip is a
-    /// no-op, i.e. the byte is unchanged — excluded by construction).
+    /// Perturbing a block (flip one bit of its first byte, or append a byte if
+    /// empty) makes its unchanged proof fail to verify.
     #[test]
     fn tampered_block_fails(blocks in arb_blocks(), seed in any::<u64>()) {
         let log = build(&blocks);

@@ -131,8 +131,19 @@ impl Store {
     /// identical content.
     pub fn put(&mut self, bytes: Vec<u8>) -> Hash {
         let key = hash(&bytes);
-        self.chunks.entry(key).or_insert(bytes);
+        self.put_hashed(key, bytes);
         key
+    }
+
+    /// Store `bytes` under an already-computed content hash, skipping the rehash
+    /// [`Self::put`] performs — for callers that just hashed the bytes anyway
+    /// (e.g. after verifying a chunk during sync).
+    ///
+    /// The caller must guarantee `hash == crypto::hash(&bytes)`; a mismatched
+    /// hash breaks content addressing (a `get` would return content that doesn't
+    /// hash to its key). Idempotent for identical content.
+    pub fn put_hashed(&mut self, hash: Hash, bytes: Vec<u8>) {
+        self.chunks.entry(hash).or_insert(bytes);
     }
 
     /// The chunk stored under `hash`, if present.
@@ -222,6 +233,20 @@ mod tests {
         let (manifest, chunks) = split_with(b"hello world", 4);
         assert!(verify_chunk(&manifest.chunks[0], &chunks[0]));
         assert!(!verify_chunk(&manifest.chunks[0], b"nope"));
+    }
+
+    #[test]
+    fn put_hashed_matches_put() {
+        // Inserting under a precomputed hash stores exactly as put would, so a
+        // blob assembled via put_hashed reassembles identically.
+        let data: Vec<u8> = (0..CHUNK_SIZE + 500).map(|i| i as u8).collect();
+        let (manifest, chunks) = split(&data);
+        let mut store = Store::new();
+        for chunk in chunks {
+            let h = crypto::hash(&chunk);
+            store.put_hashed(h, chunk);
+        }
+        assert_eq!(store.reassemble(&manifest), Some(data));
     }
 
     #[test]

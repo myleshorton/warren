@@ -66,7 +66,9 @@ const KIND_GET_CHUNK: u8 = 8;
 const KIND_CHUNK: u8 = 9;
 
 /// A sync protocol message: a request from the client, or a response from the
-/// server. One connection syncs one feed, so a request needs no feed id.
+/// server. A session is tied to one feed, so feed requests carry no id; blob
+/// requests are content-addressed and name what they want (`GetManifest`/
+/// `GetChunk`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Message {
     /// Client → server: send the feed's current signed head.
@@ -419,10 +421,11 @@ impl BlobDownload {
                 if !self.wanted.contains(&h) {
                     return Err(SyncError::BadChunk);
                 }
-                // Store only if new, so a duplicate chunk is a true no-op (no
-                // needless clone).
+                // Store only if new, so a duplicate chunk is a true no-op. Insert
+                // under the hash we already computed (put_hashed) rather than let
+                // the store rehash the bytes.
                 if !self.store.has(&h) {
-                    self.store.put(data.clone());
+                    self.store.put_hashed(h, data.clone());
                 }
                 Ok(())
             }

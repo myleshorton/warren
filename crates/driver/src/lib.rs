@@ -463,6 +463,11 @@ async fn run(
     // in-flight one untouched.
     let mut pending_connect: HashMap<NodeId, (UdpSocket, oneshot::Sender<ConnectReply>)> =
         HashMap::new();
+    // Accept-side reflexive probes run off the actor (they'd block it) and feed
+    // their result back here; the actor then replies with the discovered address
+    // and starts the punch. The actor keeps `reflexive_tx` so the channel stays
+    // open even with no probe in flight.
+    let (reflexive_tx, mut reflexive_rx) = mpsc::channel::<ReflexiveDone>(64);
 
     loop {
         // Deliver completed operations, then flush. Order matters:
@@ -514,27 +519,33 @@ async fn run(
                     initiator_data_addr,
                     strategy,
                 } => {
-                    // Stand up a data socket, tell the core where to punch back,
-                    // then run the punch primitive `strategy` selects toward the
-                    // initiator (dial-accept on this socket, or spray / open
-                    // birthday sockets). Decline if the node is bound to an
-                    // unspecified address: the data socket's address would be
-                    // unspecified too, unpunchable by the peer (mirrors the
-                    // outbound `UnspecifiedLocalAddr` check); the initiator times
-                    // out.
+                    // Stand up a data socket and discover its external address via
+                    // a reflexive probe — off the actor (it awaits a round-trip),
+                    // feeding the result back so we then reply with that address
+                    // and run the punch (see the `reflexive_rx` branch below).
+                    // Decline if the node is bound to an unspecified address: the
+                    // data socket's address would be unspecified too, unpunchable
+                    // by the peer (mirrors the outbound `UnspecifiedLocalAddr`
+                    // check); the initiator times out.
                     if !data_ip.is_unspecified() {
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
-                            if let Ok(data_addr) = data_sock.local_addr() {
-                                dht.accept_connect(initiator, data_addr, now());
-                                spawn_accept_punch(AcceptJob {
+                            if let Ok(local) = data_sock.local_addr() {
+                                let id = dht.id();
+                                let reflectors = dht
+                                    .closest(&id, REFLECTORS)
+                                    .into_iter()
+                                    .map(|c| c.addr)
+                                    .collect();
+                                spawn_reflexive_probe(ReflexiveProbe {
                                     data_sock,
-                                    own_host: data_ip,
+                                    id,
+                                    local,
+                                    reflectors,
+                                    initiator,
                                     peer_host: initiator_data_addr.ip(),
                                     strategy,
-                                    cfg: punch_cfg,
-                                    birthday,
-                                    seed: data_addr.port() as u64,
-                                    incoming_tx: incoming_tx.clone(),
+                                    seed: local.port() as u64,
+                                    done: reflexive_tx.clone(),
                                 });
                             }
                         }
@@ -615,6 +626,24 @@ async fn run(
                     Err(_) => return,
                 }
             }
+            done = reflexive_rx.recv() => {
+                if let Some(done) = done {
+                    // The accept-side reflexive probe finished: reply to the
+                    // initiator with the discovered external address, then run the
+                    // punch on the data socket per the planned strategy.
+                    dht.accept_connect(done.initiator, done.external_addr, now());
+                    spawn_accept_punch(AcceptJob {
+                        data_sock: done.data_sock,
+                        own_host: data_ip,
+                        peer_host: done.peer_host,
+                        strategy: done.strategy,
+                        cfg: punch_cfg,
+                        birthday,
+                        seed: done.seed,
+                        incoming_tx: incoming_tx.clone(),
+                    });
+                }
+            }
             _ = async {
                 match &delay {
                     Some(d) => tokio::time::sleep(*d).await,
@@ -657,6 +686,51 @@ struct AcceptJob {
     birthday: BirthdayParams,
     seed: u64,
     incoming_tx: mpsc::Sender<Channel>,
+}
+
+/// Inputs to an accept-side reflexive probe task.
+struct ReflexiveProbe {
+    data_sock: UdpSocket,
+    id: NodeId,
+    local: SocketAddr,
+    reflectors: Vec<SocketAddr>,
+    initiator: NodeId,
+    peer_host: IpAddr,
+    strategy: Strategy,
+    seed: u64,
+    done: mpsc::Sender<ReflexiveDone>,
+}
+
+/// Result of an accept-side reflexive probe, fed back into the actor loop.
+struct ReflexiveDone {
+    initiator: NodeId,
+    /// The data socket's externally-observed address (or its local address if no
+    /// reflector answered), to advertise to the initiator.
+    external_addr: SocketAddr,
+    data_sock: UdpSocket,
+    peer_host: IpAddr,
+    strategy: Strategy,
+    seed: u64,
+}
+
+/// Discover the accept-side data socket's external address off the actor, then
+/// hand it (and the socket) back so the actor can reply and punch. Runs in its
+/// own task because the probe awaits a reflector round-trip.
+fn spawn_reflexive_probe(p: ReflexiveProbe) {
+    tokio::spawn(async move {
+        let external_addr = reflexive_addr(&p.data_sock, p.id, p.local, &p.reflectors).await;
+        let _ = p
+            .done
+            .send(ReflexiveDone {
+                initiator: p.initiator,
+                external_addr,
+                data_sock: p.data_sock,
+                peer_host: p.peer_host,
+                strategy: p.strategy,
+                seed: p.seed,
+            })
+            .await;
+    });
 }
 
 /// Punch a data channel to the peer that a `connect` resolved, then report the

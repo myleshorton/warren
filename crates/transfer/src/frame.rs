@@ -103,10 +103,9 @@ impl Packet {
                 if k > NACK_MAX_INDICES as u64 {
                     return None;
                 }
-                // Belt and suspenders: also cap by remaining bytes, since each
-                // index is at least one byte.
-                let cap = (k as usize).min(dec.remaining());
-                let mut indices = Vec::with_capacity(cap);
+                // `k` is now bounded (≤ 256), so pre-allocate exactly it — small,
+                // and no reallocations while reading.
+                let mut indices = Vec::with_capacity(k as usize);
                 for _ in 0..k {
                     indices.push(dec.uint().ok()?);
                 }
@@ -243,7 +242,7 @@ impl Reassembler {
         id: u64,
         index: u64,
         count: u64,
-        payload: &[u8],
+        payload: Vec<u8>,
     ) -> Option<(u64, Vec<u8>)> {
         // Reject abusive framing before allocating anything for it.
         if count == 0 || count > MAX_FRAGMENTS || index >= count {
@@ -287,7 +286,7 @@ impl Reassembler {
                 return None; // would exceed the reassembly cap: refuse to buffer
             }
             partial.bytes += payload.len();
-            partial.frags.insert(index, payload.to_vec());
+            partial.frags.insert(index, payload); // move in — no re-copy
         }
         // Complete once every index in [0, count) is present: `frags` holds
         // `count` distinct in-range indices exactly when the message is whole.
@@ -320,7 +319,7 @@ impl Reassembler {
                 index,
                 count,
                 payload,
-            } => self.push_data(id, index, count, &payload),
+            } => self.push_data(id, index, count, payload),
             Packet::Nack { .. } => None,
         }
     }
@@ -334,11 +333,15 @@ impl Reassembler {
     }
 
     /// The fragments still missing from the message in progress, or `None` if
-    /// nothing is being reassembled. The caller NACKs (a bounded batch of) these.
+    /// nothing is being reassembled. Capped at [`NACK_MAX_INDICES`] — the caller
+    /// NACKs one datagram's worth at a time and pages the rest across intervals,
+    /// so building the full set (up to `count`, which hostile framing could push
+    /// toward `MAX_FRAGMENTS`) would be pointless allocation.
     pub fn missing(&self) -> Option<Missing> {
         let partial = self.current.as_ref()?;
         let indices = (0..partial.count as u64)
             .filter(|i| !partial.frags.contains_key(&(*i as usize)))
+            .take(NACK_MAX_INDICES)
             .collect();
         Some(Missing {
             id: partial.id,
@@ -537,19 +540,18 @@ mod tests {
     #[test]
     fn push_data_rejects_abusive_framing() {
         let mut r = Reassembler::new();
-        assert_eq!(r.push_data(1, 0, 0, b"x"), None); // count == 0
-        assert_eq!(r.push_data(1, 3, 2, b"x"), None); // index past count
-        assert_eq!(r.push_data(1, 0, MAX_FRAGMENTS + 1, b"x"), None); // count past cap
+        assert_eq!(r.push_data(1, 0, 0, b"x".to_vec()), None); // count == 0
+        assert_eq!(r.push_data(1, 3, 2, b"x".to_vec()), None); // index past count
+        assert_eq!(r.push_data(1, 0, MAX_FRAGMENTS + 1, b"x".to_vec()), None); // count past cap
     }
 
     #[test]
     fn a_message_past_the_size_cap_never_completes() {
         // Two fragments whose payloads together exceed MAX_MESSAGE: the second is
         // refused, so the message never completes and the buffer stays bounded.
-        let big = vec![0u8; MAX_MESSAGE];
         let mut r = Reassembler::new();
-        assert_eq!(r.push_data(1, 0, 2, &big), None); // fits the cap on its own
-        assert_eq!(r.push_data(1, 1, 2, b"one byte too many"), None); // over the cap
+        assert_eq!(r.push_data(1, 0, 2, vec![0u8; MAX_MESSAGE]), None); // fits the cap alone
+        assert_eq!(r.push_data(1, 1, 2, b"one byte too many".to_vec()), None); // over the cap
     }
 
     #[test]

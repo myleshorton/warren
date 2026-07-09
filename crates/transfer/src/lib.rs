@@ -386,7 +386,7 @@ impl<'a, L: Link> Wire<'a, L> {
                         payload,
                     }) => {
                         if let Some((mid, bytes)) =
-                            self.inbound.push_data(id, index, count, &payload)
+                            self.inbound.push_data(id, index, count, payload)
                         {
                             // Commit the id only once the payload decodes: a
                             // reassembled but undecodable message is junk

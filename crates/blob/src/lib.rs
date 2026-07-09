@@ -172,6 +172,11 @@ impl Store {
         let mut out = Vec::with_capacity(manifest.total_len.min(1 << 20) as usize);
         for chunk_hash in &manifest.chunks {
             out.extend_from_slice(self.get(chunk_hash)?);
+            // Fail fast once we pass the claimed length, so a tampered
+            // (too-small) total_len can't make us concatenate the rest.
+            if out.len() as u64 > manifest.total_len {
+                return None;
+            }
         }
         (out.len() as u64 == manifest.total_len).then_some(out)
     }
@@ -239,11 +244,22 @@ mod tests {
     }
 
     #[test]
-    fn reassemble_fails_when_total_len_disagrees() {
+    fn reassemble_fails_when_total_len_too_large() {
         let data = vec![2u8; 100];
         let mut store = Store::new();
         let mut manifest = store.add(&data);
-        manifest.total_len = 999; // tamper
+        manifest.total_len = 999; // claims more than the chunks hold
+        assert_eq!(store.reassemble(&manifest), None);
+    }
+
+    #[test]
+    fn reassemble_fails_fast_when_total_len_too_small() {
+        // total_len shorter than the actual chunks: rejected (via the fail-fast
+        // check) rather than concatenating everything first.
+        let data = vec![3u8; CHUNK_SIZE * 2];
+        let mut store = Store::new();
+        let mut manifest = store.add(&data);
+        manifest.total_len = 10; // far smaller than the real content
         assert_eq!(store.reassemble(&manifest), None);
     }
 

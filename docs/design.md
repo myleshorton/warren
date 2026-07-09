@@ -143,7 +143,7 @@ rotating identifiers instead of "provider of banned content X." Two regimes:
 Rotation is **time-synchronized**: `epoch = floor(now / epoch_len)`, so every
 participant computes the *same* topic in a given epoch — the provider set does
 **not** fragment. Providers re-announce each epoch (piggybacking the DHT's
-existing re-announce cadence, so `epoch_len ≥` that interval), and boundaries are
+existing re-announce cadence, so we keep `epoch_len` at least that interval), and boundaries are
 covered by **overlap** — providers announce under the current *and* next epoch,
 viewers look up the current *and* previous — so clock skew never opens an
 availability gap. `epoch_len` is **tunable**: shorter tightens the correlation

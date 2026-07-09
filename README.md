@@ -36,7 +36,7 @@ accept weaker guarantees.
 | Technique | What it proves | Where |
 |---|---|---|
 | **Unit tests** | Hand-picked cases, edge conditions, error paths | every crate |
-| **Property tests** (proptest) | Invariants hold for *all* inputs; no panics on adversarial bytes; every Merkle proof verifies and tampering always fails | `wire`, `crypto`, `feed` |
+| **Property tests** (proptest) | Invariants hold for *all* inputs; no panics on adversarial bytes; every Merkle proof verifies and tampering always fails; blobs round-trip and chunks are self-verifying | `wire`, `crypto`, `feed`, `blob` |
 | **Known-answer tests** | Bit-exact match to published spec vectors (RFC 8032, BLAKE3) | `crypto` |
 | **Deterministic sim** | Multi-node behavior under a controlled clock/network — no flakes | `swarm` |
 | **Oracle checks** | Lookup results verified against a brute-force ground truth | `swarm` |
@@ -74,9 +74,13 @@ crates/
             a peer verifies with only the owner's public key — the basis for
             sparse random-access sync. (Named `feed`, not `log`, to avoid the
             crates.io logging-facade collision.)
+  blob      content-addressed store for large immutable data: split into chunks
+            named by their BLAKE3 hash (self-verifying, dedup), a Manifest listing
+            them whose own hash is the blob's address, and a Store that reassembles
 
-  next: blob (content-addressed store) + the feed sync protocol (request blocks/
-        proofs from peers over the driver), relay data path, port mapping, ...
+  next: the sync protocol — request feed blocks/proofs and blob chunks/manifests
+        from peers over the driver, verifying each — relay data path, port
+        mapping, ...
 ```
 
 Try it:

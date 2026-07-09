@@ -3,11 +3,13 @@
 //! — verifying every block — with no server in the path.
 //!
 //! The feed's public key is the content id and the discovery topic, but the
-//! publisher's DHT node id is *independent* (random). Knowing the feed key
-//! therefore does not locate the publisher's node: a censor who scraped the key
-//! cannot turn it into a node address with a single `connect`/`find_node`. You
-//! must look the *topic* up to learn which (random-id) node serves it. This test
-//! asserts exactly that decoupling: connecting by the feed key finds nothing,
+//! publisher's DHT node id is *independent* (random). So the key no longer
+//! doubles as a node id: `connect(feed_key)` — treating the scraped key as
+//! something to dial — resolves `NotFound`. Discovery instead goes through a
+//! *topic* lookup, which reveals which (random-id) node serves the content.
+//! (That lookup still returns the provider's contact, so decoupling the node id
+//! is not the same as hiding the provider — that is what blinded topics harden.)
+//! This test asserts the decoupling: connecting by the feed key finds nothing,
 //! while the topic-lookup path streams and verifies the whole feed.
 
 use std::sync::Arc;

@@ -11,9 +11,10 @@
 //!
 //! The feed's public key is the video's id and its discovery topic, but the
 //! publisher's DHT node id is *random and independent*. So the key does not
-//! double as a network locator: a censor who scraped it cannot turn it into the
-//! publisher's node address — the demo shows a connect-by-key finding nothing
-//! before the topic lookup reveals the real (random-id) provider.
+//! double as a node id: a `connect(feed_key)` reaches no one — the demo shows it
+//! finding nothing before the topic lookup reveals the real (random-id) provider.
+//! (The lookup still returns the provider's contact; decoupling the node id is
+//! not the same as hiding the provider — that is a job for blinded topics.)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -57,8 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let feed_kp = Keypair::from_seed(&[42u8; 32]);
     let feed_pk = feed_kp.public();
     // The feed key is the video id and the discovery topic. The node id is
-    // random — deliberately unrelated to the key — so knowing the key doesn't
-    // reveal (or locate) the publisher's node.
+    // random — deliberately unrelated to the key — so the key can't be dialed as
+    // a node id; discovery goes through a topic lookup instead.
     let topic = NodeId::from_bytes(feed_pk.to_bytes());
     let node_id = rng.node_id();
     // Each "frame" is ~40 KiB — larger than a single UDP datagram — so streaming
@@ -122,13 +123,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     viewer.add_contact(bootstrap).await?;
     timeout(T, viewer.bootstrap()).await??;
 
-    // Decoupling, made visible: trying to reach the feed key *as a node* — what a
-    // censor who only scraped the key would do — finds no one, because the key is
-    // not a node address.
-    println!("[viewer]  first, treating the feed key as a node address (as a censor would)...");
+    // Decoupling, made visible: trying to dial the feed key *as a node id* — what
+    // a censor who only scraped the key would do — finds no one, because no node
+    // runs the feed key as its id.
+    println!(
+        "[viewer]  first, dialing the feed key as if it were a node id (as a censor would)..."
+    );
     let by_key = timeout(T, viewer.connect(topic)).await??;
     println!(
-        "[viewer]  → {:?}: the key is not a locator; you can't reach the publisher by it",
+        "[viewer]  → {:?}: the key is not a node id; you can't dial the publisher by it",
         by_key.outcome
     );
 

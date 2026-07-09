@@ -719,6 +719,7 @@ dependencies = [
  "crypto",
  "driver",
  "feed",
+ "swarm",
  "sync",
  "thiserror",
  "tokio",

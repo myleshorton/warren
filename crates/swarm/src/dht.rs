@@ -67,7 +67,10 @@ pub enum ConnectOutcome {
     Direct,
     /// A hole was punched (one-sided-random birthday strategy).
     Punched,
-    /// Neither side is directly reachable (both symmetric): via the coordinator.
+    /// Both peers are symmetric, so no direct path can be punched. Reported as an
+    /// outcome, but no data channel is established: relaying peer data is
+    /// intentionally not built (it would load relays too heavily for a serverless
+    /// model).
     Relayed,
     /// The target could not be found on the DHT (not announced).
     NotFound,

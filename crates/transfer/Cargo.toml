@@ -17,4 +17,8 @@ tokio = { version = "1", features = ["time"] }
 thiserror.workspace = true
 
 [dev-dependencies]
+swarm = { path = "../swarm" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+
+[[example]]
+name = "stream"

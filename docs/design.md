@@ -42,9 +42,10 @@ A feed's public key is simultaneously *what to verify against* and *what to look
 up* — a viewer who knows only the key can both discover who serves the content
 and verify every byte it sends. Crucially, the key is *not* the publisher's DHT
 node id: publishers run a **random** node id and advertise content under the key
-as a *topic*. The publisher never self-announces under the feed key, so dialing
-it (`connect(feed_key)`) doesn't reach the publisher, and the publisher no longer
-sits in the DHT keyspace at the content key. (Discovery still works — a topic
+as a *topic*. The publisher does not run the feed key *as its node id*, so
+dialing it (`connect(feed_key)`) doesn't reach the publisher, and the publisher
+no longer sits in the DHT keyspace at the content key. (Discovery still works — a
+topic
 lookup returns a provider contact — so this decouples the *node id*, not the
 lookup itself; hardening the lookup is what blinded topics do. Earlier revisions
 coupled key and node id for elegance; the threat model below is why we split
@@ -137,10 +138,11 @@ SIGMETRICS 2026) shows enumeration is turnkey:
 **Decouple the DHT node id from the content key. (Implemented.)** Publishers run
 a random node id and advertise content under a *topic* (the feed key). A feed key
 therefore no longer *doubles as* the publisher's node id: the publisher does not
-self-announce under the feed key, so dialing it (`connect(feed_key)`) no longer
-reaches the publisher — it resolves `NotFound` unless some *other* node has
-chosen to run that id, and even then content is verified by hash/signature so a
-squatter serves nothing valid. The publisher also no longer sits in the DHT
+run the feed key as its node id (no announce record exists whose *id* is the feed
+key — the content announce under that topic carries the publisher's *random* id),
+so dialing it (`connect(feed_key)`) no longer reaches the publisher. It resolves
+`NotFound` unless some *other* node has chosen to run that id, and even then
+content is verified by hash/signature so a squatter serves nothing valid. The publisher also no longer sits in the DHT
 keyspace at the content key. A viewer instead looks the topic up to learn which
 random-id node
 serves the content, then connects to *that* node. This does not by itself hide

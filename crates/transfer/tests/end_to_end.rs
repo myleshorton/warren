@@ -107,9 +107,10 @@ async fn discover_by_topic_connect_and_stream_a_feed() {
     timeout(T, viewer.bootstrap()).await.unwrap().unwrap();
 
     // Decoupling, proven: connecting *by the feed key as a node id* — what a
-    // censor who scraped the key would try — reaches no one, because no node
-    // self-announces under the feed key. The content record living near that key
-    // belongs to a random-id node, so it is not a coordinator for a connect-by-id.
+    // censor who scraped the key would try — reaches no one, because no node runs
+    // the feed key as its node id. The content record living near that key carries
+    // a random node's id, not the feed key's, so it is not a self-announce and
+    // thus not a coordinator for a connect-by-id.
     let by_key = timeout(T, viewer.connect(topic))
         .await
         .unwrap()
@@ -117,7 +118,7 @@ async fn discover_by_topic_connect_and_stream_a_feed() {
     assert_eq!(
         by_key.outcome,
         ConnectOutcome::NotFound,
-        "the feed key must not double as a node locator"
+        "the feed key must not double as a node id"
     );
     assert!(by_key.channel.is_none());
 

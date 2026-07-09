@@ -120,10 +120,11 @@ pub struct Config {
     /// this only governs the very first reply; it's refined from the first clean
     /// request→reply→request round trip onward.
     ///
-    /// Keep it well below [`request_timeout`](Self::request_timeout): the pacer
-    /// never spaces fragments more than about `rtt / 2` apart, so an RTT near the
-    /// timeout could make a pacing pause look like a stall and draw a spurious
-    /// NACK. The default — 100 ms against a 2 s timeout — leaves ample margin.
+    /// The RTT used for pacing is capped at [`request_timeout`](Self::request_timeout)
+    /// (see the pacer), so a pacing pause stays safely under the receiver's stall
+    /// interval and can't be mistaken for loss — even if a stalled peer inflates
+    /// the estimate. Best kept well below the timeout regardless; the default —
+    /// 100 ms against a 2 s timeout — leaves ample margin.
     pub initial_rtt: Duration,
 }
 
@@ -146,7 +147,7 @@ pub async fn download_feed<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<Vec<u8>>, TransferError> {
     let mut dl = FeedDownload::new(public_key);
-    let mut wire = Wire::new(channel, cfg.initial_rtt);
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout);
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -162,7 +163,7 @@ pub async fn download_blob<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
     let mut dl = BlobDownload::new(id);
-    let mut wire = Wire::new(channel, cfg.initial_rtt);
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout);
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -266,7 +267,7 @@ async fn serve<L: Link>(
         cfg.initial_rtt,
         cfg.request_timeout
     );
-    let mut wire = Wire::new(channel, cfg.initial_rtt);
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout);
     // Idle is measured from the last *valid* activity, so a peer can't hold the
     // session open by sending undecodable junk.
     let mut deadline = Instant::now() + cfg.idle;
@@ -368,7 +369,9 @@ struct Wire<'a, L: Link> {
 }
 
 impl<'a, L: Link> Wire<'a, L> {
-    fn new(link: &'a L, initial_rtt: Duration) -> Self {
+    /// `max_rtt` caps the pacing RTT (the caller passes `request_timeout`) so a
+    /// pacing pause can't be mistaken for a stall.
+    fn new(link: &'a L, initial_rtt: Duration, max_rtt: Duration) -> Self {
         Self {
             link,
             next_id: 0,
@@ -376,7 +379,7 @@ impl<'a, L: Link> Wire<'a, L> {
             buf: vec![0u8; MAX_DATAGRAM],
             last_sent: None,
             cong: Congestion::new(),
-            rtt: Rtt::new(initial_rtt),
+            rtt: Rtt::new(initial_rtt, max_rtt),
         }
     }
 

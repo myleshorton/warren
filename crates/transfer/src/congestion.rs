@@ -78,17 +78,24 @@ impl Default for Congestion {
     }
 }
 
-/// Cap on the smoothed RTT, so a pathological sample (a client that hangs before
-/// its next request) can't drive pacing slower than the transfer's own timeouts
-/// tolerate. Real RTTs are far below this.
+/// Absolute backstop on the smoothed RTT, in case a caller passes an enormous
+/// `request_timeout`. The effective cap is the smaller of this and the caller's
+/// bound; real RTTs are far below either.
 const MAX_RTT: Duration = Duration::from_secs(1);
 
 /// A smoothed round-trip-time estimate (EWMA, TCP's α = 1/8). Fed samples by the
 /// sender — the gap between finishing a reply and the peer's next request — and
 /// read to pace fragments over one RTT.
+///
+/// The estimate is capped at `max` (the caller passes `request_timeout`, min'd
+/// with [`MAX_RTT`]) so a stalled peer that inflates a sample can't push the
+/// pacing gap past the receiver's stall interval — which would turn pacing into
+/// spurious NACKs. With the cap, a fragment is spaced at most `cap / window`
+/// apart, always comfortably under `request_timeout`.
 #[derive(Debug)]
 pub struct Rtt {
     srtt: Duration,
+    max: Duration,
     /// Whether a real sample has landed yet. The first one *replaces* the assumed
     /// initial (RFC 6298), so the estimate snaps to the actual path immediately
     /// instead of crawling there from a wrong guess; later samples are smoothed.
@@ -96,10 +103,14 @@ pub struct Rtt {
 }
 
 impl Rtt {
-    /// Start from an assumed RTT, used until the first real sample lands.
-    pub fn new(initial: Duration) -> Self {
+    /// Start from an assumed RTT (used until the first real sample lands), capping
+    /// the estimate at `max` (the caller's `request_timeout`, itself bounded by
+    /// [`MAX_RTT`]).
+    pub fn new(initial: Duration, max: Duration) -> Self {
+        let max = max.min(MAX_RTT);
         Self {
-            srtt: initial.min(MAX_RTT),
+            srtt: initial.min(max),
+            max,
             sampled: false,
         }
     }
@@ -110,7 +121,7 @@ impl Rtt {
     }
 
     /// Fold in a new round-trip sample: the first replaces the assumed initial;
-    /// later ones smooth as `srtt = 7/8 srtt + 1/8 sample`. Capped at `MAX_RTT`.
+    /// later ones smooth as `srtt = 7/8 srtt + 1/8 sample`. Capped at `max`.
     pub fn sample(&mut self, rtt: Duration) {
         self.srtt = if self.sampled {
             (self.srtt * 7 + rtt) / 8
@@ -118,7 +129,7 @@ impl Rtt {
             self.sampled = true;
             rtt
         }
-        .min(MAX_RTT);
+        .min(self.max);
     }
 }
 
@@ -181,17 +192,20 @@ mod tests {
         assert!(c.window() >= MIN_WINDOW);
     }
 
+    // A generous cap for the tests that aren't about capping.
+    const NO_CAP: Duration = Duration::from_secs(10);
+
     #[test]
     fn rtt_starts_at_the_initial_estimate() {
         assert_eq!(
-            Rtt::new(Duration::from_millis(100)).get(),
+            Rtt::new(Duration::from_millis(100), NO_CAP).get(),
             Duration::from_millis(100)
         );
     }
 
     #[test]
     fn rtt_first_sample_replaces_then_later_ones_smooth() {
-        let mut r = Rtt::new(Duration::from_millis(100));
+        let mut r = Rtt::new(Duration::from_millis(100), NO_CAP);
         // The first sample snaps the estimate to the measured path (not smoothed
         // against the assumed 100ms).
         r.sample(Duration::from_millis(200));
@@ -203,7 +217,7 @@ mod tests {
 
     #[test]
     fn rtt_converges_on_a_steady_path() {
-        let mut r = Rtt::new(Duration::from_millis(100));
+        let mut r = Rtt::new(Duration::from_millis(100), NO_CAP);
         for _ in 0..50 {
             r.sample(Duration::from_millis(20));
         }
@@ -216,12 +230,24 @@ mod tests {
     }
 
     #[test]
-    fn rtt_is_capped_against_a_pathological_estimate() {
-        assert_eq!(Rtt::new(Duration::from_secs(30)).get(), MAX_RTT);
-        let mut r = Rtt::new(Duration::from_millis(50));
+    fn rtt_is_capped_at_the_configured_max() {
+        // The estimate never exceeds the cap (derived from request_timeout), even
+        // when a stalled peer produces absurd samples.
+        let cap = Duration::from_millis(200);
+        assert_eq!(Rtt::new(Duration::from_secs(30), cap).get(), cap); // capped up front
+        let mut r = Rtt::new(Duration::from_millis(50), cap);
         for _ in 0..100 {
-            r.sample(Duration::from_secs(60)); // absurd samples
+            r.sample(Duration::from_secs(60));
         }
-        assert!(r.get() <= MAX_RTT);
+        assert!(r.get() <= cap);
+    }
+
+    #[test]
+    fn rtt_max_is_bounded_by_the_absolute_backstop() {
+        // An enormous request_timeout is still clamped by MAX_RTT.
+        assert_eq!(
+            Rtt::new(Duration::from_secs(30), Duration::from_secs(600)).get(),
+            MAX_RTT
+        );
     }
 }

@@ -111,6 +111,12 @@ pub struct Config {
     /// How long a sender pauses between bursts when pacing a large message's
     /// fragments (see the congestion window). Bounds the burst rate; larger
     /// slows sending, smaller lets bursts bunch up.
+    ///
+    /// Must stay well below the receiving peer's [`request_timeout`](Self::request_timeout):
+    /// a pacing pause longer than that interval looks to the receiver like a
+    /// stall, drawing a spurious NACK (a wasted resend, and it shrinks the
+    /// sender's window). The default — 1 ms against a 2 s timeout — leaves ample
+    /// margin.
     pub pacing_gap: Duration,
 }
 
@@ -243,12 +249,24 @@ async fn serve<L: Link>(
     cfg: &Config,
     respond: impl Fn(&Message) -> Message,
 ) -> Result<(), TransferError> {
+    // A pacing pause must stay well under the peer's request_timeout, or a burst
+    // gap reads as a stall and draws spurious NACKs. Peers normally share a
+    // Config, so guard that common case in dev builds.
+    debug_assert!(
+        cfg.pacing_gap < cfg.request_timeout,
+        "pacing_gap ({:?}) must be well below request_timeout ({:?})",
+        cfg.pacing_gap,
+        cfg.request_timeout
+    );
     let mut wire = Wire::new(channel, cfg.pacing_gap);
     // Idle is measured from the last *valid* activity, so a peer can't hold the
     // session open by sending undecodable junk.
     let mut deadline = Instant::now() + cfg.idle;
-    // Whether the reply currently being served has already drawn a NACK, so loss
-    // is counted once per reply.
+    // The last request served, and whether its reply has drawn a NACK (so loss is
+    // counted once per reply). Telling a *new* request from a *retransmit* of the
+    // same one distinguishes clean delivery (the client moved on) from total loss
+    // (the client received nothing and re-asks — partial loss would NACK instead).
+    let mut last_request: Option<Message> = None;
     let mut lost = false;
     loop {
         match wire.recv(deadline).await? {
@@ -256,12 +274,25 @@ async fn serve<L: Link>(
             // confusion, or a delayed packet) is ignored — replying `Absent` to
             // it would inject terminal traffic at the client.
             Some(Recv::Message(request)) if request.is_request() => {
-                // A new request means the client accepted the previous reply: if
-                // it never NACKed, that reply was delivered cleanly — grow.
-                if wire.has_sent() && !lost {
-                    wire.on_delivered();
+                let retransmit = last_request.as_ref() == Some(&request);
+                if wire.has_sent() {
+                    if retransmit {
+                        // Same request again → the client got none of the last
+                        // reply: back off (don't mistake a re-ask for progress).
+                        if !lost {
+                            wire.on_loss();
+                            lost = true;
+                        }
+                    } else if !lost {
+                        // A different request → the client accepted the last reply
+                        // cleanly: grow.
+                        wire.on_delivered();
+                    }
                 }
-                lost = false;
+                if !retransmit {
+                    lost = false;
+                    last_request = Some(request.clone());
+                }
                 wire.send(&respond(&request)).await?;
                 deadline = Instant::now() + cfg.idle;
             }

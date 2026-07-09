@@ -244,9 +244,10 @@ async fn serve<L: Link>(
             }
             Some(Recv::Message(_)) => {} // response-type: ignore
             // The client is missing fragments of the reply we last sent: resend
-            // just those. Only a NACK that matches that reply counts as activity
-            // (holds the session open) — a stale or bogus one resends nothing and
-            // mustn't let a client keep the session alive by spamming NACKs.
+            // just those. Only a NACK that actually causes a resend counts as
+            // activity (holds the session open) — a stale, empty, or bogus one
+            // resends nothing and mustn't let a client keep the session alive by
+            // spamming NACKs.
             Some(Recv::Nack { id, indices }) => {
                 if wire.resend(id, &indices).await? {
                     deadline = Instant::now() + cfg.idle;
@@ -317,11 +318,12 @@ impl<'a, L: Link> Wire<'a, L> {
     }
 
     /// Resend the requested fragments of the last message sent. Returns whether
-    /// the NACK matched that message — a NACK for a superseded reply matches
-    /// nothing and is ignored — so the caller can treat only a real repair
-    /// request as session activity. Only the requested, in-range fragments are
-    /// rebuilt (via [`frame::fragment_at`]), never the whole message, so light
-    /// loss costs proportionally little.
+    /// it actually resent anything — a NACK for a superseded reply, or one whose
+    /// indices are empty or all out of range, resends nothing and returns
+    /// `false`, so the caller counts only *productive* repair as session
+    /// activity (an empty/bogus NACK can't hold a session open). Only the
+    /// requested, in-range fragments are rebuilt (via [`frame::fragment_at`]),
+    /// never the whole message, so light loss costs proportionally little.
     async fn resend(&self, id: u64, indices: &[u64]) -> Result<bool, TransferError> {
         // Build just the requested fragments, releasing the borrow of `last_sent`
         // before awaiting the sends.
@@ -340,10 +342,11 @@ impl<'a, L: Link> Wire<'a, L> {
                 .filter_map(|i| frame::fragment_at(*last_id, bytes, FRAGMENT, i))
                 .collect()
         };
+        let resent = !to_send.is_empty();
         for fragment in &to_send {
             self.link.send(fragment).await?;
         }
-        Ok(true)
+        Ok(resent)
     }
 
     /// NACK (a bounded batch of) the missing fragments of message `id`. Capped at

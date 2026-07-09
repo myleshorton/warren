@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Warren: streaming a signed feed across a serverless network ===\n");
 
     // --- A small DHT backbone -------------------------------------------------
-    print!("[network] bringing up a 6-node DHT on loopback... ");
+    print!("[network] bringing up a 7-node DHT on loopback (1 bootstrap + 6 peers)... ");
     let mut rng = Rng::new(0x5EED);
     let boot = Node::bind(lo, rng.node_id()).await?;
     let mut backbone = Vec::new();
@@ -95,11 +95,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("[viewer]  discovering the publisher by key and hole-punching a connection...");
     let conn = timeout(T, viewer.connect(node_id)).await??;
-    let mut channel = conn.channel.ok_or("no channel (publisher unreachable)")?;
-    println!(
-        "[viewer]  connected: {:?} — a direct path, no server relaying",
-        conn.outcome
-    );
+    let outcome = conn.outcome;
+    let mut channel = conn.channel.ok_or_else(|| {
+        format!("connect resolved {outcome:?} with no data channel (a Relayed outcome yields none by design)")
+    })?;
+    println!("[viewer]  connected: {outcome:?} — a direct path, no server relaying");
 
     println!("[viewer]  streaming frames over the punched channel, verifying each...");
     let received = timeout(T, download_feed(&mut channel, feed_pk, &Config::default())).await??;

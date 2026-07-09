@@ -143,6 +143,11 @@ impl Store {
     /// hash breaks content addressing (a `get` would return content that doesn't
     /// hash to its key). Idempotent for identical content.
     pub fn put_hashed(&mut self, hash: Hash, bytes: Vec<u8>) {
+        debug_assert_eq!(
+            hash,
+            crypto::hash(&bytes),
+            "put_hashed: hash must equal crypto::hash(bytes)"
+        );
         self.chunks.entry(hash).or_insert(bytes);
     }
 

@@ -382,11 +382,17 @@ impl BlobDownload {
         None
     }
 
-    /// Verify and fold in a response. Like [`FeedDownload::handle_response`],
-    /// every response makes verified progress or is a terminal [`SyncError`];
-    /// content addressing means a chunk is trusted iff its hash belongs to the
-    /// manifest, so the requested-vs-received hash needn't match (any valid
-    /// manifest chunk is progress).
+    /// Verify and fold in a response. Content addressing means a chunk is
+    /// trusted iff its hash belongs to the manifest, so the requested-vs-received
+    /// hash needn't match (any valid manifest chunk is progress).
+    ///
+    /// As in [`FeedDownload::handle_response`], almost every response either
+    /// makes verified progress or is a terminal [`SyncError`], with the same
+    /// benign no-op exceptions: a duplicate [`Message::Manifest`] once one is
+    /// accepted ("first manifest wins"), and an already-stored chunk. So a peer
+    /// can decline to make progress by repeating those (or being slow/silent);
+    /// that liveness concern is the I/O layer's, bounded by a timeout. This core
+    /// guarantees only safety — it never accepts data that doesn't verify.
     pub fn handle_response(&mut self, response: &Message) -> Result<(), SyncError> {
         match response {
             // First manifest wins; ignore a later one (see FeedDownload).

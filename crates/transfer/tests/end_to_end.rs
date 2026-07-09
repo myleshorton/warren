@@ -4,9 +4,10 @@
 //!
 //! The feed's public key is the content id and the discovery topic, but the
 //! publisher's DHT node id is *independent* (random). So the key no longer
-//! doubles as a node id: `connect(feed_key)` — treating the scraped key as
-//! something to dial — resolves `NotFound`. Discovery instead goes through a
-//! *topic* lookup, which reveals which (random-id) node serves the content.
+//! doubles as a node id: no node runs the feed key as its node id (no
+//! self-announce record has that id), so `connect(feed_key)` — dialing the
+//! scraped key — resolves `NotFound`. Discovery instead goes through a *topic*
+//! lookup, which reveals which (random-id) node serves the content.
 //! (That lookup still returns the provider's contact, so decoupling the node id
 //! is not the same as hiding the provider — that is what blinded topics harden.)
 //! This test asserts the decoupling: connecting by the feed key finds nothing,

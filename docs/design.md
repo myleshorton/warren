@@ -45,11 +45,10 @@ node id: publishers run a **random** node id and advertise content under the key
 as a *topic*. The publisher does not run the feed key *as its node id*, so
 dialing it (`connect(feed_key)`) doesn't reach the publisher, and the publisher
 no longer sits in the DHT keyspace at the content key. (Discovery still works — a
-topic
-lookup returns a provider contact — so this decouples the *node id*, not the
-lookup itself; hardening the lookup is what blinded topics do. Earlier revisions
-coupled key and node id for elegance; the threat model below is why we split
-them.)
+topic lookup returns a provider contact — so this decouples the *node id*, not
+the lookup itself; hardening the lookup is what blinded topics do. Earlier
+revisions coupled key and node id for elegance; the threat model below is why we
+split them.)
 
 **4. Sans-IO, adversarially-verified cores.**
 The security-critical logic — DHT routing, the sync protocol, feed/blob

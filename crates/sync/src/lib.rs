@@ -42,7 +42,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use blob::{verify_chunk, Manifest};
+use blob::Manifest;
 use crypto::{hash, Hash, PublicKey, HASH_LEN};
 use feed::{verify_block_proof, verify_head, Head, Proof};
 use thiserror::Error;
@@ -411,13 +411,19 @@ impl BlobDownload {
                 if self.manifest.is_none() {
                     return Err(SyncError::Unsolicited);
                 }
+                // The hash of the bytes *is* the chunk's identity: accept it iff
+                // it belongs to this blob's manifest — a chunk that doesn't is a
+                // peer sending us junk. (No separate verify step: `h` is the
+                // content hash, so membership is the whole check.)
                 let h = hash(data);
-                // Accept any chunk that belongs to this blob (verified by hash);
-                // one that doesn't is a peer sending us junk.
-                if !self.wanted.contains(&h) || !verify_chunk(&h, data) {
+                if !self.wanted.contains(&h) {
                     return Err(SyncError::BadChunk);
                 }
-                self.store.put(data.clone());
+                // Store only if new, so a duplicate chunk is a true no-op (no
+                // needless clone).
+                if !self.store.has(&h) {
+                    self.store.put(data.clone());
+                }
                 Ok(())
             }
             Message::Absent => Err(SyncError::Absent),

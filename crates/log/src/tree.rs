@@ -16,28 +16,23 @@
 //! Functions here are pure and take the leaves as a slice, so the recursive
 //! definition doubles as the oracle the property tests check against.
 
-use crypto::{hash, Hash};
+use crypto::{hash, hash_parts, Hash};
 
 /// Domain-separation prefix for a leaf hash.
 const LEAF_PREFIX: u8 = 0x00;
 /// Domain-separation prefix for an internal node hash.
 const NODE_PREFIX: u8 = 0x01;
 
-/// Hash a block as a Merkle leaf: `H(0x00 ‖ block)`.
+/// Hash a block as a Merkle leaf: `H(0x00 ‖ block)`. Streams the tag and block
+/// into the hasher rather than copying the (possibly large) block to prepend the
+/// tag.
 pub fn leaf_hash(block: &[u8]) -> Hash {
-    let mut buf = Vec::with_capacity(1 + block.len());
-    buf.push(LEAF_PREFIX);
-    buf.extend_from_slice(block);
-    hash(&buf)
+    hash_parts(&[&[LEAF_PREFIX], block])
 }
 
 /// Hash an internal node from its children: `H(0x01 ‖ left ‖ right)`.
 fn node_hash(left: &Hash, right: &Hash) -> Hash {
-    let mut buf = [0u8; 1 + crypto::HASH_LEN + crypto::HASH_LEN];
-    buf[0] = NODE_PREFIX;
-    buf[1..1 + crypto::HASH_LEN].copy_from_slice(left);
-    buf[1 + crypto::HASH_LEN..].copy_from_slice(right);
-    hash(&buf)
+    hash_parts(&[&[NODE_PREFIX], left, right])
 }
 
 /// The largest power of two strictly less than `n` (for `n >= 2`).

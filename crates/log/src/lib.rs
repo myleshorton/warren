@@ -43,6 +43,11 @@ pub use tree::leaf_hash;
 /// mistaken for a signature over anything else this keypair signs.
 const HEAD_DOMAIN: &[u8] = b"warren-log-head-v1";
 
+/// Maximum siblings in a valid inclusion proof: the tree height for a `u64`
+/// length is at most 64 (`log2(2^64)`), so any longer proof is malformed. A hard
+/// cap keeps a network-facing `Proof::decode` from allocating on a crafted count.
+const MAX_PROOF_SIBLINGS: usize = 64;
+
 /// A signed commitment to the log's current contents: its length and Merkle
 /// root, plus the owner's signature over them. Everything a peer needs to
 /// verify blocks against.
@@ -226,8 +231,12 @@ impl Proof {
     pub fn decode(buf: &[u8]) -> Result<Proof, LogError> {
         let mut dec = Decoder::new(buf);
         let count = dec.uint()?;
-        // Each sibling is a fixed-size hash; bound the count by the buffer so a
-        // crafted length can't force a huge allocation.
+        // A valid proof has at most `MAX_PROOF_SIBLINGS` hashes; reject anything
+        // longer outright, and also bound by the buffer so a crafted length
+        // within the cap still can't over-allocate relative to the bytes present.
+        if count > MAX_PROOF_SIBLINGS as u64 {
+            return Err(LogError::Malformed("proof exceeds maximum length"));
+        }
         if count > dec.remaining() as u64 / HASH_LEN as u64 {
             return Err(LogError::Malformed("sibling count exceeds buffer"));
         }
@@ -328,6 +337,17 @@ mod tests {
             let proof = log.proof(i).unwrap();
             assert_eq!(Proof::decode(&proof.encode()).unwrap(), proof);
         }
+    }
+
+    #[test]
+    fn decode_rejects_an_overlong_proof() {
+        // A count above the height cap is rejected before allocating.
+        let mut enc = wire::Encoder::new();
+        enc.uint(MAX_PROOF_SIBLINGS as u64 + 1);
+        assert_eq!(
+            Proof::decode(&enc.into_vec()),
+            Err(LogError::Malformed("proof exceeds maximum length"))
+        );
     }
 
     #[test]

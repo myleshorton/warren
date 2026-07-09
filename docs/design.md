@@ -37,12 +37,14 @@ property that makes everything else safe, and in particular makes **multi-peer
 swarming** possible: any peer holding a chunk is interchangeable, because trust is
 in the hash, not the source.
 
-**3. One key, two jobs.**
-A feed's public key is simultaneously *what to verify against* and *where to
-find it* — a viewer who knows only the key can both discover the publisher and
-verify every byte it sends. (This elegance has a censorship cost — the key becomes
-a locator for the publisher — which we address in the threat model by decoupling
-the DHT node id from the content key.)
+**3. One key, two jobs — but not a locator.**
+A feed's public key is simultaneously *what to verify against* and *what to look
+up* — a viewer who knows only the key can both discover who serves the content
+and verify every byte it sends. Crucially, the key is *not* the publisher's DHT
+node id: publishers run a **random** node id and advertise content under the key
+as a *topic*, so knowing a feed key finds the content without doubling as a
+network locator for the publisher's node. (Earlier revisions coupled the two for
+elegance; the threat model below is why we decoupled them.)
 
 **4. Sans-IO, adversarially-verified cores.**
 The security-critical logic — DHT routing, the sync protocol, feed/blob
@@ -118,14 +120,23 @@ SIGMETRICS 2026) shows enumeration is turnkey:
   protocol-specific payload identifies participants without joining the DHT.
 - **Targeted surveillance.** A Sybil positioned near a content id in the key-space
   observes who *announces* (serves) and who *looks up* (fetches) that content.
-- **Warren-specific exposure.** Because a feed's public key doubles as its DHT
-  node id, anyone who knows a feed key can locate its publisher's node directly.
+- **Warren-specific exposure (now addressed).** A naive design in which a feed's
+  public key *is* the publisher's DHT node id lets anyone who knows the key locate
+  the publisher's node with a single lookup. Warren decouples the two (see
+  mitigations), so a feed key locates the content's *topic*, not the publisher.
 
 ### Mitigations
 
-**Decouple the DHT node id from the content key.** Publishers use a random
-(or ephemeral) node id and advertise content under a *topic*, so knowing a feed
-key no longer points at the publisher's node/IP.
+**Decouple the DHT node id from the content key. (Implemented.)** Publishers run
+a random node id and advertise content under a *topic* (the feed key), so knowing
+a feed key no longer points at the publisher's node/IP: a viewer looks the topic
+up to learn which random-id node serves it, then connects to *that* node.
+Reaching a feed key *as a node id* finds no one. The node's reachability
+registration (a self-announce under its own random id) and the content
+registration (an announce under the topic) are separate, so the content→node
+mapping lives only in the topic record — which blinded topics (next) then
+protect. Random node ids also mean the DHT's coordinator/keyspace roles are
+spread across unrelated identities rather than concentrated on content keys.
 
 **Blinded, rotating topics.** Announce and look content up under a *derived* topic
 rather than the cleartext content id, so a crawler near the key-space sees opaque,
@@ -185,7 +196,8 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Signed feeds, content-addressed blobs, verified sync | built |
 | Reliable transport: fragmentation, selective repeat, AIMD + RTT pacing | built |
 | Multi-peer swarming (full seeders, round-based) | built |
-| Decoupled node id / blinded rotating topics | planned (this doc) |
+| Decoupled node id (random id + topic-based discovery) | built |
+| Blinded, rotating topics | planned |
 | Ephemeral/query-only client mode | planned |
 | Obfuscated transport, cover-DHT rendezvous | planned |
 | Holdings-aware (partial-seeder) swarming, rarest-first | planned |

@@ -1,9 +1,14 @@
-//! The whole stack in one test: a viewer discovers a publisher by key over the
-//! DHT, punches a channel to it, and streams a signed feed across it — verifying
-//! every block — with no server in the path.
+//! The whole stack in one test: a viewer discovers a publisher over the DHT by a
+//! *content topic*, punches a channel to it, and streams a signed feed across it
+//! — verifying every block — with no server in the path.
 //!
-//! The feed's public key doubles as the publisher's DHT node id (as in
-//! Hypercore), so one key is both "what to verify against" and "who to reach".
+//! The feed's public key is the content id and the discovery topic, but the
+//! publisher's DHT node id is *independent* (random). Knowing the feed key
+//! therefore does not locate the publisher's node: a censor who scraped the key
+//! cannot turn it into a node address with a single `connect`/`find_node`. You
+//! must look the *topic* up to learn which (random-id) node serves it. This test
+//! asserts exactly that decoupling: connecting by the feed key finds nothing,
+//! while the topic-lookup path streams and verifies the whole feed.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,16 +49,23 @@ async fn network(n: usize, seed: u64) -> (Node, Vec<Node>) {
 }
 
 #[tokio::test]
-async fn discover_connect_and_stream_a_feed() {
+async fn discover_by_topic_connect_and_stream_a_feed() {
     // Keep the peers alive (they populate the DHT); bootstrap new nodes off the
     // boot node, as the other loopback tests do.
     let (boot, _peers) = network(6, 0x5EED).await;
     let bootstrap = boot.contact();
 
-    // Publisher: a signed feed whose public key is also its DHT node id.
+    // Publisher: a signed feed. Its public key is the content id and the DHT
+    // discovery *topic* — but its node id is random and unrelated to the key.
     let feed_kp = Keypair::from_seed(&[42u8; 32]);
     let feed_pk = feed_kp.public();
-    let node_id = NodeId::from_bytes(feed_pk.to_bytes());
+    let topic = NodeId::from_bytes(feed_pk.to_bytes());
+    let node_id = Rng::new(0xDEC0DE).node_id();
+    assert_ne!(
+        node_id, topic,
+        "the publisher's node id must be independent of its feed key"
+    );
+
     let frames: Vec<Vec<u8>> = (0..12).map(|i| format!("frame {i}").into_bytes()).collect();
     let mut log = Log::new(feed_kp);
     for frame in &frames {
@@ -64,7 +76,14 @@ async fn discover_connect_and_stream_a_feed() {
     let publisher = Node::bind(LO.parse().unwrap(), node_id).await.unwrap();
     publisher.add_contact(bootstrap).await.unwrap();
     timeout(T, publisher.bootstrap()).await.unwrap().unwrap();
+    // Two announces, distinct in purpose: register the (random-id) node so a
+    // coordinated connect can reach it, and register the content under its topic
+    // so a viewer holding only the feed key can discover who serves it.
     timeout(T, publisher.announce(node_id))
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(T, publisher.announce(topic))
         .await
         .unwrap()
         .unwrap();
@@ -78,14 +97,37 @@ async fn discover_connect_and_stream_a_feed() {
         }
     });
 
-    // Viewer: knows only the feed key. Discover + connect + stream.
+    // Viewer: knows only the feed key.
     let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xF00).node_id())
         .await
         .unwrap();
     viewer.add_contact(bootstrap).await.unwrap();
     timeout(T, viewer.bootstrap()).await.unwrap().unwrap();
 
-    let conn = timeout(T, viewer.connect(node_id))
+    // Decoupling, proven: connecting *by the feed key as a node id* — what a
+    // censor who scraped the key would try — reaches no one, because no node
+    // self-announces under the feed key. The content record living near that key
+    // belongs to a random-id node, so it is not a coordinator for a connect-by-id.
+    let by_key = timeout(T, viewer.connect(topic))
+        .await
+        .unwrap()
+        .expect("connect resolves");
+    assert_eq!(
+        by_key.outcome,
+        ConnectOutcome::NotFound,
+        "the feed key must not double as a node locator"
+    );
+    assert!(by_key.channel.is_none());
+
+    // The real path: look the topic up to learn which node serves it, then
+    // connect to that node by its (random) id.
+    let providers = timeout(T, viewer.lookup(topic)).await.unwrap().unwrap();
+    let provider = providers
+        .iter()
+        .find(|c| c.id == node_id)
+        .expect("the publisher announced the content under its topic");
+
+    let conn = timeout(T, viewer.connect(provider.id))
         .await
         .unwrap()
         .expect("connect");

@@ -175,9 +175,14 @@ pub fn verify_block(
     if !verify_head(public_key, head) || index >= head.len {
         return false;
     }
+    // Convert to usize rather than cast: on a 32-bit target a huge signed `len`
+    // would otherwise truncate and verify against the wrong tree shape. If it
+    // doesn't fit this platform, the block simply can't be verified here.
+    let (Ok(index), Ok(len)) = (usize::try_from(index), usize::try_from(head.len)) else {
+        return false;
+    };
     let leaf = tree::leaf_hash(block);
-    tree::root_from_path(leaf, index as usize, head.len as usize, &proof.siblings)
-        == Some(head.root)
+    tree::root_from_path(leaf, index, len, &proof.siblings) == Some(head.root)
 }
 
 /// Errors decoding a [`Head`] or [`Proof`] from bytes.
@@ -205,6 +210,12 @@ impl Head {
     pub fn decode(buf: &[u8]) -> Result<Head, LogError> {
         let mut dec = Decoder::new(buf);
         let len = dec.uint()?;
+        // The rest of the crate indexes with usize, so a length that can't fit
+        // this platform's usize (only possible on <64-bit targets) is malformed
+        // rather than silently truncated.
+        if usize::try_from(len).is_err() {
+            return Err(LogError::Malformed("length exceeds usize"));
+        }
         let root = dec.array::<HASH_LEN>()?;
         let signature = Signature::from_bytes(dec.array::<SIGNATURE_LEN>()?);
         dec.finish()?;

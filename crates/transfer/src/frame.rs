@@ -41,32 +41,37 @@ pub const MAX_FRAGMENTS: u64 = 1 << 16;
 const HEADER_BUDGET: usize = 32;
 
 /// Split `payload` into fragments that each fit in a `datagram`-byte packet,
-/// tagged with `msg_id` so a [`Reassembler`] can group and order them. Always
-/// returns at least one fragment (an empty payload yields a single empty one).
+/// tagged with `msg_id` so a [`Reassembler`] can group and order them. Yields
+/// them lazily — one at a time — so the caller can send each as it's built
+/// rather than buffer the whole set (a large message would otherwise peak at a
+/// second copy of itself in fragment `Vec`s). Always yields at least one
+/// fragment (an empty payload yields a single empty one).
 ///
 /// `datagram` must exceed `HEADER_BUDGET` — otherwise the header alone would
 /// fill (or overflow) a fragment and the "fits in `datagram` bytes" guarantee
 /// couldn't hold. Callers pass the crate's `FRAGMENT`, which is far larger; the
 /// assertion documents the precondition for any future caller.
-pub fn fragment(msg_id: u64, payload: &[u8], datagram: usize) -> Vec<Vec<u8>> {
+pub fn fragment(
+    msg_id: u64,
+    payload: &[u8],
+    datagram: usize,
+) -> impl Iterator<Item = Vec<u8>> + '_ {
     debug_assert!(
         datagram > HEADER_BUDGET,
         "datagram ({datagram}) must exceed the fragment header budget ({HEADER_BUDGET})"
     );
     let budget = datagram.saturating_sub(HEADER_BUDGET).max(1);
     let count = payload.len().div_ceil(budget).max(1);
-    (0..count)
-        .map(|i| {
-            let start = i * budget;
-            let end = ((i + 1) * budget).min(payload.len());
-            let mut enc = Encoder::new();
-            enc.uint(msg_id);
-            enc.uint(i as u64);
-            enc.uint(count as u64);
-            enc.raw(&payload[start..end]);
-            enc.into_vec()
-        })
-        .collect()
+    (0..count).map(move |i| {
+        let start = i * budget;
+        let end = ((i + 1) * budget).min(payload.len());
+        let mut enc = Encoder::new();
+        enc.uint(msg_id);
+        enc.uint(i as u64);
+        enc.uint(count as u64);
+        enc.raw(&payload[start..end]);
+        enc.into_vec()
+    })
 }
 
 /// Collects the fragments of a single message. Because the transfer loop is
@@ -207,14 +212,14 @@ mod tests {
     #[test]
     fn a_small_message_is_one_fragment_and_roundtrips() {
         let payload = b"just the head, please".to_vec();
-        let frags = fragment(1, &payload, DGRAM);
+        let frags: Vec<Vec<u8>> = fragment(1, &payload, DGRAM).collect();
         assert_eq!(frags.len(), 1);
         assert_eq!(reassemble(&frags), Some(payload));
     }
 
     #[test]
     fn an_empty_payload_roundtrips_as_one_empty_fragment() {
-        let frags = fragment(7, &[], DGRAM);
+        let frags: Vec<Vec<u8>> = fragment(7, &[], DGRAM).collect();
         assert_eq!(frags.len(), 1);
         assert_eq!(reassemble(&frags), Some(Vec::new()));
     }
@@ -222,7 +227,7 @@ mod tests {
     #[test]
     fn a_large_message_spans_many_fragments_and_roundtrips() {
         let payload: Vec<u8> = (0..50_000u32).map(|i| i as u8).collect();
-        let frags = fragment(2, &payload, DGRAM);
+        let frags: Vec<Vec<u8>> = fragment(2, &payload, DGRAM).collect();
         assert!(frags.len() > 40, "should need many fragments");
         assert!(
             frags.iter().all(|f| f.len() <= DGRAM),
@@ -234,7 +239,7 @@ mod tests {
     #[test]
     fn fragments_reassemble_out_of_order() {
         let payload: Vec<u8> = (0..10_000u32).map(|i| (i * 7) as u8).collect();
-        let mut frags = fragment(3, &payload, DGRAM);
+        let mut frags: Vec<Vec<u8>> = fragment(3, &payload, DGRAM).collect();
         frags.reverse();
         assert_eq!(reassemble(&frags), Some(payload));
     }
@@ -242,7 +247,7 @@ mod tests {
     #[test]
     fn duplicate_fragments_are_harmless() {
         let payload: Vec<u8> = (0..5_000u32).map(|i| i as u8).collect();
-        let frags = fragment(4, &payload, DGRAM);
+        let frags: Vec<Vec<u8>> = fragment(4, &payload, DGRAM).collect();
         // Feed every fragment twice, interleaved.
         let mut doubled = Vec::new();
         for f in &frags {
@@ -255,7 +260,7 @@ mod tests {
     #[test]
     fn a_message_is_incomplete_until_every_fragment_arrives() {
         let payload: Vec<u8> = (0..8_000u32).map(|i| i as u8).collect();
-        let frags = fragment(5, &payload, DGRAM);
+        let frags: Vec<Vec<u8>> = fragment(5, &payload, DGRAM).collect();
         assert!(frags.len() > 2);
         // Withhold the last fragment: never completes.
         let mut r = Reassembler::new();
@@ -270,8 +275,8 @@ mod tests {
     fn a_newer_message_supersedes_an_incomplete_one() {
         let old: Vec<u8> = vec![0xAA; 5_000];
         let new: Vec<u8> = vec![0xBB; 5_000];
-        let old_frags = fragment(10, &old, DGRAM);
-        let new_frags = fragment(11, &new, DGRAM);
+        let old_frags: Vec<Vec<u8>> = fragment(10, &old, DGRAM).collect();
+        let new_frags: Vec<Vec<u8>> = fragment(11, &new, DGRAM).collect();
         let mut r = Reassembler::new();
         // A partial old message...
         for f in &old_frags[..old_frags.len() - 1] {
@@ -291,8 +296,8 @@ mod tests {
     fn stragglers_from_an_old_message_are_ignored() {
         let old: Vec<u8> = vec![0xAA; 3_000];
         let new: Vec<u8> = vec![0xBB; 3_000];
-        let old_frags = fragment(20, &old, DGRAM);
-        let new_frags = fragment(21, &new, DGRAM);
+        let old_frags: Vec<Vec<u8>> = fragment(20, &old, DGRAM).collect();
+        let new_frags: Vec<Vec<u8>> = fragment(21, &new, DGRAM).collect();
         let mut r = Reassembler::new();
         // Complete and accept the new message first.
         let mut done = None;
@@ -329,7 +334,7 @@ mod tests {
 
         // A normal message with a small id is still delivered.
         let real = b"the real payload".to_vec();
-        let frags = fragment(7, &real, DGRAM);
+        let frags: Vec<Vec<u8>> = fragment(7, &real, DGRAM).collect();
         let mut done = None;
         for f in &frags {
             if let Some((id, msg)) = r.push(f) {

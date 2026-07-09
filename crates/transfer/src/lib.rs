@@ -269,6 +269,10 @@ pub async fn download_blob_swarm(
         let mut fetches = tokio::task::JoinSet::new();
         for mut provider in std::mem::take(&mut providers) {
             let assignment = plan.take(share);
+            if assignment.is_empty() {
+                providers.push(provider); // more providers than chunks: idle this round, keep it
+                continue;
+            }
             taken.extend(assignment.iter().copied());
             let cfg = *cfg;
             fetches.spawn(async move {

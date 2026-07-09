@@ -78,13 +78,14 @@ crates/
   blob      content-addressed store for large immutable data: split into chunks
             named by their BLAKE3 hash (self-verifying, dedup), a Manifest listing
             them whose own hash is the blob's address, and a Store that reassembles
-  sync      sans-IO feed synchronization: a FeedDownload client requests the head
-            then each block, verifying every response against the feed's public
-            key; serve_feed answers from a local Log. Pure request/response
-            messages — the driver pumps them over a punched channel.
+  sync      sans-IO synchronization for both data primitives: FeedDownload
+            (head + blocks, verified against the feed's public key) and
+            BlobDownload (manifest + chunks, verified by content hash), with
+            serve_feed/serve_blob answering from a local Log/Store. Pure
+            request/response messages — the driver pumps them over a channel.
 
-  next: blob sync (manifest + chunks) in the same crate; wire sync over a driver
-        channel; relay data path, port mapping, ...
+  next: wire sync over a driver channel (the pure message loop -> a real download
+        over a punched connection); relay data path, port mapping, ...
 ```
 
 Try it:

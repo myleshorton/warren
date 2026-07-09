@@ -11,6 +11,7 @@ publish = false
 crypto = { path = "../crypto" }
 wire = { path = "../wire" }
 feed = { path = "../feed" }
+blob = { path = "../blob" }
 thiserror.workspace = true
 
 [dev-dependencies]

@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout(T, n.bootstrap()).await??;
         backbone.push(n);
     }
-    let bootstrap = backbone[0].contact();
+    let bootstrap = boot.contact();
     println!("up.");
 
     // --- Publisher ------------------------------------------------------------

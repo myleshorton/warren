@@ -36,8 +36,10 @@ async fn network(n: usize, seed: u64) -> (Node, Vec<Node>) {
 
 #[tokio::test]
 async fn discover_connect_and_stream_a_feed() {
-    let (_boot, peers) = network(6, 0x5EED).await;
-    let bootstrap = peers[0].contact();
+    // Keep the peers alive (they populate the DHT); bootstrap new nodes off the
+    // boot node, as the other loopback tests do.
+    let (boot, _peers) = network(6, 0x5EED).await;
+    let bootstrap = boot.contact();
 
     // Publisher: a signed feed whose public key is also its DHT node id.
     let feed_kp = Keypair::from_seed(&[42u8; 32]);

@@ -92,13 +92,14 @@ crates/
             receiver NACKs the fragment indices it's missing and the sender
             resends only those, so one lost fragment costs one datagram to
             recover, not the whole message. Sends are paced by an AIMD congestion
-            window (slow-start, halve-on-loss from NACK feedback) so a large
-            message goes out in bounded bursts instead of one blast. The seam
-            where the data layer finally rides the transport over a real
-            connection.
+            window (slow-start, halve-on-loss from NACK feedback), spread across a
+            measured RTT, so a large message goes out at a path-appropriate rate
+            instead of one blast. The seam where the data layer finally rides the
+            transport over a real connection.
 
-  next: multi-peer swarming (fetch a blob's chunks from many providers), RTT-
-        based pacing, port mapping, an incremental Merkle accumulator for feed, ...
+  next: multi-peer swarming (fetch a blob's chunks from many providers, verified
+        by hash so any source works), port mapping, an incremental Merkle
+        accumulator for feed, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

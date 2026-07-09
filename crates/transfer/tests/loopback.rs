@@ -31,7 +31,7 @@ async fn connected_pair() -> (Channel, Channel) {
 
 #[tokio::test]
 async fn downloads_a_feed_over_a_channel() {
-    let (client_ch, server_ch) = connected_pair().await;
+    let (mut client_ch, mut server_ch) = connected_pair().await;
 
     let mut log = Log::new(Keypair::from_seed(&[1u8; 32]));
     for i in 0..15u8 {
@@ -42,17 +42,20 @@ async fn downloads_a_feed_over_a_channel() {
 
     // Server answers in the background; client pulls the whole feed.
     let _server =
-        tokio::spawn(async move { serve_feed(&server_ch, &log, &Config::default()).await });
-    let blocks = timeout(T, download_feed(&client_ch, public_key, &Config::default()))
-        .await
-        .expect("download should finish")
-        .expect("download should verify");
+        tokio::spawn(async move { serve_feed(&mut server_ch, &log, &Config::default()).await });
+    let blocks = timeout(
+        T,
+        download_feed(&mut client_ch, public_key, &Config::default()),
+    )
+    .await
+    .expect("download should finish")
+    .expect("download should verify");
     assert_eq!(blocks, expected);
 }
 
 #[tokio::test]
 async fn downloads_a_blob_over_a_channel() {
-    let (client_ch, server_ch) = connected_pair().await;
+    let (mut client_ch, mut server_ch) = connected_pair().await;
 
     let data: Vec<u8> = (0..40_000).map(|i| i as u8).collect();
     // Chunk well under MAX_DATAGRAM so each Chunk message fits one datagram
@@ -66,8 +69,8 @@ async fn downloads_a_blob_over_a_channel() {
     let id = store.put(manifest.encode());
 
     let _server =
-        tokio::spawn(async move { serve_blob(&server_ch, &store, &Config::default()).await });
-    let got = timeout(T, download_blob(&client_ch, id, &Config::default()))
+        tokio::spawn(async move { serve_blob(&mut server_ch, &store, &Config::default()).await });
+    let got = timeout(T, download_blob(&mut client_ch, id, &Config::default()))
         .await
         .expect("download should finish")
         .expect("download should verify");

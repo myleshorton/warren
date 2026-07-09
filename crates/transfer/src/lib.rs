@@ -16,6 +16,11 @@
 //! lifts this is future work). Retransmits can duplicate a request, but the sync
 //! state machines treat duplicate responses as idempotent no-ops, so stop-and-
 //! wait reliability is safe here.
+//!
+//! Each call borrows the channel `&mut`, so the type system enforces that one
+//! channel runs a single transfer at a time: two concurrent transfers would
+//! interleave datagrams and mis-correlate responses (which the sync layer would
+//! reject as protocol violations).
 
 use std::time::Duration;
 
@@ -57,7 +62,7 @@ impl Default for Config {
 /// Download and verify a whole feed over `channel`, returning its blocks in
 /// order. Trust is anchored in `public_key` (see [`sync`]).
 pub async fn download_feed(
-    channel: &Channel,
+    channel: &mut Channel,
     public_key: PublicKey,
     cfg: &Config,
 ) -> Result<Vec<Vec<u8>>, TransferError> {
@@ -73,7 +78,7 @@ pub async fn download_feed(
 /// Download and verify a whole blob over `channel`, returning its bytes. Trust
 /// is anchored in the content address `id`.
 pub async fn download_blob(
-    channel: &Channel,
+    channel: &mut Channel,
     id: Hash,
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
@@ -89,7 +94,7 @@ pub async fn download_blob(
 /// Serve feed sync requests on `channel` from a local [`feed::Log`] until the
 /// client goes idle (or the channel breaks).
 pub async fn serve_feed(
-    channel: &Channel,
+    channel: &mut Channel,
     log: &feed::Log,
     cfg: &Config,
 ) -> Result<(), TransferError> {
@@ -100,7 +105,7 @@ pub async fn serve_feed(
 /// must hold each blob's manifest under its own content address (see
 /// [`sync::serve_blob`]).
 pub async fn serve_blob(
-    channel: &Channel,
+    channel: &mut Channel,
     store: &blob::Store,
     cfg: &Config,
 ) -> Result<(), TransferError> {

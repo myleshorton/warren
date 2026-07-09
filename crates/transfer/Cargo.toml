@@ -13,6 +13,7 @@ feed = { path = "../feed" }
 blob = { path = "../blob" }
 sync = { path = "../sync" }
 driver = { path = "../driver" }
+wire = { path = "../wire" }
 tokio = { version = "1", features = ["time"] }
 thiserror.workspace = true
 

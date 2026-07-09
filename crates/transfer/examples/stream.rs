@@ -47,8 +47,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let feed_kp = Keypair::from_seed(&[42u8; 32]);
     let feed_pk = feed_kp.public();
     let node_id = NodeId::from_bytes(feed_pk.to_bytes());
-    let frames: Vec<Vec<u8>> = (0..12)
-        .map(|i| format!("frame {i:02}: the quick brown fox").into_bytes())
+    // Each "frame" is ~40 KiB — larger than a single UDP datagram — so streaming
+    // it exercises the transport's fragmentation: every block is split across
+    // many datagrams and reassembled (then verified) on the viewer's side.
+    let frames: Vec<Vec<u8>> = (0..8)
+        .map(|i| {
+            let mut frame = format!("frame {i:02}: ").into_bytes();
+            frame.resize(40_000, i);
+            frame
+        })
         .collect();
     let total_bytes: usize = frames.iter().map(Vec::len).sum();
 
@@ -64,9 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     println!("[publish] feed key 0x{key_hex}…  (this key is both the video id and the publisher's DHT address)");
     println!(
-        "[publish] wrote {} frames ({} bytes) to a signed append-only feed",
+        "[publish] wrote {} frames ({} KiB total, ~{} KiB each — a frame is larger than one datagram) to a signed feed",
         frames.len(),
-        total_bytes
+        total_bytes / 1024,
+        total_bytes / frames.len() / 1024,
     );
 
     let publisher = Node::bind(lo, node_id).await?;
@@ -101,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     println!("[viewer]  connected: {outcome:?} — a direct path, no server relaying");
 
-    println!("[viewer]  streaming frames over the punched channel, verifying each...");
+    println!("[viewer]  streaming frames over the punched channel — each split across datagrams, reassembled, and verified...");
     let received = timeout(T, download_feed(&mut channel, feed_pk, &Config::default())).await??;
 
     // --- Result ---------------------------------------------------------------

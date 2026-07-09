@@ -46,7 +46,7 @@ use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
 
-use congestion::Congestion;
+use congestion::{Congestion, Rtt};
 use crypto::{Hash, PublicKey};
 use driver::Channel;
 use frame::{Packet, Reassembler};
@@ -69,6 +69,13 @@ pub const MAX_DATAGRAM: usize = 65_487;
 /// stays well under platform caps like macOS's 9216-byte `udp.maxdgram`. A
 /// message larger than one fragment is split across several (see `frame`).
 const FRAGMENT: usize = 1200;
+
+/// Smallest pause the pacer bothers to take. Sub-millisecond sleeps are below
+/// the timer's resolution, so instead of sleeping per fragment the pacer
+/// accumulates the target inter-fragment interval and pauses once it reaches
+/// this — bursting a few fragments between pauses on a short-RTT path, spacing
+/// them out on a long one.
+const MIN_PACING_SLEEP: Duration = Duration::from_millis(1);
 
 /// A datagram link a transfer runs over: send and receive whole datagrams to a
 /// single connected peer. [`driver::Channel`] is the real one; a test supplies a
@@ -108,16 +115,16 @@ pub struct Config {
     /// How long a server waits for the next request before assuming the client
     /// is done and ending the session.
     pub idle: Duration,
-    /// How long a sender pauses between bursts when pacing a large message's
-    /// fragments (see the congestion window). Bounds the burst rate; larger
-    /// slows sending, smaller lets bursts bunch up.
+    /// Assumed round-trip time before the path is measured. The sender paces a
+    /// window's worth of fragments across one (measured, then smoothed) RTT, so
+    /// this only governs the very first reply; it's refined from the first clean
+    /// request→reply→request round trip onward.
     ///
-    /// Must stay well below the receiving peer's [`request_timeout`](Self::request_timeout):
-    /// a pacing pause longer than that interval looks to the receiver like a
-    /// stall, drawing a spurious NACK (a wasted resend, and it shrinks the
-    /// sender's window). The default — 1 ms against a 2 s timeout — leaves ample
-    /// margin.
-    pub pacing_gap: Duration,
+    /// Keep it well below [`request_timeout`](Self::request_timeout): the pacer
+    /// never spaces fragments more than about `rtt / 2` apart, so an RTT near the
+    /// timeout could make a pacing pause look like a stall and draw a spurious
+    /// NACK. The default — 100 ms against a 2 s timeout — leaves ample margin.
+    pub initial_rtt: Duration,
 }
 
 impl Default for Config {
@@ -126,7 +133,7 @@ impl Default for Config {
             request_timeout: Duration::from_secs(2),
             retries: 4,
             idle: Duration::from_secs(10),
-            pacing_gap: Duration::from_millis(1),
+            initial_rtt: Duration::from_millis(100),
         }
     }
 }
@@ -139,7 +146,7 @@ pub async fn download_feed<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<Vec<u8>>, TransferError> {
     let mut dl = FeedDownload::new(public_key);
-    let mut wire = Wire::new(channel, cfg.pacing_gap);
+    let mut wire = Wire::new(channel, cfg.initial_rtt);
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -155,7 +162,7 @@ pub async fn download_blob<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
     let mut dl = BlobDownload::new(id);
-    let mut wire = Wire::new(channel, cfg.pacing_gap);
+    let mut wire = Wire::new(channel, cfg.initial_rtt);
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -249,16 +256,17 @@ async fn serve<L: Link>(
     cfg: &Config,
     respond: impl Fn(&Message) -> Message,
 ) -> Result<(), TransferError> {
-    // A pacing pause must stay well under the peer's request_timeout, or a burst
-    // gap reads as a stall and draws spurious NACKs. Peers normally share a
-    // Config, so guard that common case in dev builds.
+    // The RTT estimate bounds the pacing gap (≤ rtt/2 between fragments), so it
+    // must stay well under the peer's request_timeout or a pacing pause reads as
+    // a stall and draws spurious NACKs. Peers normally share a Config, so guard
+    // that common case in dev builds.
     debug_assert!(
-        cfg.pacing_gap < cfg.request_timeout,
-        "pacing_gap ({:?}) must be well below request_timeout ({:?})",
-        cfg.pacing_gap,
+        cfg.initial_rtt < cfg.request_timeout,
+        "initial_rtt ({:?}) must be well below request_timeout ({:?})",
+        cfg.initial_rtt,
         cfg.request_timeout
     );
-    let mut wire = Wire::new(channel, cfg.pacing_gap);
+    let mut wire = Wire::new(channel, cfg.initial_rtt);
     // Idle is measured from the last *valid* activity, so a peer can't hold the
     // session open by sending undecodable junk.
     let mut deadline = Instant::now() + cfg.idle;
@@ -268,6 +276,9 @@ async fn serve<L: Link>(
     // (the client received nothing and re-asks — partial loss would NACK instead).
     let mut last_request: Option<Message> = None;
     let mut lost = false;
+    // When the last reply finished sending, for measuring RTT from the client's
+    // next request (its implicit ack).
+    let mut last_reply_at: Option<Instant> = None;
     loop {
         match wire.recv(deadline).await? {
             // Answer only genuine requests. A response-type message (peer
@@ -285,8 +296,13 @@ async fn serve<L: Link>(
                         }
                     } else if !lost {
                         // A different request → the client accepted the last reply
-                        // cleanly: grow.
+                        // cleanly: grow, and take a clean RTT sample (the gap since
+                        // we finished that reply). A repaired reply's timing is
+                        // muddied by the stall+NACK, so we skip it there.
                         wire.on_delivered();
+                        if let Some(sent_at) = last_reply_at {
+                            wire.rtt_sample(sent_at.elapsed());
+                        }
                     }
                 }
                 if !retransmit {
@@ -294,6 +310,7 @@ async fn serve<L: Link>(
                     last_request = Some(request.clone());
                 }
                 wire.send(&respond(&request)).await?;
+                last_reply_at = Some(Instant::now());
                 deadline = Instant::now() + cfg.idle;
             }
             Some(Recv::Message(_)) => {} // response-type: ignore
@@ -344,14 +361,14 @@ struct Wire<'a, L: Link> {
     /// The most recently sent message (id + encoded bytes), kept so a NACK for it
     /// can be answered by resending just the requested fragments.
     last_sent: Option<(u64, Vec<u8>)>,
-    /// The send-side congestion window: how many fragments to burst before
-    /// pausing `pacing_gap`. Adapted by the server loop from NACK feedback.
+    /// The send-side congestion window (fragments per RTT), adapted by the server
+    /// loop from NACK feedback, and the smoothed RTT to pace it over.
     cong: Congestion,
-    pacing_gap: Duration,
+    rtt: Rtt,
 }
 
 impl<'a, L: Link> Wire<'a, L> {
-    fn new(link: &'a L, pacing_gap: Duration) -> Self {
+    fn new(link: &'a L, initial_rtt: Duration) -> Self {
         Self {
             link,
             next_id: 0,
@@ -359,7 +376,7 @@ impl<'a, L: Link> Wire<'a, L> {
             buf: vec![0u8; MAX_DATAGRAM],
             last_sent: None,
             cong: Congestion::new(),
-            pacing_gap,
+            rtt: Rtt::new(initial_rtt),
         }
     }
 
@@ -378,22 +395,29 @@ impl<'a, L: Link> Wire<'a, L> {
         self.cong.on_loss();
     }
 
-    /// Send `fragments` paced into bursts of the congestion window, pausing
-    /// `pacing_gap` between bursts so a large message goes out as bounded bursts
-    /// rather than one blast. A message that fits in a single window sends with
-    /// no pause at all.
+    /// Fold a round-trip sample into the RTT estimate used to pace sends.
+    fn rtt_sample(&mut self, sample: Duration) {
+        self.rtt.sample(sample);
+    }
+
+    /// Send `fragments` paced to spread a window (`cwnd`) across one RTT — a
+    /// fragment every `srtt / cwnd`. Sub-millisecond intervals are accumulated
+    /// and paid in one pause (timer granularity), so a short-RTT path bursts and
+    /// a long-RTT path spaces out; a message small relative to the rate goes out
+    /// with no pause at all.
     async fn paced_send(
         &self,
         fragments: impl Iterator<Item = Vec<u8>>,
     ) -> Result<(), TransferError> {
-        let window = self.cong.window();
-        for (sent, fragment) in fragments.enumerate() {
-            // Pause before each burst after the first (never before the first
-            // fragment, nor after the last).
-            if sent > 0 && sent % window == 0 {
-                sleep(self.pacing_gap).await;
-            }
+        let per_fragment = self.rtt.get() / self.cong.window() as u32;
+        let mut owed = Duration::ZERO;
+        for fragment in fragments {
             self.link.send(&fragment).await?;
+            owed += per_fragment;
+            if owed >= MIN_PACING_SLEEP {
+                sleep(owed).await;
+                owed = Duration::ZERO;
+            }
         }
         Ok(())
     }
@@ -595,7 +619,7 @@ mod tests {
             request_timeout: Duration::from_millis(50),
             retries: 50,
             idle: Duration::from_millis(200),
-            pacing_gap: Duration::from_millis(1),
+            initial_rtt: Duration::from_millis(5),
         }
     }
 

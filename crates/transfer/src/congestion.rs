@@ -10,6 +10,13 @@
 //! control law is unit-tested directly. `Wire` reads [`Congestion::window`] to
 //! size each burst and feeds it [`Congestion::on_delivered`] /
 //! [`Congestion::on_loss`] as responses settle.
+//!
+//! Alongside it, [`Rtt`] tracks a smoothed round-trip time so the sender can
+//! pace a window's worth of fragments across one RTT (a fragment every
+//! `srtt / window`) rather than by a fixed gap — fast on a short path, gentle on
+//! a long one.
+
+use std::time::Duration;
 
 /// Initial window, in fragments (à la TCP's IW10).
 const INIT_WINDOW: usize = 10;
@@ -71,6 +78,50 @@ impl Default for Congestion {
     }
 }
 
+/// Cap on the smoothed RTT, so a pathological sample (a client that hangs before
+/// its next request) can't drive pacing slower than the transfer's own timeouts
+/// tolerate. Real RTTs are far below this.
+const MAX_RTT: Duration = Duration::from_secs(1);
+
+/// A smoothed round-trip-time estimate (EWMA, TCP's α = 1/8). Fed samples by the
+/// sender — the gap between finishing a reply and the peer's next request — and
+/// read to pace fragments over one RTT.
+#[derive(Debug)]
+pub struct Rtt {
+    srtt: Duration,
+    /// Whether a real sample has landed yet. The first one *replaces* the assumed
+    /// initial (RFC 6298), so the estimate snaps to the actual path immediately
+    /// instead of crawling there from a wrong guess; later samples are smoothed.
+    sampled: bool,
+}
+
+impl Rtt {
+    /// Start from an assumed RTT, used until the first real sample lands.
+    pub fn new(initial: Duration) -> Self {
+        Self {
+            srtt: initial.min(MAX_RTT),
+            sampled: false,
+        }
+    }
+
+    /// The current smoothed RTT.
+    pub fn get(&self) -> Duration {
+        self.srtt
+    }
+
+    /// Fold in a new round-trip sample: the first replaces the assumed initial;
+    /// later ones smooth as `srtt = 7/8 srtt + 1/8 sample`. Capped at `MAX_RTT`.
+    pub fn sample(&mut self, rtt: Duration) {
+        self.srtt = if self.sampled {
+            (self.srtt * 7 + rtt) / 8
+        } else {
+            self.sampled = true;
+            rtt
+        }
+        .min(MAX_RTT);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -128,5 +179,49 @@ mod tests {
         c.on_loss();
         assert!(c.window() <= after_one);
         assert!(c.window() >= MIN_WINDOW);
+    }
+
+    #[test]
+    fn rtt_starts_at_the_initial_estimate() {
+        assert_eq!(
+            Rtt::new(Duration::from_millis(100)).get(),
+            Duration::from_millis(100)
+        );
+    }
+
+    #[test]
+    fn rtt_first_sample_replaces_then_later_ones_smooth() {
+        let mut r = Rtt::new(Duration::from_millis(100));
+        // The first sample snaps the estimate to the measured path (not smoothed
+        // against the assumed 100ms).
+        r.sample(Duration::from_millis(200));
+        assert_eq!(r.get(), Duration::from_millis(200));
+        // The next smooths: 7/8*200 + 1/8*40 = 180ms.
+        r.sample(Duration::from_millis(40));
+        assert_eq!(r.get(), Duration::from_millis(180));
+    }
+
+    #[test]
+    fn rtt_converges_on_a_steady_path() {
+        let mut r = Rtt::new(Duration::from_millis(100));
+        for _ in 0..50 {
+            r.sample(Duration::from_millis(20));
+        }
+        // Should have converged close to the steady 20ms.
+        let got = r.get();
+        assert!(
+            got >= Duration::from_millis(20) && got <= Duration::from_millis(22),
+            "srtt {got:?} should be ~20ms"
+        );
+    }
+
+    #[test]
+    fn rtt_is_capped_against_a_pathological_estimate() {
+        assert_eq!(Rtt::new(Duration::from_secs(30)).get(), MAX_RTT);
+        let mut r = Rtt::new(Duration::from_millis(50));
+        for _ in 0..100 {
+            r.sample(Duration::from_secs(60)); // absurd samples
+        }
+        assert!(r.get() <= MAX_RTT);
     }
 }

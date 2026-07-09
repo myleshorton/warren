@@ -202,21 +202,23 @@ async fn exchange<L: Link>(
         if let Some(message) = completed {
             return Ok(message);
         }
-        // The interval elapsed without completing the response. Repair: NACK the
-        // gaps of a partial response, or re-ask if nothing has arrived at all.
+        // The interval elapsed without completing the response. If fragments were
+        // still arriving, the transmission is simply in progress — keep waiting
+        // rather than NACK indices that are likely in flight (which would make
+        // the server resend them needlessly). Only a *stalled* interval means a
+        // gap is actually lost.
+        if wire.stored() > progress_from {
+            stalls = 0;
+            continue;
+        }
+        // No progress: repair the gaps (NACK), or re-ask if nothing arrived yet.
         match wire.missing() {
             Some(missing) => wire.nack(missing.id, &missing.indices).await?,
             None => wire.send(request).await?,
         }
-        // Count only intervals that made no progress toward the response; a
-        // lossy-but-advancing transfer keeps its budget.
-        if wire.stored() > progress_from {
-            stalls = 0;
-        } else {
-            stalls += 1;
-            if stalls > cfg.retries {
-                return Err(TransferError::Timeout);
-            }
+        stalls += 1;
+        if stalls > cfg.retries {
+            return Err(TransferError::Timeout);
         }
     }
 }

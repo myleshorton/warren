@@ -97,9 +97,14 @@ impl Packet {
                 let id = dec.uint().ok()?;
                 let k = dec.uint().ok()?;
                 if k > MAX_FRAGMENTS {
-                    return None; // refuse to allocate for an absurd list
+                    return None; // refuse to even consider an absurd list
                 }
-                let mut indices = Vec::with_capacity(k as usize);
+                // Each index is at least one byte, so the datagram can't hold more
+                // than `remaining` of them. Cap the pre-allocation to that rather
+                // than trust `k`, so a tiny datagram claiming a huge `k` can't
+                // force a large allocation (it'll just fail on the short read).
+                let cap = (k as usize).min(dec.remaining());
+                let mut indices = Vec::with_capacity(cap);
                 for _ in 0..k {
                     indices.push(dec.uint().ok()?);
                 }
@@ -165,6 +170,22 @@ pub fn fragment(
     })
 }
 
+/// Build just the `index`-th `Data` fragment of `payload`, or `None` if `index`
+/// is past the fragment count. Lets a sender answer a NACK by rebuilding only the
+/// requested fragments, without materializing (and allocating) the rest.
+pub fn fragment_at(msg_id: u64, payload: &[u8], datagram: usize, index: u64) -> Option<Vec<u8>> {
+    debug_assert!(datagram > HEADER_BUDGET);
+    let budget = datagram.saturating_sub(HEADER_BUDGET).max(1);
+    let count = payload.len().div_ceil(budget).max(1) as u64;
+    if index >= count {
+        return None;
+    }
+    let i = index as usize;
+    let start = i * budget;
+    let end = ((i + 1) * budget).min(payload.len());
+    Some(data_datagram(msg_id, index, count, &payload[start..end]))
+}
+
 /// The fragments of a message a receiver is still missing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Missing {
@@ -209,7 +230,7 @@ impl Reassembler {
     /// completes a message — the caller decodes `payload` and, on success, calls
     /// [`Reassembler::accept`] with `id` to commit it. Returns `None` while more
     /// fragments are needed. Abusive framing (a count or size past the caps) or a
-    /// stragler (at or below the accepted watermark) is dropped.
+    /// straggler (at or below the accepted watermark) is dropped.
     pub fn push_data(
         &mut self,
         id: u64,
@@ -519,6 +540,16 @@ mod tests {
     }
 
     #[test]
+    fn fragment_at_matches_fragment_and_bounds_the_index() {
+        let payload: Vec<u8> = (0..7_000u32).map(|i| i as u8).collect();
+        let all: Vec<Vec<u8>> = fragment(3, &payload, DGRAM).collect();
+        for (i, f) in all.iter().enumerate() {
+            assert_eq!(fragment_at(3, &payload, DGRAM, i as u64).as_ref(), Some(f));
+        }
+        assert_eq!(fragment_at(3, &payload, DGRAM, all.len() as u64), None); // past the end
+    }
+
+    #[test]
     fn packet_roundtrips() {
         let data = Packet::Data {
             id: 42,
@@ -622,16 +653,14 @@ mod tests {
             assert!(rounds < 100, "repair should converge");
             let missing = r.missing().expect("still in progress");
             assert_eq!(missing.id, id);
-            // Sender resends exactly the requested fragments.
-            let want: HashSet<u64> = missing.indices.iter().copied().collect();
-            for (i, f) in fragment(id, &msg, DGRAM).enumerate() {
-                if want.contains(&(i as u64)) {
-                    resent += 1;
-                    if let Some(d) = link.deliver(&f) {
-                        if let Some((mid, bytes)) = r.push(d) {
-                            r.accept(mid);
-                            done = Some(bytes);
-                        }
+            // Sender resends exactly the requested fragments (as `resend` does).
+            for &idx in &missing.indices {
+                let f = fragment_at(id, &msg, DGRAM, idx).expect("index in range");
+                resent += 1;
+                if let Some(d) = link.deliver(&f) {
+                    if let Some((mid, bytes)) = r.push(d) {
+                        r.accept(mid);
+                        done = Some(bytes);
                     }
                 }
             }

@@ -187,29 +187,35 @@ async fn exchange<L: Link>(
     loop {
         let progress_from = wire.received();
         let deadline = Instant::now() + cfg.request_timeout;
-        match wire.recv(deadline).await? {
-            // The response completed and verified. A stray request-type message
-            // or a NACK (the client doesn't serve those) is ignored — handing a
-            // request to the sync client would abort it as Unexpected.
-            Some(Recv::Message(message)) if !message.is_request() => return Ok(message),
-            Some(_) => continue,
-            None => {
-                // Interval elapsed without completing. Repair: NACK the gaps of a
-                // partial response, or re-ask if nothing has arrived at all.
-                match wire.missing() {
-                    Some(missing) => wire.nack(missing.id, &missing.indices).await?,
-                    None => wire.send(request).await?,
-                }
-                // Count only intervals that made no progress toward the response;
-                // a lossy-but-advancing transfer keeps its budget.
-                if wire.received() > progress_from {
-                    stalls = 0;
-                } else {
-                    stalls += 1;
-                    if stalls > cfg.retries {
-                        return Err(TransferError::Timeout);
-                    }
-                }
+        // Wait out one interval. A stray decodable packet — a request-type message
+        // or a NACK, neither of which the client serves — is ignored without
+        // extending the interval, so a peer can't stave off the stall bound (or
+        // our NACKs) by dribbling irrelevant traffic. Handing a request to the
+        // sync client would abort it as Unexpected, so we never return one.
+        let completed = loop {
+            match wire.recv(deadline).await? {
+                Some(Recv::Message(message)) if !message.is_request() => break Some(message),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
+        if let Some(message) = completed {
+            return Ok(message);
+        }
+        // The interval elapsed without completing the response. Repair: NACK the
+        // gaps of a partial response, or re-ask if nothing has arrived at all.
+        match wire.missing() {
+            Some(missing) => wire.nack(missing.id, &missing.indices).await?,
+            None => wire.send(request).await?,
+        }
+        // Count only intervals that made no progress toward the response; a
+        // lossy-but-advancing transfer keeps its budget.
+        if wire.received() > progress_from {
+            stalls = 0;
+        } else {
+            stalls += 1;
+            if stalls > cfg.retries {
+                return Err(TransferError::Timeout);
             }
         }
     }
@@ -238,10 +244,13 @@ async fn serve<L: Link>(
             }
             Some(Recv::Message(_)) => {} // response-type: ignore
             // The client is missing fragments of the reply we last sent: resend
-            // just those. Repair is client activity, so it holds the session open.
+            // just those. Only a NACK that matches that reply counts as activity
+            // (holds the session open) — a stale or bogus one resends nothing and
+            // mustn't let a client keep the session alive by spamming NACKs.
             Some(Recv::Nack { id, indices }) => {
-                wire.resend(id, &indices).await?;
-                deadline = Instant::now() + cfg.idle;
+                if wire.resend(id, &indices).await? {
+                    deadline = Instant::now() + cfg.idle;
+                }
             }
             None => return Ok(()), // idle: the client has stopped asking
         }
@@ -307,31 +316,34 @@ impl<'a, L: Link> Wire<'a, L> {
         Ok(())
     }
 
-    /// Resend the requested fragments of the last message sent, if the NACK is
-    /// for it (one for a superseded message is ignored). Only the requested
-    /// fragments are rebuilt; indices past the message's fragment count are
-    /// naturally skipped, so a NACK can't make us send more than the message.
-    async fn resend(&self, id: u64, indices: &[u64]) -> Result<(), TransferError> {
+    /// Resend the requested fragments of the last message sent. Returns whether
+    /// the NACK matched that message — a NACK for a superseded reply matches
+    /// nothing and is ignored — so the caller can treat only a real repair
+    /// request as session activity. Only the requested, in-range fragments are
+    /// rebuilt (via [`frame::fragment_at`]), never the whole message, so light
+    /// loss costs proportionally little.
+    async fn resend(&self, id: u64, indices: &[u64]) -> Result<bool, TransferError> {
         // Build just the requested fragments, releasing the borrow of `last_sent`
         // before awaiting the sends.
         let to_send: Vec<Vec<u8>> = {
             let Some((last_id, bytes)) = &self.last_sent else {
-                return Ok(());
+                return Ok(false);
             };
             if *last_id != id {
-                return Ok(());
+                return Ok(false);
             }
-            let want: HashSet<u64> = indices.iter().copied().collect();
-            frame::fragment(*last_id, bytes, FRAGMENT)
-                .enumerate()
-                .filter(|(i, _)| want.contains(&(*i as u64)))
-                .map(|(_, fragment)| fragment)
+            let mut seen = HashSet::new();
+            indices
+                .iter()
+                .copied()
+                .filter(|i| seen.insert(*i)) // dedup, in case a NACK repeats an index
+                .filter_map(|i| frame::fragment_at(*last_id, bytes, FRAGMENT, i))
                 .collect()
         };
         for fragment in &to_send {
             self.link.send(fragment).await?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// NACK (a bounded batch of) the missing fragments of message `id`. Capped at
@@ -526,10 +538,11 @@ mod tests {
 
         let (mut client, mut server) = lossy_pair(&[], &[]);
         let cfg = fast_cfg();
-        let (_served, downloaded) = tokio::join!(
+        let (served, downloaded) = tokio::join!(
             serve_feed(&mut server, &log, &cfg),
             download_feed(&mut client, public_key, &cfg),
         );
+        served.expect("server ends cleanly on idle");
         assert_eq!(downloaded.expect("download verifies"), expected);
     }
 }

@@ -83,17 +83,19 @@ crates/
             BlobDownload (manifest + chunks, verified by content hash), with
             serve_feed/serve_blob answering from a local Log/Store. Pure
             request/response messages — the driver pumps them over a channel.
-  transfer  runs sync over a punched driver::Channel: download_feed/download_blob
-            (client) and serve_feed/serve_blob (server), with per-request
-            retransmit + idle timeout. A message larger than a datagram (a chunk,
-            a block with its proof, a manifest) is split into MTU-sized fragments
-            and reassembled on the far side — so the default 64 KiB chunk, which
-            no datagram can carry, syncs unchanged. The seam where the data layer
-            finally rides the transport over a real connection.
+  transfer  runs sync over any Link (driver::Channel, or a test's lossy link):
+            download_feed/download_blob (client) and serve_feed/serve_blob
+            (server). A message larger than a datagram (a chunk, a block with its
+            proof, a manifest) is split into MTU-sized fragments and reassembled
+            on the far side — so the default 64 KiB chunk, which no datagram can
+            carry, syncs unchanged. Reliability is selective repeat: a stalled
+            receiver NACKs the fragment indices it's missing and the sender
+            resends only those, so one lost fragment costs one datagram to
+            recover, not the whole message. The seam where the data layer finally
+            rides the transport over a real connection.
 
-  next: per-fragment acknowledgement (repair only lost fragments, so a large
-        transfer survives a lossy link), port mapping, an incremental Merkle
-        accumulator for feed, ...
+  next: congestion control / pacing (bound fragments in flight), port mapping,
+        an incremental Merkle accumulator for feed, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

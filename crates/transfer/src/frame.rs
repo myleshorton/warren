@@ -1,23 +1,22 @@
-//! Application-level fragmentation over the datagram [`driver::Channel`].
+//! Framing + selective-repeat reliability over the datagram [`driver::Channel`].
 //!
 //! A `Channel` carries datagrams, each bounded by [`MAX_DATAGRAM`](crate::MAX_DATAGRAM);
 //! a single [`sync::Message`](sync) — a blob chunk, a feed block with its proof,
-//! or a manifest — can be larger than that. This module is the seam that lets a
-//! message span several datagrams: [`fragment`] splits an encoded message into
-//! datagram-sized pieces, each tagged with a message id and its index, and a
-//! [`Reassembler`] collects the pieces of one message back into the original
-//! bytes.
+//! or a manifest — can be larger. This module is the seam that lets a message
+//! span several datagrams and repairs individual losses:
 //!
-//! It is **sans-IO**: pure over `&[u8]`, no sockets and no clock, so the
-//! reassembly logic — including its behaviour under loss, reordering,
-//! duplication, and hostile headers — is exercised by deterministic unit tests.
-//! The crate's `Wire` pumps the fragments over a real channel.
+//! - [`fragment`] splits an encoded message into datagram-sized [`Packet::Data`]
+//!   pieces, each tagged with a message id and its index;
+//! - a [`Reassembler`] collects those pieces back into the original bytes and
+//!   reports, via [`Reassembler::missing`], which indices are still outstanding;
+//! - a [`Packet::Nack`] carries that missing set back to the sender, which
+//!   resends only those fragments (rather than the whole message).
 //!
-//! Reliability is left to the layer above: the transfer loop is stop-and-wait
-//! and retransmits a whole message on timeout, so this module does **not** ack
-//! or repair individual lost fragments. A message id lets the reassembler follow
-//! the newest attempt and discard stragglers from an abandoned one, so a
-//! retransmit never mixes with the message it replaces.
+//! It is **sans-IO**: pure over `&[u8]`, no sockets and no clock, so everything —
+//! reassembly under loss, reordering, duplication, hostile headers, and a full
+//! NACK-driven repair loop — is exercised by deterministic unit tests. The
+//! crate's `Wire` pumps these packets over a real channel and supplies the
+//! timing (when a stalled receiver decides to NACK).
 
 use std::collections::HashMap;
 
@@ -34,23 +33,120 @@ pub const MAX_MESSAGE: usize = 16 << 20;
 /// [`MAX_MESSAGE`] byte cap (which a flood of tiny fragments wouldn't trip).
 pub const MAX_FRAGMENTS: u64 = 1 << 16;
 
-/// Bytes reserved in each datagram for the fragment header: three [`u64`]
-/// varints (message id, fragment index, fragment count), each at most 10 bytes.
-/// A conservative upper bound, so a fragment's header-plus-payload never exceeds
-/// the datagram size it was split for.
+/// Most missing indices to list in one [`Packet::Nack`]. Keeps a NACK within a
+/// single datagram (≈256 three-byte varints plus a small header, well under the
+/// send size); a receiver missing more pages across successive NACKs.
+pub const NACK_MAX_INDICES: usize = 256;
+
+/// Bytes reserved in each datagram for a `Data` header: a 1-byte tag plus three
+/// [`u64`] varints (message id, fragment index, fragment count), each at most 10
+/// bytes. A conservative upper bound, so a fragment's header-plus-payload never
+/// exceeds the datagram size it was split for.
 const HEADER_BUDGET: usize = 32;
 
-/// Split `payload` into fragments that each fit in a `datagram`-byte packet,
-/// tagged with `msg_id` so a [`Reassembler`] can group and order them. Yields
-/// them lazily — one at a time — so the caller can send each as it's built
+const TAG_DATA: u8 = 0;
+const TAG_NACK: u8 = 1;
+
+/// A datagram on the channel: either one fragment of a message, or a request to
+/// resend fragments that didn't arrive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Packet {
+    /// One fragment of message `id`: fragment `index` of `count`, carrying
+    /// `payload` bytes.
+    Data {
+        /// The message this fragment belongs to.
+        id: u64,
+        /// This fragment's position in the message.
+        index: u64,
+        /// Total fragments the message was split into.
+        count: u64,
+        /// The fragment's slice of the message bytes.
+        payload: Vec<u8>,
+    },
+    /// A request to resend the listed fragment `indices` of message `id` — the
+    /// ones the receiver is still missing.
+    Nack {
+        /// The message whose fragments are being requested.
+        id: u64,
+        /// The missing fragment indices to resend.
+        indices: Vec<u64>,
+    },
+}
+
+impl Packet {
+    /// Decode a datagram, or `None` if it isn't a well-formed packet (junk, a
+    /// truncated header, or an abusive count) — the transport treats such
+    /// datagrams as noise, never a failure.
+    pub fn decode(datagram: &[u8]) -> Option<Packet> {
+        let mut dec = Decoder::new(datagram);
+        match dec.u8().ok()? {
+            TAG_DATA => {
+                let id = dec.uint().ok()?;
+                let index = dec.uint().ok()?;
+                let count = dec.uint().ok()?;
+                let remaining = dec.remaining();
+                let payload = dec.raw(remaining).ok()?.to_vec();
+                Some(Packet::Data {
+                    id,
+                    index,
+                    count,
+                    payload,
+                })
+            }
+            TAG_NACK => {
+                let id = dec.uint().ok()?;
+                let k = dec.uint().ok()?;
+                if k > MAX_FRAGMENTS {
+                    return None; // refuse to allocate for an absurd list
+                }
+                let mut indices = Vec::with_capacity(k as usize);
+                for _ in 0..k {
+                    indices.push(dec.uint().ok()?);
+                }
+                dec.finish().ok()?;
+                Some(Packet::Nack { id, indices })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Encode a `Data` datagram for one fragment.
+fn data_datagram(id: u64, index: u64, count: u64, payload: &[u8]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(TAG_DATA);
+    enc.uint(id);
+    enc.uint(index);
+    enc.uint(count);
+    enc.raw(payload);
+    enc.into_vec()
+}
+
+/// Encode a `Nack` datagram asking the sender to resend `indices` of message
+/// `id`. The caller keeps `indices` within [`NACK_MAX_INDICES`] so it fits one
+/// datagram.
+pub fn nack_datagram(id: u64, indices: &[u64]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.u8(TAG_NACK);
+    enc.uint(id);
+    enc.uint(indices.len() as u64);
+    for &i in indices {
+        enc.uint(i);
+    }
+    enc.into_vec()
+}
+
+/// Split `payload` into `Data` fragments that each fit in a `datagram`-byte
+/// packet, tagged with `msg_id` so a [`Reassembler`] can group and order them.
+/// Yields them lazily — one at a time — so the caller can send each as it's built
 /// rather than buffer the whole set (a large message would otherwise peak at a
-/// second copy of itself in fragment `Vec`s). Always yields at least one
-/// fragment (an empty payload yields a single empty one).
+/// second copy of itself). Always yields at least one fragment (an empty payload
+/// yields a single empty one).
 ///
-/// `datagram` must exceed `HEADER_BUDGET` — otherwise the header alone would
-/// fill (or overflow) a fragment and the "fits in `datagram` bytes" guarantee
-/// couldn't hold. Callers pass the crate's `FRAGMENT`, which is far larger; the
-/// assertion documents the precondition for any future caller.
+/// `datagram` must exceed `HEADER_BUDGET` — otherwise the header alone would fill
+/// (or overflow) a fragment and the "fits in `datagram` bytes" guarantee couldn't
+/// hold. Callers pass the crate's `FRAGMENT`, far larger; the assertion documents
+/// the precondition for any future caller.
 pub fn fragment(
     msg_id: u64,
     payload: &[u8],
@@ -65,18 +161,23 @@ pub fn fragment(
     (0..count).map(move |i| {
         let start = i * budget;
         let end = ((i + 1) * budget).min(payload.len());
-        let mut enc = Encoder::new();
-        enc.uint(msg_id);
-        enc.uint(i as u64);
-        enc.uint(count as u64);
-        enc.raw(&payload[start..end]);
-        enc.into_vec()
+        data_datagram(msg_id, i as u64, count as u64, &payload[start..end])
     })
 }
 
-/// Collects the fragments of a single message. Because the transfer loop is
-/// stop-and-wait, only one message is ever in flight per direction, so this
-/// tracks one message at a time and follows the newest id it sees.
+/// The fragments of a message a receiver is still missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Missing {
+    /// The message being reassembled.
+    pub id: u64,
+    /// Indices not yet received, ascending.
+    pub indices: Vec<u64>,
+}
+
+/// Collects the fragments of a message and tracks which are still missing so the
+/// receiver can NACK for them. Because the transfer loop is stop-and-wait, only
+/// one message is in flight per direction, so this tracks one at a time and
+/// follows the newest id it sees.
 #[derive(Default)]
 pub struct Reassembler {
     current: Option<Partial>,
@@ -104,20 +205,18 @@ impl Reassembler {
         Self::default()
     }
 
-    /// Feed one received datagram. Returns `Some((id, payload))` when it
+    /// Feed a decoded `Data` fragment. Returns `Some((id, payload))` when it
     /// completes a message — the caller decodes `payload` and, on success, calls
     /// [`Reassembler::accept`] with `id` to commit it. Returns `None` while more
-    /// fragments are needed. Anything unparseable, abusive (a count or size past
-    /// the caps), or stale (at or below the accepted watermark) is dropped — the
-    /// transport treats such datagrams as noise, never as a failure.
-    pub fn push(&mut self, datagram: &[u8]) -> Option<(u64, Vec<u8>)> {
-        let mut dec = Decoder::new(datagram);
-        let id = dec.uint().ok()?;
-        let index = dec.uint().ok()?;
-        let count = dec.uint().ok()?;
-        let remaining = dec.remaining();
-        let payload = dec.raw(remaining).ok()?;
-
+    /// fragments are needed. Abusive framing (a count or size past the caps) or a
+    /// stragler (at or below the accepted watermark) is dropped.
+    pub fn push_data(
+        &mut self,
+        id: u64,
+        index: u64,
+        count: u64,
+        payload: &[u8],
+    ) -> Option<(u64, Vec<u8>)> {
         // Reject abusive framing before allocating anything for it.
         if count == 0 || count > MAX_FRAGMENTS || index >= count {
             return None;
@@ -164,8 +263,8 @@ impl Reassembler {
 
         // Complete once every index in [0, count) is present. `frags` holds
         // `count` distinct in-range indices exactly when the message is whole.
-        // The watermark is *not* advanced here — only when the caller accepts
-        // the decoded payload — so a bogus id can't wedge later messages.
+        // The watermark is *not* advanced here — only when the caller accepts the
+        // decoded payload — so a bogus id can't wedge later messages.
         if partial.frags.len() == partial.count {
             let mut out = Vec::with_capacity(partial.bytes);
             for i in 0..partial.count {
@@ -178,7 +277,42 @@ impl Reassembler {
         None
     }
 
-    /// Commit `id` once the caller has validated the message [`Reassembler::push`]
+    /// Decode `datagram` as a `Data` packet and feed it in. A convenience over
+    /// [`Reassembler::push_data`] for tests; non-`Data`/undecodable datagrams are
+    /// ignored. Production decodes the [`Packet`] once in `Wire` and routes it.
+    #[cfg(test)]
+    pub fn push(&mut self, datagram: &[u8]) -> Option<(u64, Vec<u8>)> {
+        match Packet::decode(datagram)? {
+            Packet::Data {
+                id,
+                index,
+                count,
+                payload,
+            } => self.push_data(id, index, count, &payload),
+            Packet::Nack { .. } => None,
+        }
+    }
+
+    /// How many fragments of the message in progress have arrived (0 if none is).
+    /// Lets the driver tell whether an interval made repair progress.
+    pub fn received(&self) -> usize {
+        self.current.as_ref().map_or(0, |p| p.frags.len())
+    }
+
+    /// The fragments still missing from the message in progress, or `None` if
+    /// nothing is being reassembled. The caller NACKs (a bounded batch of) these.
+    pub fn missing(&self) -> Option<Missing> {
+        let partial = self.current.as_ref()?;
+        let indices = (0..partial.count as u64)
+            .filter(|i| !partial.frags.contains_key(&(*i as usize)))
+            .collect();
+        Some(Missing {
+            id: partial.id,
+            indices,
+        })
+    }
+
+    /// Commit `id` once the caller has validated the message [`Reassembler::push_data`]
     /// returned for it. Advances the watermark so stragglers and duplicates of
     /// that message are dropped from here on. Called only after a successful
     /// decode, so an undecodable (corrupt or hostile) reassembly leaves the
@@ -191,6 +325,7 @@ impl Reassembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
 
     const DGRAM: usize = 1024;
 
@@ -272,6 +407,32 @@ mod tests {
     }
 
     #[test]
+    fn missing_reports_the_gaps_then_none_when_whole() {
+        let payload: Vec<u8> = (0..6_000u32).map(|i| i as u8).collect();
+        let frags: Vec<Vec<u8>> = fragment(9, &payload, DGRAM).collect();
+        let n = frags.len();
+        assert!(n >= 4, "need several fragments for a meaningful gap");
+
+        let mut r = Reassembler::new();
+        // Deliver all but indices 1 and 3.
+        for (i, f) in frags.iter().enumerate() {
+            if i != 1 && i != 3 {
+                r.push(f);
+            }
+        }
+        let missing = r.missing().expect("a message is in progress");
+        assert_eq!(missing.id, 9);
+        assert_eq!(missing.indices, vec![1, 3]);
+
+        // Delivering the gaps completes it, and nothing is in progress after.
+        r.push(&frags[1]);
+        let (id, msg) = r.push(&frags[3]).expect("the last gap completes it");
+        r.accept(id);
+        assert_eq!(msg, payload);
+        assert_eq!(r.missing(), None);
+    }
+
+    #[test]
     fn a_newer_message_supersedes_an_incomplete_one() {
         let old: Vec<u8> = vec![0xAA; 5_000];
         let new: Vec<u8> = vec![0xBB; 5_000];
@@ -321,14 +482,8 @@ mod tests {
         // accepted. A later, lower-id legitimate message must still get through —
         // the watermark advances only on accept, so the bogus id can't wedge it.
         let mut r = Reassembler::new();
-        let mut junk = Encoder::new();
-        junk.uint(u64::MAX); // absurd id
-        junk.uint(0);
-        junk.uint(1);
-        junk.raw(b"not a decodable message");
-        let (jid, _) = r
-            .push(&junk.into_vec())
-            .expect("a one-fragment message completes");
+        let junk = data_datagram(u64::MAX, 0, 1, b"not a decodable message");
+        let (jid, _) = r.push(&junk).expect("a one-fragment message completes");
         assert_eq!(jid, u64::MAX);
         // The caller's decode fails, so it does NOT accept(jid).
 
@@ -346,33 +501,11 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_count_fragment_is_rejected() {
-        let mut enc = Encoder::new();
-        enc.uint(1); // id
-        enc.uint(0); // index
-        enc.uint(0); // count == 0: invalid
-        enc.raw(b"x");
-        assert_eq!(Reassembler::new().push(&enc.into_vec()), None);
-    }
-
-    #[test]
-    fn an_index_past_the_count_is_rejected() {
-        let mut enc = Encoder::new();
-        enc.uint(1); // id
-        enc.uint(3); // index 3...
-        enc.uint(2); // ...but only 2 fragments: invalid
-        enc.raw(b"x");
-        assert_eq!(Reassembler::new().push(&enc.into_vec()), None);
-    }
-
-    #[test]
-    fn a_count_past_the_cap_is_rejected() {
-        let mut enc = Encoder::new();
-        enc.uint(1);
-        enc.uint(0);
-        enc.uint(MAX_FRAGMENTS + 1); // over the fragment cap
-        enc.raw(b"x");
-        assert_eq!(Reassembler::new().push(&enc.into_vec()), None);
+    fn push_data_rejects_abusive_framing() {
+        let mut r = Reassembler::new();
+        assert_eq!(r.push_data(1, 0, 0, b"x"), None); // count == 0
+        assert_eq!(r.push_data(1, 3, 2, b"x"), None); // index past count
+        assert_eq!(r.push_data(1, 0, MAX_FRAGMENTS + 1, b"x"), None); // count past cap
     }
 
     #[test]
@@ -381,25 +514,41 @@ mod tests {
         // refused, so the message never completes and the buffer stays bounded.
         let big = vec![0u8; MAX_MESSAGE];
         let mut r = Reassembler::new();
-        let mut a = Encoder::new();
-        a.uint(1);
-        a.uint(0);
-        a.uint(2);
-        a.raw(&big);
-        assert_eq!(r.push(&a.into_vec()), None); // fits the cap on its own
-        let mut b = Encoder::new();
-        b.uint(1);
-        b.uint(1);
-        b.uint(2);
-        b.raw(b"one byte too many");
-        assert_eq!(r.push(&b.into_vec()), None); // refused: over the cap, no completion
+        assert_eq!(r.push_data(1, 0, 2, &big), None); // fits the cap on its own
+        assert_eq!(r.push_data(1, 1, 2, b"one byte too many"), None); // over the cap
     }
 
     #[test]
-    fn a_truncated_header_is_ignored() {
-        // Not enough bytes for the three-varint header.
-        assert_eq!(Reassembler::new().push(&[]), None);
-        assert_eq!(Reassembler::new().push(&[0x80]), None); // dangling varint
+    fn packet_roundtrips() {
+        let data = Packet::Data {
+            id: 42,
+            index: 3,
+            count: 9,
+            payload: b"some bytes".to_vec(),
+        };
+        assert_eq!(
+            Packet::decode(&data_datagram(42, 3, 9, b"some bytes")),
+            Some(data)
+        );
+
+        let nack = Packet::Nack {
+            id: 42,
+            indices: vec![1, 4, 5],
+        };
+        assert_eq!(Packet::decode(&nack_datagram(42, &[1, 4, 5])), Some(nack));
+    }
+
+    #[test]
+    fn a_truncated_or_unknown_packet_is_ignored() {
+        assert_eq!(Packet::decode(&[]), None); // no tag
+        assert_eq!(Packet::decode(&[TAG_DATA]), None); // tag but no header
+        assert_eq!(Packet::decode(&[0x7f]), None); // unknown tag
+                                                   // A Nack claiming an absurd index count is refused before allocating.
+        let mut enc = Encoder::new();
+        enc.u8(TAG_NACK);
+        enc.uint(1);
+        enc.uint(MAX_FRAGMENTS + 1);
+        assert_eq!(Packet::decode(&enc.into_vec()), None);
     }
 
     #[test]
@@ -412,6 +561,87 @@ mod tests {
                 .map(|i| (seed.wrapping_mul(i as u32 + 1)) as u8)
                 .collect();
             let _ = r.push(&bytes);
+            let _ = Packet::decode(&bytes);
         }
+    }
+
+    /// A lossy pipe: `deliver` drops a datagram when its running index is in the
+    /// drop schedule, modelling a link that loses specific packets.
+    struct Lossy {
+        sent: usize,
+        drop: HashSet<usize>,
+    }
+    impl Lossy {
+        fn new(drop: &[usize]) -> Self {
+            Self {
+                sent: 0,
+                drop: drop.iter().copied().collect(),
+            }
+        }
+        /// Returns the datagram if it survives, `None` if this one is dropped.
+        fn deliver<'a>(&mut self, datagram: &'a [u8]) -> Option<&'a [u8]> {
+            let n = self.sent;
+            self.sent += 1;
+            (!self.drop.contains(&n)).then_some(datagram)
+        }
+    }
+
+    #[test]
+    fn selective_repeat_recovers_a_lossy_transfer() {
+        // End-to-end repair, purely: a large message is fragmented and delivered
+        // over a lossy pipe; the receiver NACKs the gaps and the sender resends
+        // only those, until the message is whole — resending far fewer datagrams
+        // than the whole message.
+        let msg: Vec<u8> = (0..40_000u32).map(|i| (i * 31) as u8).collect();
+        let id = 1;
+        let all: Vec<Vec<u8>> = fragment(id, &msg, DGRAM).collect();
+        let total = all.len();
+        assert!(total > 20, "want a message with many fragments");
+
+        // Drop a scattered handful on the first delivery, and one NACK-repair
+        // datagram too (so a fragment needs re-repairing).
+        let mut link = Lossy::new(&[2, 5, 9, 14, 19, total]); // `total` = first repair pkt
+        let mut r = Reassembler::new();
+        let mut resent = 0;
+
+        // First pass: send every fragment.
+        let mut done = None;
+        for f in &all {
+            if let Some(d) = link.deliver(f) {
+                if let Some((mid, bytes)) = r.push(d) {
+                    r.accept(mid);
+                    done = Some(bytes);
+                }
+            }
+        }
+
+        // Repair rounds: NACK the gaps, resend just those, until complete.
+        let mut rounds = 0;
+        while done.is_none() {
+            rounds += 1;
+            assert!(rounds < 100, "repair should converge");
+            let missing = r.missing().expect("still in progress");
+            assert_eq!(missing.id, id);
+            // Sender resends exactly the requested fragments.
+            let want: HashSet<u64> = missing.indices.iter().copied().collect();
+            for (i, f) in fragment(id, &msg, DGRAM).enumerate() {
+                if want.contains(&(i as u64)) {
+                    resent += 1;
+                    if let Some(d) = link.deliver(&f) {
+                        if let Some((mid, bytes)) = r.push(d) {
+                            r.accept(mid);
+                            done = Some(bytes);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(done, Some(msg));
+        // Repair resent only a small fraction — not the whole message again.
+        assert!(
+            resent < total / 2,
+            "repair resent {resent} of {total} fragments; expected only the lost few"
+        );
     }
 }

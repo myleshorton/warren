@@ -19,7 +19,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 swarm = { path = "../swarm" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync"] }
 
 [[example]]
 name = "stream"

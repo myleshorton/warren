@@ -41,15 +41,18 @@
 
 mod congestion;
 mod frame;
+mod plan;
 
 use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
 
+use blob::Manifest;
 use congestion::{Congestion, Rtt};
 use crypto::{Hash, PublicKey};
 use driver::Channel;
 use frame::{Packet, Reassembler};
+use plan::Plan;
 use sync::{BlobDownload, FeedDownload, Message, SyncError};
 use thiserror::Error;
 use tokio::time::{sleep, timeout, Instant};
@@ -147,7 +150,12 @@ pub async fn download_feed<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<Vec<u8>>, TransferError> {
     let mut dl = FeedDownload::new(public_key);
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout);
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -163,12 +171,197 @@ pub async fn download_blob<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
     let mut dl = BlobDownload::new(id);
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout);
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
     }
     dl.reassemble().ok_or(TransferError::Incomplete)
+}
+
+/// One provider's result for a round of chunk fetches.
+struct ChunkOutcome {
+    /// Chunks fetched and verified this round.
+    fetched: Vec<(Hash, Vec<u8>)>,
+    /// Whether the provider is still usable; a channel error or timeout retires it.
+    alive: bool,
+}
+
+/// The per-channel session state a swarm carries across rounds: the next
+/// outbound message id and the inbound accepted-watermark. Recreating a `Wire`
+/// each round (a fresh [`frame::Reassembler`]) would reset both — replaying ids
+/// the server drops as stale, and losing straggler protection on the response
+/// side — so the driver threads a `Cursor` through each provider's fetches.
+#[derive(Default, Clone, Copy)]
+struct Cursor {
+    next_id: u64,
+    accepted: Option<u64>,
+}
+
+/// A provider in a swarm download: its channel plus the session `Cursor` carried
+/// across rounds.
+struct Provider {
+    channel: Channel,
+    cursor: Cursor,
+}
+
+/// Download and verify a blob by fetching its chunks from **several** providers
+/// concurrently. A chunk is content-addressed, so any provider holding it is
+/// interchangeable and each is verified by its hash — a provider can neither
+/// corrupt the blob nor be trusted beyond the bytes it proves.
+///
+/// The manifest is fetched by trying the providers in turn, taking the first
+/// that serves it (a slow or dead first provider delays this — racing them for
+/// the manifest is future work). Then the still-missing chunks are partitioned
+/// across the live providers and fetched in concurrent rounds. A chunk a provider
+/// was assigned but didn't return is re-partitioned to others, and a provider
+/// that stops responding (a channel error or a timeout) is retired. Returns
+/// [`TransferError::Incomplete`] if the survivors can't supply the rest.
+///
+/// v1 is round-based: a slow (but alive) provider can hold up its round — work
+/// isn't stolen mid-round yet — and chunks are chosen in manifest order
+/// (streaming-friendly), not rarest-first.
+pub async fn download_blob_swarm(
+    channels: Vec<Channel>,
+    id: Hash,
+    cfg: &Config,
+) -> Result<Vec<u8>, TransferError> {
+    let providers: Vec<Provider> = channels
+        .into_iter()
+        .map(|channel| Provider {
+            channel,
+            cursor: Cursor::default(),
+        })
+        .collect();
+
+    // The manifest comes from the first provider that can serve it. A provider
+    // that doesn't respond (a timeout or I/O error) is retired here rather than
+    // carried into the fetch rounds only to time out all over again.
+    let mut manifest = None;
+    let mut live = Vec::with_capacity(providers.len());
+    let mut rest = providers.into_iter();
+    for mut provider in rest.by_ref() {
+        match fetch_manifest(&mut provider.channel, id, cfg, &mut provider.cursor).await {
+            Ok(m) => {
+                manifest = Some(m);
+                live.push(provider);
+                break;
+            }
+            // A non-response retires the provider; a provider that answered but
+            // couldn't serve the manifest is kept (it may still have chunks).
+            Err(TransferError::Timeout) | Err(TransferError::Io(_)) => {}
+            Err(_) => live.push(provider),
+        }
+    }
+    live.extend(rest); // providers we never had to try
+    let mut providers = live;
+    let mut plan = Plan::new(manifest.ok_or(TransferError::Incomplete)?);
+
+    // Fetch chunks in rounds until complete, out of providers, or stuck.
+    while !plan.is_complete() && !providers.is_empty() && plan.pending() > 0 {
+        let share = plan.pending().div_ceil(providers.len());
+        let mut taken = Vec::new();
+        let mut fetches = tokio::task::JoinSet::new();
+        for mut provider in std::mem::take(&mut providers) {
+            let assignment = plan.take(share);
+            if assignment.is_empty() {
+                providers.push(provider); // more providers than chunks: idle this round, keep it
+                continue;
+            }
+            taken.extend(assignment.iter().copied());
+            let cfg = *cfg;
+            fetches.spawn(async move {
+                let outcome = download_chunks(
+                    &mut provider.channel,
+                    &assignment,
+                    &cfg,
+                    &mut provider.cursor,
+                )
+                .await;
+                (provider, outcome)
+            });
+        }
+
+        let mut progressed = false;
+        while let Some(joined) = fetches.join_next().await {
+            // A task that panicked or was cancelled yields a JoinError; its
+            // chunks simply stay unfetched (requeued below) rather than crashing
+            // the whole download.
+            if let Ok((provider, outcome)) = joined {
+                for (hash, data) in outcome.fetched {
+                    progressed |= plan.store(hash, data);
+                }
+                if outcome.alive {
+                    providers.push(provider); // survives to the next round
+                }
+            }
+        }
+        // Re-pend everything handed out this round that didn't arrive (requeue
+        // skips chunks already stored) — robust even if a fetch task was lost.
+        plan.requeue(taken);
+        if !progressed {
+            break; // no live provider could supply any remaining chunk
+        }
+    }
+
+    plan.reassemble().ok_or(TransferError::Incomplete)
+}
+
+/// Fetch and verify a blob's manifest from one provider, advancing its `cursor`.
+async fn fetch_manifest<L: Link>(
+    channel: &mut L,
+    id: Hash,
+    cfg: &Config,
+    cursor: &mut Cursor,
+) -> Result<Manifest, TransferError> {
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *cursor);
+    let result = match exchange(&mut wire, &Message::GetManifest { id }, cfg).await {
+        Ok(Message::Manifest(manifest)) if manifest.id() == id => Ok(manifest),
+        Ok(Message::Manifest(_)) => Err(TransferError::Sync(SyncError::BadManifest)),
+        Ok(_) => Err(TransferError::Sync(SyncError::Absent)),
+        Err(e) => Err(e),
+    };
+    *cursor = wire.cursor();
+    result
+}
+
+/// Fetch the listed chunks from one provider over a single session, verifying
+/// each by its hash. A chunk the provider lacks or sends wrong is skipped — left
+/// for another provider — and a provider that stops responding (a channel error
+/// or a timeout) is retired (`alive = false`). Advances the `cursor` so the next
+/// round on this channel keeps ids monotonic and preserves the straggler
+/// watermark.
+async fn download_chunks<L: Link>(
+    channel: &mut L,
+    wanted: &[Hash],
+    cfg: &Config,
+    cursor: &mut Cursor,
+) -> ChunkOutcome {
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *cursor);
+    let mut fetched = Vec::new();
+    let mut alive = true;
+    for &hash in wanted {
+        match exchange(&mut wire, &Message::GetChunk { hash }, cfg).await {
+            Ok(Message::Chunk { data }) if crypto::hash(&data) == hash => {
+                fetched.push((hash, data));
+            }
+            // Absent, a mismatched chunk, or an unexpected message: this provider
+            // didn't give us this chunk (perhaps a straggler) — try another.
+            Ok(_) => {}
+            // The channel timed out or broke: stop and retire this provider.
+            Err(_) => {
+                alive = false;
+                break;
+            }
+        }
+    }
+    *cursor = wire.cursor();
+    ChunkOutcome { fetched, alive }
 }
 
 /// Serve feed sync requests on `channel` from a local [`feed::Log`] until the
@@ -267,7 +460,12 @@ async fn serve<L: Link>(
         cfg.initial_rtt,
         cfg.request_timeout
     );
-    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout);
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
     // Idle is measured from the last *valid* activity, so a peer can't hold the
     // session open by sending undecodable junk.
     let mut deadline = Instant::now() + cfg.idle;
@@ -370,16 +568,28 @@ struct Wire<'a, L: Link> {
 
 impl<'a, L: Link> Wire<'a, L> {
     /// `max_rtt` caps the pacing RTT (the caller passes `request_timeout`) so a
-    /// pacing pause can't be mistaken for a stall.
-    fn new(link: &'a L, initial_rtt: Duration, max_rtt: Duration) -> Self {
+    /// pacing pause can't be mistaken for a stall. `cursor` seeds the session
+    /// state: a fresh session starts at `Cursor::default()`, but a swarm reuses
+    /// one channel across several `Wire`s (a round per provider) and threads a
+    /// `Cursor` so the outbound ids stay monotonic (or the server drops a reset
+    /// id as a stale duplicate) and the inbound straggler watermark survives.
+    fn new(link: &'a L, initial_rtt: Duration, max_rtt: Duration, cursor: Cursor) -> Self {
         Self {
             link,
-            next_id: 0,
-            inbound: Reassembler::new(),
+            next_id: cursor.next_id,
+            inbound: Reassembler::resume(cursor.accepted),
             buf: vec![0u8; MAX_DATAGRAM],
             last_sent: None,
             cong: Congestion::new(),
             rtt: Rtt::new(initial_rtt, max_rtt),
+        }
+    }
+
+    /// Export the session state to carry into the next `Wire` on this channel.
+    fn cursor(&self) -> Cursor {
+        Cursor {
+            next_id: self.next_id,
+            accepted: self.inbound.accepted(),
         }
     }
 

@@ -227,9 +227,20 @@ struct Partial {
 }
 
 impl Reassembler {
-    /// A reassembler with nothing in progress.
-    pub fn new() -> Self {
-        Self::default()
+    /// Resume with a prior accepted watermark. A caller that recreates the
+    /// reassembler across sessions on the same channel (e.g. a swarm round)
+    /// passes the previous [`Reassembler::accepted`] value, so stragglers of
+    /// already-accepted messages keep being dropped rather than reassembled anew.
+    pub fn resume(accepted: Option<u64>) -> Self {
+        Self {
+            accepted,
+            ..Self::default()
+        }
+    }
+
+    /// The current accepted watermark, to carry into a resumed reassembler.
+    pub fn accepted(&self) -> Option<u64> {
+        self.accepted
     }
 
     /// Feed a decoded `Data` fragment. Returns `Some((id, payload))` when it
@@ -370,7 +381,7 @@ mod tests {
     /// each completed message (as the Wire does after a successful decode) and
     /// returning the last one completed.
     fn reassemble(frags: &[Vec<u8>]) -> Option<Vec<u8>> {
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         let mut done = None;
         for f in frags {
             if let Some((id, msg)) = r.push(f) {
@@ -435,7 +446,7 @@ mod tests {
         let frags: Vec<Vec<u8>> = fragment(5, &payload, DGRAM).collect();
         assert!(frags.len() > 2);
         // Withhold the last fragment: never completes.
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         for f in &frags[..frags.len() - 1] {
             assert_eq!(r.push(f), None);
         }
@@ -450,7 +461,7 @@ mod tests {
         let n = frags.len();
         assert!(n >= 4, "need several fragments for a meaningful gap");
 
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         // Deliver all but indices 1 and 3.
         for (i, f) in frags.iter().enumerate() {
             if i != 1 && i != 3 {
@@ -475,7 +486,7 @@ mod tests {
         let new: Vec<u8> = vec![0xBB; 5_000];
         let old_frags: Vec<Vec<u8>> = fragment(10, &old, DGRAM).collect();
         let new_frags: Vec<Vec<u8>> = fragment(11, &new, DGRAM).collect();
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         // A partial old message...
         for f in &old_frags[..old_frags.len() - 1] {
             assert_eq!(r.push(f), None);
@@ -496,7 +507,7 @@ mod tests {
         let new: Vec<u8> = vec![0xBB; 3_000];
         let old_frags: Vec<Vec<u8>> = fragment(20, &old, DGRAM).collect();
         let new_frags: Vec<Vec<u8>> = fragment(21, &new, DGRAM).collect();
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         // Complete and accept the new message first.
         let mut done = None;
         for f in &new_frags {
@@ -518,7 +529,7 @@ mod tests {
         // completes on its own but the caller can't decode it, so it's never
         // accepted. A later, lower-id legitimate message must still get through —
         // the watermark advances only on accept, so the bogus id can't wedge it.
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         let junk = data_datagram(u64::MAX, 0, 1, b"not a decodable message");
         let (jid, _) = r.push(&junk).expect("a one-fragment message completes");
         assert_eq!(jid, u64::MAX);
@@ -539,7 +550,7 @@ mod tests {
 
     #[test]
     fn push_data_rejects_abusive_framing() {
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         assert_eq!(r.push_data(1, 0, 0, b"x".to_vec()), None); // count == 0
         assert_eq!(r.push_data(1, 3, 2, b"x".to_vec()), None); // index past count
         assert_eq!(r.push_data(1, 0, MAX_FRAGMENTS + 1, b"x".to_vec()), None); // count past cap
@@ -549,7 +560,7 @@ mod tests {
     fn a_message_past_the_size_cap_never_completes() {
         // Two fragments whose payloads together exceed MAX_MESSAGE: the second is
         // refused, so the message never completes and the buffer stays bounded.
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         assert_eq!(r.push_data(1, 0, 2, vec![0u8; MAX_MESSAGE]), None); // fits the cap alone
         assert_eq!(r.push_data(1, 1, 2, b"one byte too many".to_vec()), None); // over the cap
     }
@@ -600,7 +611,7 @@ mod tests {
     #[test]
     fn push_never_panics_on_arbitrary_bytes() {
         // A crude fuzz: hostile datagrams must be dropped, never panic.
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         for seed in 0..2_000u32 {
             let len = (seed % 37) as usize;
             let bytes: Vec<u8> = (0..len)
@@ -647,7 +658,7 @@ mod tests {
         // Drop a scattered handful on the first delivery, and one NACK-repair
         // datagram too (so a fragment needs re-repairing).
         let mut link = Lossy::new(&[2, 5, 9, 14, 19, total]); // `total` = first repair pkt
-        let mut r = Reassembler::new();
+        let mut r = Reassembler::default();
         let mut resent = 0;
 
         // First pass: send every fragment.

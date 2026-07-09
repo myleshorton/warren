@@ -89,6 +89,8 @@ crates/
             BlobDownload (manifest + chunks, verified by content hash), with
             serve_feed/serve_blob answering from a local Log/Store. Pure
             request/response messages — the driver pumps them over a channel.
+            GetHave/Have lets a provider advertise, as a bitfield over the
+            manifest, which chunks it holds (for holdings-aware swarming).
   transfer  runs sync over any Link (driver::Channel, or a test's lossy link):
             download_feed/download_blob (client) and serve_feed/serve_blob
             (server). A message larger than a datagram (a chunk, a block with its
@@ -102,14 +104,18 @@ crates/
             measured RTT, so a large message goes out at a path-appropriate rate
             instead of one blast. And download_blob_swarm fetches a blob's chunks
             from several providers at once — verified by hash, so any source is
-            interchangeable — re-partitioning a dropped provider's chunks to the
-            rest. The seam where the data layer finally rides the transport over a
-            real (and now multi-peer) connection.
+            interchangeable. It is holdings-aware: each provider advertises (via
+            GetHave) which chunks it has, so partial seeders — no one holding the
+            whole blob — collectively assemble it, and chunks are scheduled
+            rarest-first (scarcest data pulled while its few holders are around).
+            A dropped provider's chunks are re-assigned to the rest. The seam where
+            the data layer finally rides the transport over a real, multi-peer
+            connection.
 
-  next: holdings-aware swarming (providers advertise which chunks they have, so
-        partial seeders — no one holding the whole blob — assemble it; today's
-        round-based version assumes full seeders and can't work-steal mid-round),
-        rarest-first, port mapping, an incremental Merkle accumulator for feed, ...
+  next: work-stealing within a round (a slow provider can still hold up its
+        round), a deadline-aware selection policy for streaming (rarest-first is
+        the wrong order for playback), port mapping, an incremental Merkle
+        accumulator for feed, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

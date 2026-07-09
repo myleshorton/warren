@@ -37,6 +37,18 @@ fn full_store(data: &[u8]) -> blob::Store {
     store
 }
 
+/// A partial seeder: the manifest (so it can report holdings and serve the
+/// manifest) plus only the chunks at `indices`.
+fn partial_store(data: &[u8], indices: &[usize]) -> blob::Store {
+    let (manifest, chunks) = blob::split(data);
+    let mut store = blob::Store::new();
+    store.put(manifest.encode());
+    for &i in indices {
+        store.put(chunks[i].clone());
+    }
+    store
+}
+
 #[tokio::test]
 async fn swarm_downloads_from_several_full_providers() {
     // A blob of several chunks, held in full by three providers. The client
@@ -94,5 +106,36 @@ async fn swarm_completes_despite_a_dead_provider() {
     .await
     .expect("swarm should finish")
     .expect("swarm should verify");
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn swarm_assembles_from_partial_seeders() {
+    // Six distinct chunks (each a constant byte = its index). No provider holds
+    // all six, but their holdings union to the whole blob, so the swarm assembles
+    // it from partial seeders — the point of holdings-aware, rarest-first
+    // scheduling.
+    let data: Vec<u8> = (0..blob::CHUNK_SIZE * 6)
+        .map(|i| (i / blob::CHUNK_SIZE) as u8)
+        .collect();
+    let id = blob::split(&data).0.id();
+
+    // A: {0,1,2}  B: {2,3}  C: {3,4,5}  — union is every chunk, none is complete.
+    let holdings: [&[usize]; 3] = [&[0, 1, 2], &[2, 3], &[3, 4, 5]];
+    let mut clients = Vec::new();
+    let mut servers = Vec::new();
+    for indices in holdings {
+        let (client, mut server) = connected_pair().await;
+        clients.push(client);
+        let store = partial_store(&data, indices);
+        servers.push(tokio::spawn(async move {
+            let _ = serve_blob(&mut server, &store, &Config::default()).await;
+        }));
+    }
+
+    let got = timeout(T, download_blob_swarm(clients, id, &Config::default()))
+        .await
+        .expect("swarm should finish")
+        .expect("partial seeders should collectively assemble the blob");
     assert_eq!(got, data);
 }

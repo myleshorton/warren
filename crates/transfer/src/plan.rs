@@ -12,7 +12,7 @@
 //! tracks progress, so the assignment/re-assignment logic is unit-tested on its
 //! own.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 
 use blob::{Manifest, Store};
 use crypto::Hash;
@@ -21,8 +21,9 @@ use crypto::Hash;
 /// and reassembles the blob once every chunk has arrived and verified.
 pub struct Plan {
     manifest: Manifest,
-    /// Distinct chunk hashes not yet handed to a provider, in first-seen order.
-    pending: VecDeque<Hash>,
+    /// Distinct chunk hashes not yet handed to a provider. A set, not a queue:
+    /// assignment order is decided per round by rarity, not first-seen.
+    pending: HashSet<Hash>,
     /// The distinct chunks the blob is made of — for membership (a provider can't
     /// slip us a chunk that isn't part of this blob) and for completion.
     wanted: HashSet<Hash>,
@@ -36,13 +37,7 @@ impl Plan {
     /// but a fresh plan starts with an empty store, so every distinct chunk is
     /// pending.
     pub fn new(manifest: Manifest) -> Self {
-        let mut seen = HashSet::new();
-        let pending = manifest
-            .chunks
-            .iter()
-            .filter(|h| seen.insert(**h))
-            .copied()
-            .collect();
+        let pending = manifest.chunks.iter().copied().collect();
         let wanted = manifest.chunks.iter().copied().collect();
         Self {
             manifest,
@@ -52,11 +47,39 @@ impl Plan {
         }
     }
 
-    /// Take up to `n` chunks to assign to one provider, removing them from the
-    /// pending queue. Fewer than `n` (or none) when little/nothing is left.
-    pub fn take(&mut self, n: usize) -> Vec<Hash> {
-        let count = n.min(self.pending.len());
-        self.pending.drain(..count).collect()
+    /// Assign pending chunks to providers for one round, **rarest-first** and
+    /// **holdings-aware**. `havesets[i]` is the set of chunk hashes live provider
+    /// `i` holds. Chunks are ordered by how few of these providers hold them
+    /// (rarest first, so the scarcest data is pulled while its holders are still
+    /// around), and each is given to a *least-loaded* provider that actually holds
+    /// it, up to `cap` chunks per provider. A chunk no provider holds is left
+    /// pending — the swarm can't supply it this round. Assigned chunks are removed
+    /// from pending; [`Plan::requeue`] returns any that aren't delivered. The
+    /// returned assignment is indexed to match `havesets`.
+    ///
+    /// Rarest-first is the right default for a partial-seeder swarm (it avoids
+    /// piece starvation), but it is *not* ideal for streaming; keeping the choice
+    /// to this one ordering makes a future deadline-aware policy a local change.
+    pub fn assign(&mut self, havesets: &[&HashSet<Hash>], cap: usize) -> Vec<Vec<Hash>> {
+        let mut assignment = vec![Vec::new(); havesets.len()];
+        let mut load = vec![0usize; havesets.len()];
+
+        // Rarest-first; ties broken by hash so the schedule is deterministic.
+        let holders = |h: &Hash| havesets.iter().filter(|hs| hs.contains(h)).count();
+        let mut order: Vec<Hash> = self.pending.iter().copied().collect();
+        order.sort_by_key(|h| (holders(h), *h));
+
+        for hash in order {
+            let pick = (0..havesets.len())
+                .filter(|&i| load[i] < cap && havesets[i].contains(&hash))
+                .min_by_key(|&i| (load[i], i));
+            if let Some(i) = pick {
+                assignment[i].push(hash);
+                load[i] += 1;
+                self.pending.remove(&hash);
+            }
+        }
+        assignment
     }
 
     /// Fold in a chunk a provider delivered. The bytes must hash to `hash` and
@@ -80,7 +103,7 @@ impl Plan {
     pub fn requeue(&mut self, hashes: impl IntoIterator<Item = Hash>) {
         for hash in hashes {
             if self.wanted.contains(&hash) && !self.have.has(&hash) {
-                self.pending.push_back(hash);
+                self.pending.insert(hash);
             }
         }
     }
@@ -112,44 +135,137 @@ mod tests {
         (manifest, pairs)
     }
 
+    /// A haveset holding every chunk — a full seeder.
+    fn full(chunks: &[(Hash, Vec<u8>)]) -> HashSet<Hash> {
+        chunks.iter().map(|(h, _)| *h).collect()
+    }
+
+    /// A haveset holding only the chunks at `indices`.
+    fn subset(chunks: &[(Hash, Vec<u8>)], indices: &[usize]) -> HashSet<Hash> {
+        indices.iter().map(|&i| chunks[i].0).collect()
+    }
+
+    /// Deliver every chunk in `assignment[i]` that provider `i` actually holds.
+    fn deliver(plan: &mut Plan, assignment: &[Vec<Hash>], chunks: &[(Hash, Vec<u8>)]) {
+        for chunk_list in assignment {
+            for h in chunk_list {
+                let data = chunks.iter().find(|(ch, _)| ch == h).unwrap().1.clone();
+                plan.store(*h, data);
+            }
+        }
+    }
+
     #[test]
     fn assigns_all_distinct_chunks_then_completes() {
         let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         let (manifest, chunks) = blob(&data, 100);
         let mut plan = Plan::new(manifest);
+        let seeder = full(&chunks);
 
-        // Hand every chunk out (one at a time), store each: completes exactly once.
         assert!(!plan.is_complete());
-        let mut handed = 0;
         while plan.pending() > 0 {
-            for h in plan.take(1) {
-                let data = chunks.iter().find(|(ch, _)| *ch == h).unwrap().1.clone();
-                assert!(plan.store(h, data));
-                handed += 1;
-            }
+            let assignment = plan.assign(&[&seeder], 1); // one chunk per round
+            deliver(&mut plan, &assignment, &chunks);
         }
         assert!(plan.is_complete());
         assert_eq!(plan.reassemble().as_deref(), Some(&data[..]));
-        assert!(handed >= 10);
     }
 
     #[test]
-    fn requeued_chunks_are_handed_out_again() {
-        let data: Vec<u8> = (0..500u32).map(|i| i as u8).collect();
-        let (manifest, chunks) = blob(&data, 100);
+    fn never_assigns_a_provider_a_chunk_it_lacks() {
+        // Three providers with disjoint holdings that together cover the blob.
+        let data: Vec<u8> = (0..900u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100); // 9 chunks
+        let a = subset(&chunks, &[0, 1, 2]);
+        let b = subset(&chunks, &[3, 4, 5]);
+        let c = subset(&chunks, &[6, 7, 8]);
         let mut plan = Plan::new(manifest);
 
-        // Provider A takes everything but delivers nothing (dead); requeue it all.
-        let assigned = plan.take(usize::MAX);
+        let assignment = plan.assign(&[&a, &b, &c], usize::MAX);
+        for (i, held) in [&a, &b, &c].iter().enumerate() {
+            for h in &assignment[i] {
+                assert!(
+                    held.contains(h),
+                    "provider {i} was assigned a chunk it lacks"
+                );
+            }
+        }
+        // Between them the three cover everything, so one round assigns it all.
         assert_eq!(plan.pending(), 0);
-        plan.requeue(assigned);
+        deliver(&mut plan, &assignment, &chunks);
+        assert!(plan.is_complete());
+    }
+
+    #[test]
+    fn assigns_the_rarest_chunk_to_its_only_holder() {
+        // Every provider holds chunks 0..3; only provider 2 also holds chunk 3.
+        let data: Vec<u8> = (0..400u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100); // 4 chunks
+        let rare = chunks[3].0;
+        let common = subset(&chunks, &[0, 1, 2]);
+        let a = common.clone();
+        let b = common.clone();
+        let c = full(&chunks); // holds the rare chunk too
+        let mut plan = Plan::new(manifest);
+
+        // Cap 1: each provider gets exactly one chunk this round. The rarest
+        // (chunk 3, held only by provider 2) must be the one provider 2 gets.
+        let assignment = plan.assign(&[&a, &b, &c], 1);
+        assert_eq!(
+            assignment[2],
+            vec![rare],
+            "the sole holder must get the rare chunk"
+        );
+    }
+
+    #[test]
+    fn a_chunk_no_one_holds_stays_pending() {
+        let data: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100); // 3 chunks
+                                                   // Providers hold chunks 0 and 1 but nobody holds chunk 2.
+        let a = subset(&chunks, &[0]);
+        let b = subset(&chunks, &[1]);
+        let mut plan = Plan::new(manifest);
+
+        plan.assign(&[&a, &b], usize::MAX);
+        // Chunk 2 (held by no one) is the only thing still pending.
+        assert_eq!(plan.pending(), 1);
+        assert!(plan.pending_contains(chunks[2].0));
+        assert!(!plan.is_complete());
+    }
+
+    #[test]
+    fn cap_bounds_and_balances_per_provider() {
+        // Two full seeders, four chunks, cap 1: each gets one this round, the
+        // other two stay pending for the next.
+        let data: Vec<u8> = (0..400u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100);
+        let a = full(&chunks);
+        let b = full(&chunks);
+        let mut plan = Plan::new(manifest);
+
+        let assignment = plan.assign(&[&a, &b], 1);
+        assert_eq!(assignment[0].len(), 1);
+        assert_eq!(assignment[1].len(), 1);
+        assert_eq!(plan.pending(), 2);
+    }
+
+    #[test]
+    fn requeued_chunks_are_assigned_again() {
+        let data: Vec<u8> = (0..500u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100);
+        let seeder = full(&chunks);
+        let mut plan = Plan::new(manifest);
+
+        // Provider takes everything but delivers nothing (dead); requeue it all.
+        let assignment = plan.assign(&[&seeder], usize::MAX);
+        assert_eq!(plan.pending(), 0);
+        plan.requeue(assignment.into_iter().flatten());
         assert!(plan.pending() > 0);
 
-        // Provider B now gets them and completes.
-        for h in plan.take(usize::MAX) {
-            let data = chunks.iter().find(|(ch, _)| *ch == h).unwrap().1.clone();
-            plan.store(h, data);
-        }
+        // A live seeder now gets them and completes.
+        let assignment = plan.assign(&[&seeder], usize::MAX);
+        deliver(&mut plan, &assignment, &chunks);
         assert!(plan.is_complete());
         assert_eq!(plan.reassemble().as_deref(), Some(&data[..]));
     }
@@ -158,14 +274,15 @@ mod tests {
     fn a_chunk_that_arrived_elsewhere_is_not_requeued() {
         let data: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
         let (manifest, chunks) = blob(&data, 100);
+        let seeder = full(&chunks);
         let mut plan = Plan::new(manifest);
 
-        let assigned = plan.take(usize::MAX);
+        let assignment = plan.assign(&[&seeder], usize::MAX);
         // One of the assigned chunks arrives from another provider...
         let (h0, d0) = (chunks[0].0, chunks[0].1.clone());
         assert!(plan.store(h0, d0));
         // ...so requeuing the whole assignment doesn't re-add that one.
-        plan.requeue(assigned.iter().copied());
+        plan.requeue(assignment.into_iter().flatten());
         assert!(!plan.pending_contains(h0));
     }
 
@@ -189,12 +306,12 @@ mod tests {
         // A blob of three identical chunks: the manifest lists one hash thrice,
         // so only one distinct chunk is ever pending.
         let data = vec![0x5au8; 300];
-        let (manifest, _) = blob(&data, 100);
+        let (manifest, chunks) = blob(&data, 100);
+        let seeder = full(&chunks);
         let mut plan = Plan::new(manifest);
         assert_eq!(plan.pending(), 1, "identical chunks dedup to one");
-        for h in plan.take(usize::MAX) {
-            plan.store(h, vec![0x5au8; 100]);
-        }
+        let assignment = plan.assign(&[&seeder], usize::MAX);
+        deliver(&mut plan, &assignment, &chunks);
         assert!(plan.is_complete());
         assert_eq!(plan.reassemble(), Some(data));
     }

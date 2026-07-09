@@ -185,7 +185,7 @@ async fn exchange<L: Link>(
     wire.send(request).await?;
     let mut stalls = 0;
     loop {
-        let progress_from = wire.received();
+        let progress_from = wire.stored();
         let deadline = Instant::now() + cfg.request_timeout;
         // Wait out one interval. A stray decodable packet — a request-type message
         // or a NACK, neither of which the client serves — is ignored without
@@ -210,7 +210,7 @@ async fn exchange<L: Link>(
         }
         // Count only intervals that made no progress toward the response; a
         // lossy-but-advancing transfer keeps its budget.
-        if wire.received() > progress_from {
+        if wire.stored() > progress_from {
             stalls = 0;
         } else {
             stalls += 1;
@@ -355,10 +355,10 @@ impl<'a, L: Link> Wire<'a, L> {
         Ok(())
     }
 
-    /// How many fragments of the in-progress message have arrived — lets the
-    /// driver tell whether an interval made repair progress.
-    fn received(&self) -> usize {
-        self.inbound.received()
+    /// Total fragments stored so far (monotonic) — lets the driver tell whether
+    /// an interval made repair progress, even across a message-id switch.
+    fn stored(&self) -> usize {
+        self.inbound.stored()
     }
 
     /// The fragments still missing from the in-progress message, if any.

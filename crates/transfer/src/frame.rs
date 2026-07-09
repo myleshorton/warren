@@ -96,13 +96,15 @@ impl Packet {
             TAG_NACK => {
                 let id = dec.uint().ok()?;
                 let k = dec.uint().ok()?;
-                if k > MAX_FRAGMENTS {
-                    return None; // refuse to even consider an absurd list
+                // A sender never puts more than NACK_MAX_INDICES in one NACK (it
+                // pages), so reject anything larger — this keeps parsing
+                // allocation-bounded under hostile input, well below what
+                // `remaining` bytes alone would allow (~65k u64s otherwise).
+                if k > NACK_MAX_INDICES as u64 {
+                    return None;
                 }
-                // Each index is at least one byte, so the datagram can't hold more
-                // than `remaining` of them. Cap the pre-allocation to that rather
-                // than trust `k`, so a tiny datagram claiming a huge `k` can't
-                // force a large allocation (it'll just fail on the short read).
+                // Belt and suspenders: also cap by remaining bytes, since each
+                // index is at least one byte.
                 let cap = (k as usize).min(dec.remaining());
                 let mut indices = Vec::with_capacity(cap);
                 for _ in 0..k {
@@ -210,6 +212,11 @@ pub struct Reassembler {
     /// its own but is dropped by the caller's decode, so it must not be able to
     /// poison this watermark and wedge every later legitimate message.
     accepted: Option<u64>,
+    /// Total distinct fragments ever stored, over this reassembler's whole life.
+    /// Monotonic — it doesn't reset when the current message is superseded — so
+    /// the driver can use it as a progress signal that survives an id switch
+    /// (where the in-progress fragment count would otherwise drop).
+    stored: usize,
 }
 
 /// A message being reassembled: the fragments seen so far, keyed by index.
@@ -274,26 +281,30 @@ impl Reassembler {
         }
 
         let partial = self.current.as_mut().expect("just set");
-        if !partial.frags.contains_key(&index) {
+        let is_new = !partial.frags.contains_key(&index);
+        if is_new {
             if partial.bytes + payload.len() > MAX_MESSAGE {
                 return None; // would exceed the reassembly cap: refuse to buffer
             }
             partial.bytes += payload.len();
             partial.frags.insert(index, payload.to_vec());
         }
-
-        // Complete once every index in [0, count) is present. `frags` holds
+        // Complete once every index in [0, count) is present: `frags` holds
         // `count` distinct in-range indices exactly when the message is whole.
+        let complete = partial.frags.len() == partial.count;
+
+        if is_new {
+            self.stored += 1; // a fresh fragment landed: real progress
+        }
         // The watermark is *not* advanced here — only when the caller accepts the
         // decoded payload — so a bogus id can't wedge later messages.
-        if partial.frags.len() == partial.count {
+        if complete {
+            let partial = self.current.take().expect("present");
             let mut out = Vec::with_capacity(partial.bytes);
             for i in 0..partial.count {
                 out.extend_from_slice(&partial.frags[&i]);
             }
-            let id = partial.id;
-            self.current = None;
-            return Some((id, out));
+            return Some((partial.id, out));
         }
         None
     }
@@ -314,10 +325,12 @@ impl Reassembler {
         }
     }
 
-    /// How many fragments of the message in progress have arrived (0 if none is).
-    /// Lets the driver tell whether an interval made repair progress.
-    pub fn received(&self) -> usize {
-        self.current.as_ref().map_or(0, |p| p.frags.len())
+    /// Total distinct fragments stored over this reassembler's life — monotonic,
+    /// so an interval that stored at least one new fragment shows as progress
+    /// even if the in-progress message was superseded (which resets the current
+    /// fragment count but not this).
+    pub fn stored(&self) -> usize {
+        self.stored
     }
 
     /// The fragments still missing from the message in progress, or `None` if

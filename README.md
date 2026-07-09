@@ -84,12 +84,16 @@ crates/
             serve_feed/serve_blob answering from a local Log/Store. Pure
             request/response messages — the driver pumps them over a channel.
   transfer  runs sync over a punched driver::Channel: download_feed/download_blob
-            (client) and serve_feed/serve_blob (server), framing each message as a
-            datagram with per-request retransmit + idle timeout. The seam where
-            the data layer finally rides the transport over a real connection.
+            (client) and serve_feed/serve_blob (server), with per-request
+            retransmit + idle timeout. A message larger than a datagram (a chunk,
+            a block with its proof, a manifest) is split into MTU-sized fragments
+            and reassembled on the far side — so the default 64 KiB chunk, which
+            no datagram can carry, syncs unchanged. The seam where the data layer
+            finally rides the transport over a real connection.
 
-  next: a stream transport lifting the one-message-per-datagram limit, port
-        mapping, an incremental Merkle accumulator for feed, ...
+  next: per-fragment acknowledgement (repair only lost fragments, so a large
+        transfer survives a lossy link), port mapping, an incremental Merkle
+        accumulator for feed, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

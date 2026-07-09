@@ -54,18 +54,16 @@ async fn downloads_a_feed_over_a_channel() {
 }
 
 #[tokio::test]
-async fn downloads_a_blob_over_a_channel() {
+async fn downloads_a_blob_with_default_chunks_over_a_channel() {
     let (mut client_ch, mut server_ch) = connected_pair().await;
 
-    let data: Vec<u8> = (0..40_000).map(|i| i as u8).collect();
-    // Chunk well under MAX_DATAGRAM so each Chunk message fits one datagram
-    // (the default 64 KiB chunk would not). Store the chunks and the manifest
-    // (under its own content address) so the server can serve both.
-    let (manifest, chunks) = blob::split_with(&data, 8 * 1024);
+    // Default 64 KiB chunks each exceed one datagram, so every Chunk message is
+    // fragmented across datagrams and reassembled on the far side — the case the
+    // one-message-per-datagram transport couldn't carry at all. Several chunks,
+    // to cross more than one fragment boundary.
+    let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
     let mut store = blob::Store::new();
-    for chunk in chunks {
-        store.put(chunk);
-    }
+    let manifest = store.add(&data);
     let id = store.put(manifest.encode());
 
     let _server =
@@ -75,4 +73,30 @@ async fn downloads_a_blob_over_a_channel() {
         .expect("download should finish")
         .expect("download should verify");
     assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn downloads_a_feed_with_oversize_blocks_over_a_channel() {
+    let (mut client_ch, mut server_ch) = connected_pair().await;
+
+    // Each block is larger than a datagram, so its Block message (block bytes
+    // plus inclusion proof) has to be fragmented — the feed-side counterpart to
+    // the blob test above.
+    let expected: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i; 100_000]).collect();
+    let mut log = Log::new(Keypair::from_seed(&[2u8; 32]));
+    for block in &expected {
+        log.append(block.clone());
+    }
+    let public_key = log.public_key();
+
+    let _server =
+        tokio::spawn(async move { serve_feed(&mut server_ch, &log, &Config::default()).await });
+    let blocks = timeout(
+        T,
+        download_feed(&mut client_ch, public_key, &Config::default()),
+    )
+    .await
+    .expect("download should finish")
+    .expect("download should verify");
+    assert_eq!(blocks, expected);
 }

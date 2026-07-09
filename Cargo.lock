@@ -723,6 +723,7 @@ dependencies = [
  "sync",
  "thiserror",
  "tokio",
+ "wire",
 ]
 
 [[package]]

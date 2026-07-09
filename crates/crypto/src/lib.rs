@@ -381,6 +381,22 @@ mod tests {
         assert_eq!(pk.blinded_topic(7), *hasher.finalize().as_bytes());
     }
 
+    // Pin the PSK-blinded construction too: the 32-byte hash key is
+    // `derive_key(context, psk)`, and the data hashed is `public key ‖ le(epoch)`.
+    // Interop across implementations depends on every one of these bytes.
+    #[test]
+    fn psk_blinded_topic_matches_its_documented_construction() {
+        let pk = Keypair::from_seed(&[9u8; 32]).public();
+        let key = blake3::derive_key("holepunch:blinded-topic-psk:v1", b"secret");
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(pk.as_bytes());
+        hasher.update(&7u64.to_le_bytes());
+        assert_eq!(
+            pk.blinded_topic_psk(b"secret", 7),
+            *hasher.finalize().as_bytes()
+        );
+    }
+
     #[test]
     fn psk_blinded_topic_depends_on_psk_and_differs_from_key_blinded() {
         let pk = Keypair::from_seed(&[9u8; 32]).public();

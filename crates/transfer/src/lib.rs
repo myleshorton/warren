@@ -210,7 +210,7 @@ pub async fn download_blob_swarm(
     id: Hash,
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
-    let mut providers: Vec<Provider> = channels
+    let providers: Vec<Provider> = channels
         .into_iter()
         .map(|channel| Provider {
             channel,
@@ -218,22 +218,37 @@ pub async fn download_blob_swarm(
         })
         .collect();
 
-    // The manifest comes from the first provider that can serve it.
+    // The manifest comes from the first provider that can serve it. A provider
+    // that doesn't respond (a timeout or I/O error) is retired here rather than
+    // carried into the fetch rounds only to time out all over again.
     let mut manifest = None;
-    for provider in &mut providers {
-        if let Ok(m) = fetch_manifest(&mut provider.channel, id, cfg, &mut provider.next_id).await {
-            manifest = Some(m);
-            break;
+    let mut live = Vec::with_capacity(providers.len());
+    let mut rest = providers.into_iter();
+    for mut provider in rest.by_ref() {
+        match fetch_manifest(&mut provider.channel, id, cfg, &mut provider.next_id).await {
+            Ok(m) => {
+                manifest = Some(m);
+                live.push(provider);
+                break;
+            }
+            // A non-response retires the provider; a provider that answered but
+            // couldn't serve the manifest is kept (it may still have chunks).
+            Err(TransferError::Timeout) | Err(TransferError::Io(_)) => {}
+            Err(_) => live.push(provider),
         }
     }
+    live.extend(rest); // providers we never had to try
+    let mut providers = live;
     let mut plan = Plan::new(manifest.ok_or(TransferError::Incomplete)?);
 
     // Fetch chunks in rounds until complete, out of providers, or stuck.
     while !plan.is_complete() && !providers.is_empty() && plan.pending() > 0 {
         let share = plan.pending().div_ceil(providers.len());
+        let mut taken = Vec::new();
         let mut fetches = tokio::task::JoinSet::new();
         for mut provider in std::mem::take(&mut providers) {
             let assignment = plan.take(share);
+            taken.extend(assignment.iter().copied());
             let cfg = *cfg;
             fetches.spawn(async move {
                 let outcome = download_chunks(
@@ -243,22 +258,27 @@ pub async fn download_blob_swarm(
                     &mut provider.next_id,
                 )
                 .await;
-                (provider, assignment, outcome)
+                (provider, outcome)
             });
         }
 
         let mut progressed = false;
         while let Some(joined) = fetches.join_next().await {
-            let (provider, assignment, outcome) = joined.expect("swarm fetch task panicked");
-            let delivered: HashSet<Hash> = outcome.fetched.iter().map(|(h, _)| *h).collect();
-            for (hash, data) in outcome.fetched {
-                progressed |= plan.store(hash, data);
-            }
-            plan.requeue(assignment.into_iter().filter(|h| !delivered.contains(h)));
-            if outcome.alive {
-                providers.push(provider); // survives to the next round
+            // A task that panicked or was cancelled yields a JoinError; its
+            // chunks simply stay unfetched (requeued below) rather than crashing
+            // the whole download.
+            if let Ok((provider, outcome)) = joined {
+                for (hash, data) in outcome.fetched {
+                    progressed |= plan.store(hash, data);
+                }
+                if outcome.alive {
+                    providers.push(provider); // survives to the next round
+                }
             }
         }
+        // Re-pend everything handed out this round that didn't arrive (requeue
+        // skips chunks already stored) — robust even if a fetch task was lost.
+        plan.requeue(taken);
         if !progressed {
             break; // no live provider could supply any remaining chunk
         }

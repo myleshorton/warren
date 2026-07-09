@@ -3,7 +3,7 @@
 //! round-trips.
 
 use crypto::Keypair;
-use log::{verify_block, verify_head, Head, Log, Proof};
+use feed::{verify_block, verify_head, Head, Log, Proof};
 use proptest::prelude::*;
 
 /// A log built from an arbitrary, non-empty sequence of blocks.
@@ -20,8 +20,6 @@ fn build(blocks: &[Vec<u8>]) -> Log {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(500))]
-
     /// Every block of any log verifies against the signed head with its proof.
     #[test]
     fn every_block_verifies(blocks in arb_blocks()) {

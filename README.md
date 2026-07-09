@@ -36,15 +36,15 @@ accept weaker guarantees.
 | Technique | What it proves | Where |
 |---|---|---|
 | **Unit tests** | Hand-picked cases, edge conditions, error paths | every crate |
-| **Property tests** (proptest) | Invariants hold for *all* inputs; no panics on adversarial bytes; every Merkle proof verifies and tampering always fails | `wire`, `crypto`, `log` |
+| **Property tests** (proptest) | Invariants hold for *all* inputs; no panics on adversarial bytes; every Merkle proof verifies and tampering always fails | `wire`, `crypto`, `feed` |
 | **Known-answer tests** | Bit-exact match to published spec vectors (RFC 8032, BLAKE3) | `crypto` |
 | **Deterministic sim** | Multi-node behavior under a controlled clock/network — no flakes | `swarm` |
 | **Oracle checks** | Lookup results verified against a brute-force ground truth | `swarm` |
 | **Statistical guardrails** | Probabilistic behavior (birthday punch) measured against its analytic bound; fails if constants weaken | `swarm` |
 | **Loopback integration** | Real `tokio` UDP sockets on one host: bootstrap, announce, lookup, and a one-call `connect(id)` that punches a live channel | `driver` |
 | **Real-socket punching** | Actual UDP hole punching on one host — direct, dial, and a real birthday port-collision | `puncher` |
-| **Fault injection** (planned) | Drops, reorders, corruption, partitions | `swarm`, `log` |
-| **Corpus / golden files** (planned) | Wire format stays stable across versions | `wire`, `log` |
+| **Fault injection** (planned) | Drops, reorders, corruption, partitions | `swarm`, `feed` |
+| **Corpus / golden files** (planned) | Wire format stays stable across versions | `wire`, `feed` |
 | **Live demos** (planned) | A human can watch it work (network forming, a video streaming) | binaries |
 
 ## Layout
@@ -69,11 +69,13 @@ crates/
             + reflexive discovery: both dialer and target probe a reflector to
               advertise their data socket's external address (NATed peers punchable)
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
-  log       signed append-only log: BLAKE3 Merkle tree over blocks, a signed
-            (len, root) head, and per-block inclusion proofs a peer verifies with
-            only the owner's public key — the basis for sparse random-access sync
+  feed      signed append-only log (the "log"/hypercore role): BLAKE3 Merkle tree
+            over blocks, a signed (len, root) head, and per-block inclusion proofs
+            a peer verifies with only the owner's public key — the basis for
+            sparse random-access sync. (Named `feed`, not `log`, to avoid the
+            crates.io logging-facade collision.)
 
-  next: blob (content-addressed store) + the log sync protocol (request blocks/
+  next: blob (content-addressed store) + the feed sync protocol (request blocks/
         proofs from peers over the driver), relay data path, port mapping, ...
 ```
 

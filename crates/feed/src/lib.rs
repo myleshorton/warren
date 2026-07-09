@@ -14,7 +14,7 @@
 //! on top; here we provide the verifiable primitives it exchanges.
 //!
 //! ```
-//! use log::{verify_block, verify_head, Log};
+//! use feed::{verify_block, verify_head, Log};
 //! use crypto::Keypair;
 //!
 //! let mut log = Log::new(Keypair::generate());

@@ -187,10 +187,19 @@ impl FeedDownload {
         (self.cursor < head.len).then_some(Message::GetBlock { index: self.cursor })
     }
 
-    /// Verify and fold in a response. Every response has exactly two fates:
-    /// verified progress, or a terminal [`SyncError`] that ends the session (the
-    /// caller drops the peer). Nothing is silently ignored — an ignored response
-    /// plus a re-issuing [`Self::poll_request`] would be an infinite loop.
+    /// Verify and fold in a response. Almost every response has one of two
+    /// fates: verified progress, or a terminal [`SyncError`] that ends the
+    /// session (the caller drops the peer). The lone exception is a duplicate
+    /// [`Message::Head`] once a head is already accepted — a benign no-op, since
+    /// "first head wins" and re-applying it changes nothing. (It is *not*
+    /// re-validated: doing so would let a peer abort a healthy download with a
+    /// crafted second head — see [`SyncError::BadHead`].)
+    ///
+    /// So a peer *can* avoid making progress — by repeating `Head`, or simply
+    /// being slow or silent. Telling "stalled" from "slow" needs a clock, which
+    /// a sans-IO core doesn't have: **liveness is the I/O layer's job**, bounded
+    /// by a timeout, as the driver already bounds its other operations. This
+    /// core guarantees only safety — it never accepts data that doesn't verify.
     pub fn handle_response(&mut self, response: &Message) -> Result<(), SyncError> {
         match response {
             // First head wins. Once we hold a verified head, ignore later ones so

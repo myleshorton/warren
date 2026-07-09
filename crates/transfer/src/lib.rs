@@ -30,12 +30,14 @@ use sync::{BlobDownload, FeedDownload, Message, SyncError};
 use thiserror::Error;
 use tokio::time::{timeout, Instant};
 
-/// Largest datagram exchanged — the maximum UDP payload for IPv4
-/// (65535 − 20-byte IP − 8-byte UDP headers). A single encoded [`sync::Message`]
-/// must fit within this, so a feed block or blob chunk (plus wire overhead) has
-/// to stay under it; a message that doesn't is a [`TransferError::MessageTooLarge`]
-/// rather than an opaque socket error.
-pub const MAX_DATAGRAM: usize = 65_507;
+/// Largest datagram exchanged — the maximum UDP payload that fits on **both**
+/// IPv4 and IPv6 (65535 − 40-byte IPv6 header − 8-byte UDP header; the IPv4
+/// limit of 65507 is larger). A `Channel` may be either family, so this
+/// conservative minimum means a message that passes the size check never fails
+/// with `EMSGSIZE`. A single encoded [`sync::Message`] must fit within it, so a
+/// feed block or blob chunk (plus wire overhead) has to stay under it; a message
+/// that doesn't is a [`TransferError::MessageTooLarge`], not a socket error.
+pub const MAX_DATAGRAM: usize = 65_487;
 
 /// Timing for a transfer over an unreliable channel.
 #[derive(Debug, Clone, Copy)]
@@ -136,10 +138,13 @@ async fn exchange(
             }
             match timeout(remaining, channel.recv(buf)).await {
                 Ok(Ok(n)) => {
-                    if let Ok(message) = Message::decode(&buf[..n]) {
-                        return Ok(message);
+                    // Accept only a response; a stray request (peer confusion, or
+                    // a previous session) is ignored like junk, not returned —
+                    // handing it to the sync client would abort as Unexpected.
+                    match Message::decode(&buf[..n]) {
+                        Ok(message) if !message.is_request() => return Ok(message),
+                        _ => {} // request-type or undecodable: keep waiting
                     }
-                    // Undecodable: keep waiting out this window, don't resend.
                 }
                 Ok(Err(e)) => return Err(TransferError::Io(e)),
                 Err(_) => break, // window elapsed: retransmit
@@ -167,12 +172,16 @@ async fn serve(
         }
         match timeout(remaining, channel.recv(&mut buf)).await {
             Ok(Ok(n)) => {
+                // Answer only genuine requests. A response-type message (peer
+                // confusion, or a delayed packet) is ignored — replying `Absent`
+                // to it would inject terminal traffic at the client. Only a valid
+                // request advances the idle deadline.
                 if let Ok(request) = Message::decode(&buf[..n]) {
-                    channel.send(&encode_bounded(&respond(&request))?).await?;
-                    deadline = Instant::now() + cfg.idle;
+                    if request.is_request() {
+                        channel.send(&encode_bounded(&respond(&request))?).await?;
+                        deadline = Instant::now() + cfg.idle;
+                    }
                 }
-                // Undecodable datagrams are ignored and do not extend the idle
-                // deadline.
             }
             Ok(Err(e)) => return Err(TransferError::Io(e)),
             Err(_) => return Ok(()),

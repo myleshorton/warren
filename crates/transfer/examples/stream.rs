@@ -11,10 +11,12 @@
 //!
 //! The feed's public key is the video's id and its discovery topic, but the
 //! publisher's DHT node id is *random and independent*. So the key does not
-//! double as a node id: a `connect(feed_key)` reaches no one — the demo shows it
-//! finding nothing before the topic lookup reveals the real (random-id) provider.
-//! (The lookup still returns the provider's contact; decoupling the node id is
-//! not the same as hiding the provider — that is a job for blinded topics.)
+//! double as the *publisher's* node id: the publisher never self-announces under
+//! it, so `connect(feed_key)` doesn't reach the publisher — the demo shows it
+//! finding nothing (no node here runs that id) before the topic lookup reveals
+//! the real (random-id) provider. (The lookup still returns the provider's
+//! contact; decoupling the node id is not the same as hiding the provider — that
+//! is a job for blinded topics.)
 
 use std::sync::Arc;
 use std::time::Duration;

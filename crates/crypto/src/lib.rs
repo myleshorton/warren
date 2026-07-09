@@ -48,6 +48,18 @@ pub fn hash(data: &[u8]) -> Hash {
     *blake3::hash(data).as_bytes()
 }
 
+/// Hash the concatenation of `parts` with BLAKE3, without allocating to join
+/// them. `hash_parts(&[a, b])` equals `hash(&[a, b].concat())` but streams each
+/// part into the hasher — useful for a domain tag followed by a large payload
+/// (e.g. a Merkle leaf `tag ‖ block`) where copying the payload would be waste.
+pub fn hash_parts(parts: &[&[u8]]) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    for part in parts {
+        hasher.update(part);
+    }
+    *hasher.finalize().as_bytes()
+}
+
 /// An Ed25519 signing identity (secret seed + derived public key).
 ///
 /// Cloneable but never printed: its `Debug` redacts the secret.
@@ -193,6 +205,16 @@ mod tests {
             hex::encode(kp.public().to_bytes()),
             "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
         );
+    }
+
+    // hash_parts streams the parts but must equal hashing their concatenation.
+    #[test]
+    fn hash_parts_equals_hash_of_concatenation() {
+        let a = b"warren-log-head\x00";
+        let b = vec![0x5au8; 4096];
+        assert_eq!(hash_parts(&[a, &b]), hash(&[a.as_slice(), &b].concat()));
+        assert_eq!(hash_parts(&[]), hash(b""));
+        assert_eq!(hash_parts(&[b"", b"x", b""]), hash(b"x"));
     }
 
     // BLAKE3 known answer for the empty input.

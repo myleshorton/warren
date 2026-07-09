@@ -43,7 +43,16 @@ const HEADER_BUDGET: usize = 32;
 /// Split `payload` into fragments that each fit in a `datagram`-byte packet,
 /// tagged with `msg_id` so a [`Reassembler`] can group and order them. Always
 /// returns at least one fragment (an empty payload yields a single empty one).
+///
+/// `datagram` must exceed `HEADER_BUDGET` — otherwise the header alone would
+/// fill (or overflow) a fragment and the "fits in `datagram` bytes" guarantee
+/// couldn't hold. Callers pass the crate's `FRAGMENT`, which is far larger; the
+/// assertion documents the precondition for any future caller.
 pub fn fragment(msg_id: u64, payload: &[u8], datagram: usize) -> Vec<Vec<u8>> {
+    debug_assert!(
+        datagram > HEADER_BUDGET,
+        "datagram ({datagram}) must exceed the fragment header budget ({HEADER_BUDGET})"
+    );
     let budget = datagram.saturating_sub(HEADER_BUDGET).max(1);
     let count = payload.len().div_ceil(budget).max(1);
     (0..count)
@@ -66,10 +75,14 @@ pub fn fragment(msg_id: u64, payload: &[u8], datagram: usize) -> Vec<Vec<u8>> {
 #[derive(Default)]
 pub struct Reassembler {
     current: Option<Partial>,
-    /// Highest message id already completed. Fragments at or below it are
-    /// stragglers from a message we've finished with — dropped so a late one
-    /// can't be reassembled and handed up a second time.
-    completed: Option<u64>,
+    /// Highest message id the caller has *accepted* (via [`Reassembler::accept`],
+    /// after it validated the payload). Fragments at or below it are stragglers
+    /// of a message already delivered and committed — dropped so a late one can't
+    /// be reassembled and handed up again. Advanced only on accept, never on mere
+    /// reassembly: a datagram with a bogus (huge, corrupted) id can complete on
+    /// its own but is dropped by the caller's decode, so it must not be able to
+    /// poison this watermark and wedge every later legitimate message.
+    accepted: Option<u64>,
 }
 
 /// A message being reassembled: the fragments seen so far, keyed by index.
@@ -86,12 +99,13 @@ impl Reassembler {
         Self::default()
     }
 
-    /// Feed one received datagram. Returns `Some(payload)` when it completes the
-    /// original message, or `None` while more fragments are needed. Anything
-    /// unparseable, abusive (a count or size past the caps), or stale (belonging
-    /// to a superseded message) is dropped — the transport treats such datagrams
-    /// as noise, never as a failure.
-    pub fn push(&mut self, datagram: &[u8]) -> Option<Vec<u8>> {
+    /// Feed one received datagram. Returns `Some((id, payload))` when it
+    /// completes a message — the caller decodes `payload` and, on success, calls
+    /// [`Reassembler::accept`] with `id` to commit it. Returns `None` while more
+    /// fragments are needed. Anything unparseable, abusive (a count or size past
+    /// the caps), or stale (at or below the accepted watermark) is dropped — the
+    /// transport treats such datagrams as noise, never as a failure.
+    pub fn push(&mut self, datagram: &[u8]) -> Option<(u64, Vec<u8>)> {
         let mut dec = Decoder::new(datagram);
         let id = dec.uint().ok()?;
         let index = dec.uint().ok()?;
@@ -106,8 +120,8 @@ impl Reassembler {
         let count = count as usize;
         let index = index as usize;
 
-        // Drop stragglers from a message we've already completed and handed up.
-        if let Some(done) = self.completed {
+        // Drop stragglers from a message the caller has already accepted.
+        if let Some(done) = self.accepted {
             if id <= done {
                 return None;
             }
@@ -145,16 +159,27 @@ impl Reassembler {
 
         // Complete once every index in [0, count) is present. `frags` holds
         // `count` distinct in-range indices exactly when the message is whole.
+        // The watermark is *not* advanced here — only when the caller accepts
+        // the decoded payload — so a bogus id can't wedge later messages.
         if partial.frags.len() == partial.count {
             let mut out = Vec::with_capacity(partial.bytes);
             for i in 0..partial.count {
                 out.extend_from_slice(&partial.frags[&i]);
             }
-            self.completed = Some(partial.id);
+            let id = partial.id;
             self.current = None;
-            return Some(out);
+            return Some((id, out));
         }
         None
+    }
+
+    /// Commit `id` once the caller has validated the message [`Reassembler::push`]
+    /// returned for it. Advances the watermark so stragglers and duplicates of
+    /// that message are dropped from here on. Called only after a successful
+    /// decode, so an undecodable (corrupt or hostile) reassembly leaves the
+    /// watermark untouched.
+    pub fn accept(&mut self, id: u64) {
+        self.accepted = Some(self.accepted.map_or(id, |cur| cur.max(id)));
     }
 }
 
@@ -164,13 +189,15 @@ mod tests {
 
     const DGRAM: usize = 1024;
 
-    /// Push `frags` (in the given order) through a fresh reassembler, returning
-    /// the first completed message.
+    /// Push `frags` (in the given order) through a fresh reassembler, accepting
+    /// each completed message (as the Wire does after a successful decode) and
+    /// returning the last one completed.
     fn reassemble(frags: &[Vec<u8>]) -> Option<Vec<u8>> {
         let mut r = Reassembler::new();
         let mut done = None;
         for f in frags {
-            if let Some(msg) = r.push(f) {
+            if let Some((id, msg)) = r.push(f) {
+                r.accept(id);
                 done = Some(msg);
             }
         }
@@ -235,8 +262,8 @@ mod tests {
         for f in &frags[..frags.len() - 1] {
             assert_eq!(r.push(f), None);
         }
-        // The withheld one completes it.
-        assert_eq!(r.push(frags.last().unwrap()), Some(payload));
+        // The withheld one completes it, tagged with its message id.
+        assert_eq!(r.push(frags.last().unwrap()), Some((5, payload)));
     }
 
     #[test]
@@ -253,7 +280,7 @@ mod tests {
         // ...is abandoned when the newer message arrives in full.
         let mut done = None;
         for f in &new_frags {
-            if let Some(msg) = r.push(f) {
+            if let Some((_, msg)) = r.push(f) {
                 done = Some(msg);
             }
         }
@@ -267,10 +294,11 @@ mod tests {
         let old_frags = fragment(20, &old, DGRAM);
         let new_frags = fragment(21, &new, DGRAM);
         let mut r = Reassembler::new();
-        // Complete the new message first.
+        // Complete and accept the new message first.
         let mut done = None;
         for f in &new_frags {
-            if let Some(msg) = r.push(f) {
+            if let Some((id, msg)) = r.push(f) {
+                r.accept(id);
                 done = Some(msg);
             }
         }
@@ -279,6 +307,37 @@ mod tests {
         for f in &old_frags {
             assert_eq!(r.push(f), None);
         }
+    }
+
+    #[test]
+    fn an_unaccepted_completion_does_not_wedge_later_messages() {
+        // A datagram with a bogus, huge id (corruption or a hostile peer)
+        // completes on its own but the caller can't decode it, so it's never
+        // accepted. A later, lower-id legitimate message must still get through —
+        // the watermark advances only on accept, so the bogus id can't wedge it.
+        let mut r = Reassembler::new();
+        let mut junk = Encoder::new();
+        junk.uint(u64::MAX); // absurd id
+        junk.uint(0);
+        junk.uint(1);
+        junk.raw(b"not a decodable message");
+        let (jid, _) = r
+            .push(&junk.into_vec())
+            .expect("a one-fragment message completes");
+        assert_eq!(jid, u64::MAX);
+        // The caller's decode fails, so it does NOT accept(jid).
+
+        // A normal message with a small id is still delivered.
+        let real = b"the real payload".to_vec();
+        let frags = fragment(7, &real, DGRAM);
+        let mut done = None;
+        for f in &frags {
+            if let Some((id, msg)) = r.push(f) {
+                r.accept(id);
+                done = Some(msg);
+            }
+        }
+        assert_eq!(done, Some(real));
     }
 
     #[test]

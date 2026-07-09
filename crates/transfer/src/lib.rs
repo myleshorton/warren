@@ -242,10 +242,14 @@ impl<'a> Wire<'a> {
             }
             match timeout(remaining, self.channel.recv(&mut self.buf)).await {
                 Ok(Ok(n)) => {
-                    if let Some(payload) = self.inbound.push(&self.buf[..n]) {
-                        // A reassembled but undecodable message is junk: ignore
-                        // it and keep waiting, as with a single bad datagram.
+                    if let Some((id, payload)) = self.inbound.push(&self.buf[..n]) {
+                        // Commit the id only once the payload decodes: a
+                        // reassembled but undecodable message is junk (corruption
+                        // or a hostile peer), so we ignore it and — crucially —
+                        // don't advance the watermark, or a bogus id would wedge
+                        // every later message.
                         if let Ok(message) = Message::decode(&payload) {
+                            self.inbound.accept(id);
                             return Ok(Some(message));
                         }
                     }

@@ -183,8 +183,22 @@ pub fn verify_block(
     proof: &Proof,
 ) -> bool {
     // Cheap bounds check first: an out-of-range index short-circuits before the
-    // (comparatively expensive) signature verification.
-    if index >= head.len || !verify_head(public_key, head) {
+    // (comparatively expensive) signature verification. Then verify the head
+    // signature, then the block's inclusion proof against it.
+    index < head.len
+        && verify_head(public_key, head)
+        && verify_block_proof(head, index, block, proof)
+}
+
+/// Verify a block's inclusion proof against an *already-trusted* `head` — the
+/// proof only, no head-signature check.
+///
+/// Use when the head's signature was verified separately and won't change: a
+/// sync session verifies the head once, then many blocks against it, so calling
+/// [`verify_block`] per block would redundantly re-verify the same signature.
+/// [`verify_block`] is exactly this plus the head-signature check.
+pub fn verify_block_proof(head: &Head, index: u64, block: &[u8], proof: &Proof) -> bool {
+    if index >= head.len {
         return false;
     }
     // Convert to usize rather than cast: on a 32-bit target a huge signed `len`
@@ -307,6 +321,41 @@ mod tests {
             );
         }
         assert!(log.proof(10).is_none());
+    }
+
+    #[test]
+    fn verify_block_proof_checks_inclusion_without_the_signature() {
+        let log = log_with(8);
+        let head = log.head();
+        for i in 0..log.len() {
+            let proof = log.proof(i).unwrap();
+            // Proof-only verification accepts every real block against the head.
+            assert!(verify_block_proof(
+                &head,
+                i as u64,
+                log.get(i).unwrap(),
+                &proof
+            ));
+        }
+        // It still rejects a tampered block and an out-of-range index...
+        let proof0 = log.proof(0).unwrap();
+        assert!(!verify_block_proof(&head, 0, b"tampered", &proof0));
+        assert!(!verify_block_proof(&head, 99, log.get(0).unwrap(), &proof0));
+        // ...but, unlike verify_block, does NOT check the head signature: a head
+        // with a bad signature but the real root still passes proof-only (that's
+        // the caller's responsibility to have verified once).
+        let forged = Head {
+            signature: Keypair::from_seed(&[0xAB; 32]).sign(b"nonsense"),
+            ..head.clone()
+        };
+        assert!(verify_block_proof(&forged, 0, log.get(0).unwrap(), &proof0));
+        assert!(!verify_block(
+            &log.public_key(),
+            &forged,
+            0,
+            log.get(0).unwrap(),
+            &proof0
+        ));
     }
 
     #[test]

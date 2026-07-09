@@ -37,7 +37,7 @@
 use std::collections::HashMap;
 
 use crypto::PublicKey;
-use feed::{verify_block, verify_head, Head, Proof};
+use feed::{verify_block_proof, verify_head, Head, Proof};
 use thiserror::Error;
 use wire::{Decoder, Encoder, WireError};
 
@@ -208,8 +208,11 @@ impl FeedDownload {
                 Ok(())
             }
             Message::Block { index, data, proof } => {
+                // The head's signature was verified once when it was accepted, so
+                // check only the block's inclusion proof against it here — no need
+                // to re-verify the signature for every block.
                 let head = self.head.as_ref().ok_or(SyncError::Unsolicited)?;
-                if !verify_block(&self.public_key, head, *index, data, proof) {
+                if !verify_block_proof(head, *index, data, proof) {
                     return Err(SyncError::BadBlock);
                 }
                 self.received.entry(*index).or_insert_with(|| data.clone());
@@ -296,12 +299,12 @@ mod tests {
     /// synced blocks.
     fn sync(server: &Log) -> Vec<Vec<u8>> {
         let mut dl = FeedDownload::new(server.public_key());
-        let mut steps = 0;
+        let mut steps: u64 = 0;
         while let Some(request) = dl.poll_request() {
             let response = serve_feed(&request, server);
             dl.handle_response(&response).unwrap();
             steps += 1;
-            assert!(steps < 100_000, "sync should terminate");
+            assert!(steps <= MAX_SYNC_BLOCKS + 1, "sync should terminate");
         }
         assert!(dl.is_complete());
         dl.into_blocks()

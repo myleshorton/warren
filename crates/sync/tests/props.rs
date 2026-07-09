@@ -21,13 +21,14 @@ fn build(blocks: &[Vec<u8>]) -> Log {
 
 /// Drive a download against `server` to completion (honest responses).
 fn run(dl: &mut FeedDownload, server: &Log) {
-    let mut steps = 0;
+    // A head + one request per block, bounded by the protocol's own cap.
+    let mut steps: u64 = 0;
     while let Some(request) = dl.poll_request() {
         let response = serve_feed(&request, server);
         dl.handle_response(&response)
             .expect("honest response verifies");
         steps += 1;
-        assert!(steps < 1_000_000, "sync must terminate");
+        assert!(steps <= sync::MAX_SYNC_BLOCKS + 1, "sync must terminate");
     }
 }
 

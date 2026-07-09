@@ -127,20 +127,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // blinded topic (boundary overlap). The closure recomputes the epoch from the
     // wall clock each round, so the announces follow the rotation on their own;
     // holding `_announcer` keeps the loop alive for the run.
-    let _announcer = publisher
-        .keep_announced(REANNOUNCE_INTERVAL, move || {
+    let _announcer = timeout(
+        T,
+        publisher.keep_announced(REANNOUNCE_INTERVAL, move || {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
+                .expect("system clock before 1970")
+                .as_secs();
             let e = epoch(now, EPOCH_LEN_SECS);
             vec![
                 node_id,
                 NodeId::from_bytes(feed_pk.blinded_topic(e)),
                 NodeId::from_bytes(feed_pk.blinded_topic(e + 1)),
             ]
-        })
-        .await;
+        }),
+    )
+    .await?;
     println!(
         "[publish] announced (and re-announcing every {}s): reachable as node 0x{}…, serving under blinded topics for epochs {ep} and {}",
         REANNOUNCE_INTERVAL.as_secs(),

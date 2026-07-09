@@ -39,18 +39,20 @@
 //! interleave datagrams and mis-correlate responses (which the sync layer would
 //! reject as protocol violations).
 
+mod congestion;
 mod frame;
 
 use std::collections::HashSet;
 use std::io;
 use std::time::Duration;
 
+use congestion::Congestion;
 use crypto::{Hash, PublicKey};
 use driver::Channel;
 use frame::{Packet, Reassembler};
 use sync::{BlobDownload, FeedDownload, Message, SyncError};
 use thiserror::Error;
-use tokio::time::{timeout, Instant};
+use tokio::time::{sleep, timeout, Instant};
 
 pub use frame::MAX_MESSAGE;
 
@@ -106,6 +108,10 @@ pub struct Config {
     /// How long a server waits for the next request before assuming the client
     /// is done and ending the session.
     pub idle: Duration,
+    /// How long a sender pauses between bursts when pacing a large message's
+    /// fragments (see the congestion window). Bounds the burst rate; larger
+    /// slows sending, smaller lets bursts bunch up.
+    pub pacing_gap: Duration,
 }
 
 impl Default for Config {
@@ -114,6 +120,7 @@ impl Default for Config {
             request_timeout: Duration::from_secs(2),
             retries: 4,
             idle: Duration::from_secs(10),
+            pacing_gap: Duration::from_millis(1),
         }
     }
 }
@@ -126,7 +133,7 @@ pub async fn download_feed<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<Vec<u8>>, TransferError> {
     let mut dl = FeedDownload::new(public_key);
-    let mut wire = Wire::new(channel);
+    let mut wire = Wire::new(channel, cfg.pacing_gap);
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -142,7 +149,7 @@ pub async fn download_blob<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
     let mut dl = BlobDownload::new(id);
-    let mut wire = Wire::new(channel);
+    let mut wire = Wire::new(channel, cfg.pacing_gap);
     while let Some(request) = dl.poll_request() {
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
@@ -226,21 +233,35 @@ async fn exchange<L: Link>(
 /// The server loop shared by [`serve_feed`]/[`serve_blob`]: read a request,
 /// answer it with `respond`, and honor NACKs by resending the missing fragments
 /// of that reply; return when the client goes idle.
+///
+/// It also drives the congestion window: a reply that drew a NACK is a loss
+/// signal (shrink); a reply the client never NACKed — evidenced by the client
+/// moving on to the next request — is a clean delivery (grow). So the window
+/// ramps up across a run of clean replies and backs off on loss.
 async fn serve<L: Link>(
     channel: &L,
     cfg: &Config,
     respond: impl Fn(&Message) -> Message,
 ) -> Result<(), TransferError> {
-    let mut wire = Wire::new(channel);
+    let mut wire = Wire::new(channel, cfg.pacing_gap);
     // Idle is measured from the last *valid* activity, so a peer can't hold the
     // session open by sending undecodable junk.
     let mut deadline = Instant::now() + cfg.idle;
+    // Whether the reply currently being served has already drawn a NACK, so loss
+    // is counted once per reply.
+    let mut lost = false;
     loop {
         match wire.recv(deadline).await? {
             // Answer only genuine requests. A response-type message (peer
             // confusion, or a delayed packet) is ignored — replying `Absent` to
             // it would inject terminal traffic at the client.
             Some(Recv::Message(request)) if request.is_request() => {
+                // A new request means the client accepted the previous reply: if
+                // it never NACKed, that reply was delivered cleanly — grow.
+                if wire.has_sent() && !lost {
+                    wire.on_delivered();
+                }
+                lost = false;
                 wire.send(&respond(&request)).await?;
                 deadline = Instant::now() + cfg.idle;
             }
@@ -249,9 +270,13 @@ async fn serve<L: Link>(
             // just those. Only a NACK that actually causes a resend counts as
             // activity (holds the session open) — a stale, empty, or bogus one
             // resends nothing and mustn't let a client keep the session alive by
-            // spamming NACKs.
+            // spamming NACKs. The first real NACK for a reply shrinks the window.
             Some(Recv::Nack { id, indices }) => {
                 if wire.resend(id, &indices).await? {
+                    if !lost {
+                        wire.on_loss();
+                        lost = true;
+                    }
                     deadline = Instant::now() + cfg.idle;
                 }
             }
@@ -288,17 +313,58 @@ struct Wire<'a, L: Link> {
     /// The most recently sent message (id + encoded bytes), kept so a NACK for it
     /// can be answered by resending just the requested fragments.
     last_sent: Option<(u64, Vec<u8>)>,
+    /// The send-side congestion window: how many fragments to burst before
+    /// pausing `pacing_gap`. Adapted by the server loop from NACK feedback.
+    cong: Congestion,
+    pacing_gap: Duration,
 }
 
 impl<'a, L: Link> Wire<'a, L> {
-    fn new(link: &'a L) -> Self {
+    fn new(link: &'a L, pacing_gap: Duration) -> Self {
         Self {
             link,
             next_id: 0,
             inbound: Reassembler::new(),
             buf: vec![0u8; MAX_DATAGRAM],
             last_sent: None,
+            cong: Congestion::new(),
+            pacing_gap,
         }
+    }
+
+    /// Whether any message has been sent yet (a reply is being served).
+    fn has_sent(&self) -> bool {
+        self.last_sent.is_some()
+    }
+
+    /// Grow the congestion window: the last reply was delivered without loss.
+    fn on_delivered(&mut self) {
+        self.cong.on_delivered();
+    }
+
+    /// Shrink the congestion window: the last reply drew a NACK (loss).
+    fn on_loss(&mut self) {
+        self.cong.on_loss();
+    }
+
+    /// Send `fragments` paced into bursts of the congestion window, pausing
+    /// `pacing_gap` between bursts so a large message goes out as bounded bursts
+    /// rather than one blast. A message that fits in a single window sends with
+    /// no pause at all.
+    async fn paced_send(
+        &self,
+        fragments: impl Iterator<Item = Vec<u8>>,
+    ) -> Result<(), TransferError> {
+        let window = self.cong.window();
+        for (sent, fragment) in fragments.enumerate() {
+            // Pause before each burst after the first (never before the first
+            // fragment, nor after the last).
+            if sent > 0 && sent % window == 0 {
+                sleep(self.pacing_gap).await;
+            }
+            self.link.send(&fragment).await?;
+        }
+        Ok(())
     }
 
     /// Fragment `message`, send every fragment, and remember it for repair. A
@@ -312,9 +378,8 @@ impl<'a, L: Link> Wire<'a, L> {
         }
         let id = self.next_id;
         self.next_id += 1;
-        for fragment in frame::fragment(id, &bytes, FRAGMENT) {
-            self.link.send(&fragment).await?;
-        }
+        self.paced_send(frame::fragment(id, &bytes, FRAGMENT))
+            .await?;
         self.last_sent = Some((id, bytes));
         Ok(())
     }
@@ -345,9 +410,7 @@ impl<'a, L: Link> Wire<'a, L> {
                 .collect()
         };
         let resent = !to_send.is_empty();
-        for fragment in &to_send {
-            self.link.send(fragment).await?;
-        }
+        self.paced_send(to_send.into_iter()).await?;
         Ok(resent)
     }
 
@@ -501,6 +564,7 @@ mod tests {
             request_timeout: Duration::from_millis(50),
             retries: 50,
             idle: Duration::from_millis(200),
+            pacing_gap: Duration::from_millis(1),
         }
     }
 

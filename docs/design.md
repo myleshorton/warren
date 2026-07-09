@@ -188,9 +188,12 @@ and `blinded_topic_psk` (PSK-blinded) — pure, domain-separated, property-teste
 with a wire-format KAT so participants on different versions can't silently
 compute different topics; the epoch (`crypto::epoch`) and the announce/lookup
 overlap live at the I/O edge, exercised by the `stream` example and the
-end-to-end test (which includes an epoch-boundary case). Folding the per-epoch
-re-announce into an automatic loop in the driver is future work — today callers
-announce the current+next and look up the current+previous epoch explicitly.
+end-to-end test (which includes an epoch-boundary case). The driver keeps a
+provider announced across DHT churn and epoch rotation with
+`Node::keep_announced`: it re-announces a caller-supplied topic set on an
+interval until the returned handle is dropped, and because the closure recomputes
+the topics each round it follows the rotation on its own. Viewers still look up
+the current+previous epoch explicitly at fetch time.
 
 **Ephemeral / query-only clients.** A pure fetcher never joins others' routing
 tables, so it isn't enumerable *as a node*.
@@ -229,7 +232,7 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Multi-peer swarming (full seeders, round-based) | built |
 | Decoupled node id (random id + topic-based discovery) | built |
 | Blinded, rotating topics (key-blinded + PSK-blinded, epoch overlap) | built |
-| Automatic per-epoch re-announce loop in the driver | planned |
+| Automatic per-epoch re-announce loop in the driver (`Node::keep_announced`) | built |
 | Ephemeral/query-only client mode | planned |
 | Obfuscated transport, cover-DHT rendezvous | planned |
 | Holdings-aware (partial-seeder) swarming, rarest-first | planned |

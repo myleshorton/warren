@@ -19,6 +19,7 @@
 //! and the boundary are exercised.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -190,6 +191,88 @@ async fn discover_by_blinded_topic_and_stream_a_feed() {
         .expect("the publisher announced the content under its blinded topic");
 
     fetch_and_verify(&viewer, provider.id, feed_pk, &frames).await;
+}
+
+/// Poll `node.lookup(t)` until `id` appears under it, or panic after `T`. Each
+/// lookup is bounded by the time left, so a hung lookup can't outlast `T`.
+async fn wait_until_discovered(node: &Node, t: NodeId, id: NodeId) {
+    let deadline = tokio::time::Instant::now() + T;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(res) = timeout(remaining, node.lookup(t)).await {
+            if res.unwrap().iter().any(|c| c.id == id) {
+                return;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{id:?} was not discovered under {t:?} within the timeout"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// True iff `id` never appears under `t` for the whole `window`. Each lookup is
+/// bounded by the time left in the window, so a hung lookup can't outlast it.
+async fn stays_absent(node: &Node, t: NodeId, id: NodeId, window: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + window;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(res) = timeout(remaining, node.lookup(t)).await {
+            if res.unwrap().iter().any(|c| c.id == id) {
+                return false;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    true
+}
+
+#[tokio::test]
+async fn keep_announced_reannounces_across_rotation_and_stops_on_drop() {
+    // A provider keeps itself announced under the *current* epoch's blinded
+    // topic. Bumping the epoch stands in for the wall clock crossing a boundary;
+    // the re-announce loop should follow it, and stop when the handle is dropped.
+    let (boot, _peers) = network(6, 0x5EED).await;
+    let bootstrap = boot.contact();
+
+    let feed_pk = Keypair::from_seed(&[7u8; 32]).public();
+    let node_id = Rng::new(0x9E1).node_id();
+    let provider = Node::bind(LO.parse().unwrap(), node_id).await.unwrap();
+    provider.add_contact(bootstrap).await.unwrap();
+    timeout(T, provider.bootstrap()).await.unwrap().unwrap();
+
+    let ep = Arc::new(AtomicU64::new(0));
+    let ep_c = ep.clone();
+    let interval = Duration::from_millis(200);
+    let announcer = timeout(
+        T,
+        provider.keep_announced(interval, move || {
+            vec![topic(&feed_pk, ep_c.load(Ordering::Relaxed))]
+        }),
+    )
+    .await
+    .expect("keep_announced initial round finishes within the deadline");
+
+    let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xF00).node_id())
+        .await
+        .unwrap();
+    viewer.add_contact(bootstrap).await.unwrap();
+    timeout(T, viewer.bootstrap()).await.unwrap().unwrap();
+
+    // Announced under the initial epoch (the awaited first round)...
+    wait_until_discovered(&viewer, topic(&feed_pk, 0), node_id).await;
+    // ...and, once the epoch rotates, the loop re-announces under the new topic.
+    ep.store(1, Ordering::Relaxed);
+    wait_until_discovered(&viewer, topic(&feed_pk, 1), node_id).await;
+    // Dropping the handle stops the loop, so a further rotation is never announced
+    // (nobody stored a record under epoch 2, and records don't appear on their own).
+    drop(announcer);
+    ep.store(2, Ordering::Relaxed);
+    assert!(
+        stays_absent(&viewer, topic(&feed_pk, 2), node_id, interval * 10).await,
+        "a dropped Announcer must stop re-announcing"
+    );
 }
 
 #[tokio::test]

@@ -55,9 +55,17 @@ proptest! {
         prop_assert!(!verify_block(&pk, &head, i as u64, &block, &proof));
     }
 
-    /// A proof from one index never verifies a block at a different index.
+    /// Block `i`'s proof, presented for a *different* index `j`, is rejected —
+    /// provided the two blocks differ. (A Merkle inclusion proof attests
+    /// membership, not a unique position: identical block bytes have identical
+    /// leaves and can legitimately cross-verify in some tree shapes, so the
+    /// honest guarantee is only for distinct-content blocks. Distinct *content*
+    /// at a wrong index is what a verifier actually relies on.)
     #[test]
-    fn proof_is_index_bound(blocks in arb_blocks(), seed in any::<u64>()) {
+    fn distinct_block_does_not_cross_verify_at_another_index(
+        blocks in arb_blocks(),
+        seed in any::<u64>(),
+    ) {
         prop_assume!(blocks.len() >= 2);
         let log = build(&blocks);
         let pk = log.public_key();
@@ -65,12 +73,8 @@ proptest! {
         let i = (seed as usize) % blocks.len();
         let j = (i + 1) % blocks.len(); // a different index
         let proof = log.proof(i).unwrap();
-        // block i's proof presented as if for index j: only accepted if the two
-        // blocks happen to be byte-identical AND the tree positions collide,
-        // which for distinct indices with these blocks won't reconstruct.
-        if blocks[i] != blocks[j] {
-            prop_assert!(!verify_block(&pk, &head, j as u64, &blocks[i], &proof));
-        }
+        prop_assume!(blocks[i] != blocks[j]);
+        prop_assert!(!verify_block(&pk, &head, j as u64, &blocks[i], &proof));
     }
 
     /// Decoding arbitrary bytes never panics.

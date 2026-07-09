@@ -70,6 +70,16 @@ pub struct Proof {
 }
 
 /// A signed, append-only log owned by a keypair.
+///
+/// # Cost
+///
+/// [`Log::append`] is O(1) (it stores the block and its leaf hash), but
+/// [`Log::root`], [`Log::head`], and [`Log::proof`] recompute Merkle roots from
+/// the leaves on each call — O(n) in the number of blocks. That is fine for
+/// moderate logs and keeps this first version simple and obviously correct; a
+/// large log that commits/serves proofs frequently would want an incremental
+/// Merkle accumulator that caches subtree roots (making `head`/`proof`
+/// O(log n)). That optimization is deferred.
 pub struct Log {
     keypair: Keypair,
     blocks: Vec<Vec<u8>>,

@@ -38,6 +38,7 @@ accept weaker guarantees.
 | **Unit tests** | Hand-picked cases, edge conditions, error paths | every crate |
 | **Property tests** (proptest) | Invariants hold for *all* inputs; no panics on adversarial bytes; every Merkle proof verifies and tampering always fails; blobs round-trip and chunks are self-verifying | `wire`, `crypto`, `feed`, `blob` |
 | **Known-answer tests** | Bit-exact match to published spec vectors (RFC 8032, BLAKE3) | `crypto` |
+| **Two-party protocol loop** | A client and server state machine driven against each other with no I/O; a malicious server never makes the client accept bad data | `sync` |
 | **Deterministic sim** | Multi-node behavior under a controlled clock/network — no flakes | `swarm` |
 | **Oracle checks** | Lookup results verified against a brute-force ground truth | `swarm` |
 | **Statistical guardrails** | Probabilistic behavior (birthday punch) measured against its analytic bound; fails if constants weaken | `swarm` |
@@ -77,10 +78,13 @@ crates/
   blob      content-addressed store for large immutable data: split into chunks
             named by their BLAKE3 hash (self-verifying, dedup), a Manifest listing
             them whose own hash is the blob's address, and a Store that reassembles
+  sync      sans-IO feed synchronization: a FeedDownload client requests the head
+            then each block, verifying every response against the feed's public
+            key; serve_feed answers from a local Log. Pure request/response
+            messages — the driver pumps them over a punched channel.
 
-  next: the sync protocol — request feed blocks/proofs and blob chunks/manifests
-        from peers over the driver, verifying each — relay data path, port
-        mapping, ...
+  next: blob sync (manifest + chunks) in the same crate; wire sync over a driver
+        channel; relay data path, port mapping, ...
 ```
 
 Try it:

@@ -64,4 +64,28 @@ proptest! {
     fn public_key_parse_never_panics(bytes: [u8; 32]) {
         let _ = PublicKey::from_bytes(&bytes);
     }
+
+    /// A blinded topic is a stable function of (key, epoch), rotates with the
+    /// epoch, and is never the cleartext key — for any key and any two distinct
+    /// epochs.
+    #[test]
+    fn blinded_topic_stable_and_rotates(seed: [u8; 32], e1: u64, e2: u64) {
+        prop_assume!(e1 != e2);
+        let pk = Keypair::from_seed(&seed).public();
+        prop_assert_eq!(pk.blinded_topic(e1), pk.blinded_topic(e1));
+        prop_assert_ne!(pk.blinded_topic(e1), pk.blinded_topic(e2));
+        prop_assert_ne!(pk.blinded_topic(e1), pk.to_bytes());
+    }
+
+    /// `epoch` is monotone non-decreasing in time and never panics (including a
+    /// zero length), and is constant within a window of `epoch_len` seconds.
+    #[test]
+    fn epoch_is_monotone_and_total(now: u64, len: u64) {
+        let e = crypto::epoch(now, len);
+        prop_assert!(crypto::epoch(now.saturating_add(1), len) >= e);
+        // Within the same window, the epoch does not change.
+        let step = len.max(1);
+        let window_start = (now / step) * step;
+        prop_assert_eq!(crypto::epoch(window_start, len), e);
+    }
 }

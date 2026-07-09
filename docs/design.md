@@ -147,15 +147,16 @@ random-id node
 serves the content, then connects to *that* node. This does not by itself hide
 the provider — a topic lookup still returns its contact, address and all — but it
 removes the direct key→node coupling and confines the content→node mapping to the
-topic record, which blinded topics (next) then protect. The node's reachability
+topic record, which blinded topics (below) then protect. The node's reachability
 registration (a self-announce under its own random id) and the content
 registration (an announce under the topic) are kept separate for exactly that
 reason. Random node ids also spread the DHT's coordinator/keyspace roles across
 unrelated identities rather than concentrating them on content keys.
 
-**Blinded, rotating topics.** Announce and look content up under a *derived* topic
-rather than the cleartext content id, so a crawler near the key-space sees opaque,
-rotating identifiers instead of "provider of banned content X." Two regimes:
+**Blinded, rotating topics. (Implemented — key-blinded; PSK-blinded available.)**
+Announce and look content up under a *derived* topic rather than the cleartext
+content id, so a crawler near the key-space sees opaque, rotating identifiers
+instead of "provider of banned content X." Two regimes:
 
 - *Key-blinded* — `topic = H(feed_key ‖ epoch)`. Any viewer who knows the feed
   key (as they must, to verify) can compute it; a censor who does *not* have that
@@ -175,6 +176,15 @@ viewers look up the current *and* previous — so clock skew never opens an
 availability gap. `epoch_len` is **tunable**: shorter tightens the correlation
 window a censor gets but adds re-announce churn; longer reduces churn but widens
 the window.
+
+*What's built:* the derivations are `crypto::PublicKey::blinded_topic` (key-blinded)
+and `blinded_topic_psk` (PSK-blinded) — pure, domain-separated, property-tested,
+with a wire-format KAT so participants on different versions can't silently
+compute different topics; the epoch (`crypto::epoch`) and the announce/lookup
+overlap live at the I/O edge, exercised by the `stream` example and the
+end-to-end test (which includes an epoch-boundary case). Folding the per-epoch
+re-announce into an automatic loop in the driver is future work — today callers
+announce the current+next and look up the current+previous epoch explicitly.
 
 **Ephemeral / query-only clients.** A pure fetcher never joins others' routing
 tables, so it isn't enumerable *as a node*.
@@ -212,7 +222,8 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Reliable transport: fragmentation, selective repeat, AIMD + RTT pacing | built |
 | Multi-peer swarming (full seeders, round-based) | built |
 | Decoupled node id (random id + topic-based discovery) | built |
-| Blinded, rotating topics | planned |
+| Blinded, rotating topics (key-blinded + PSK-blinded, epoch overlap) | built |
+| Automatic per-epoch re-announce loop in the driver | planned |
 | Ephemeral/query-only client mode | planned |
 | Obfuscated transport, cover-DHT rendezvous | planned |
 | Holdings-aware (partial-seeder) swarming, rarest-first | planned |

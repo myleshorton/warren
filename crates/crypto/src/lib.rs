@@ -9,6 +9,12 @@
 //!   be announced/looked up without granting the capability to read the data it
 //!   names — the same separation Hypercore draws between a key and its
 //!   discovery key.
+//! - **Blinded, rotating topics**: [`PublicKey::blinded_topic`] derives a
+//!   *time-rotating* topic `H(key ‖ epoch)` so a DHT crawler who does not hold
+//!   the specific key sees only opaque ids that change each [`epoch`] — it cannot
+//!   catalogue the network or keep a static blocklist. (It does *not* hide the
+//!   topic from a censor who already has the key; that is what the PSK variant,
+//!   [`PublicKey::blinded_topic_psk`], is for.)
 //!
 //! This crate is pure (no I/O) so it can be property- and known-answer-tested
 //! exhaustively.
@@ -31,6 +37,16 @@ pub type Hash = [u8; HASH_LEN];
 /// Domain separator so discovery keys can never collide with any other keyed
 /// hash we compute from a public key.
 const DISCOVERY_DOMAIN: &[u8] = b"holepunch:discovery-key:v1";
+
+/// Domain separator for key-blinded rotating topics, distinct from
+/// [`DISCOVERY_DOMAIN`] so a blinded topic can never collide with a discovery
+/// key even at the same (implicit) epoch.
+const BLINDED_TOPIC_DOMAIN: &[u8] = b"holepunch:blinded-topic:v1";
+
+/// BLAKE3 `derive_key` context for turning an arbitrary-length pre-shared key
+/// into the 32-byte key used by the PSK-blinded topic. A context string is the
+/// KDF's domain separator.
+const BLINDED_TOPIC_PSK_CONTEXT: &str = "holepunch:blinded-topic-psk:v1";
 
 /// Errors from parsing or verifying key material.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -58,6 +74,20 @@ pub fn hash_parts(parts: &[&[u8]]) -> Hash {
         hasher.update(part);
     }
     *hasher.finalize().as_bytes()
+}
+
+/// The current epoch for time-synchronized topic rotation: `⌊now / epoch_len⌋`,
+/// both in whole seconds. Participants with roughly synchronized clocks compute
+/// the *same* epoch, so a rotating topic's provider set does not fragment. The
+/// caller owns the clock (this crate is pure); `epoch_len_secs` must be non-zero
+/// and is treated as at least one second.
+///
+/// Shorter epochs tighten the correlation window a crawler gets but add
+/// re-announce churn; longer epochs do the reverse. Epoch boundaries are covered
+/// by *overlap* at the I/O layer (announce the current and next epoch, look up
+/// the current and previous), so clock skew never opens an availability gap.
+pub fn epoch(now_secs: u64, epoch_len_secs: u64) -> u64 {
+    now_secs / epoch_len_secs.max(1)
 }
 
 /// An Ed25519 signing identity (secret seed + derived public key).
@@ -148,6 +178,40 @@ impl PublicKey {
     /// public key.
     pub fn discovery_key(&self) -> Hash {
         *blake3::keyed_hash(self.as_bytes(), DISCOVERY_DOMAIN).as_bytes()
+    }
+
+    /// Derive a **key-blinded, rotating topic** for the given [`epoch`]:
+    /// `H(key ‖ epoch)`, as a keyed BLAKE3 hash with this public key as the key.
+    ///
+    /// Any viewer who knows this key (as they must, to verify the content) can
+    /// compute the same topic and so discover providers. A DHT crawler who does
+    /// *not* hold this specific key sees only an opaque id that changes every
+    /// epoch: it cannot map the topic back to the content, cannot cheaply
+    /// catalogue the network, and cannot keep a precomputed blocklist current.
+    ///
+    /// This does not hide the topic from a censor who *does* hold the key — they
+    /// recompute it just as a viewer does. For that, use [`Self::blinded_topic_psk`].
+    pub fn blinded_topic(&self, epoch: u64) -> Hash {
+        let mut hasher = blake3::Hasher::new_keyed(self.as_bytes());
+        hasher.update(BLINDED_TOPIC_DOMAIN);
+        hasher.update(&epoch.to_le_bytes());
+        *hasher.finalize().as_bytes()
+    }
+
+    /// Derive a **PSK-blinded, rotating topic** for the given [`epoch`]:
+    /// `H_psk(key ‖ epoch)`, keyed by a pre-shared key rather than the (often
+    /// public) content key. The 32-byte hash key is derived from `psk` of any
+    /// length via BLAKE3's `derive_key` KDF.
+    ///
+    /// Only holders of the PSK can compute the topic, so even a censor who knows
+    /// the content key but not the PSK is blind. The cost is distributing the
+    /// PSK out of band; use it for private channels where that is acceptable.
+    pub fn blinded_topic_psk(&self, psk: &[u8], epoch: u64) -> Hash {
+        let key = blake3::derive_key(BLINDED_TOPIC_PSK_CONTEXT, psk);
+        let mut hasher = blake3::Hasher::new_keyed(&key);
+        hasher.update(self.as_bytes());
+        hasher.update(&epoch.to_le_bytes());
+        *hasher.finalize().as_bytes()
     }
 }
 
@@ -262,6 +326,75 @@ mod tests {
         let pk = kp.public();
         assert_eq!(pk.discovery_key(), pk.discovery_key());
         assert_ne!(pk.discovery_key(), pk.to_bytes());
+    }
+
+    #[test]
+    fn epoch_is_floor_division_and_never_divides_by_zero() {
+        assert_eq!(epoch(0, 3600), 0);
+        assert_eq!(epoch(3599, 3600), 0);
+        assert_eq!(epoch(3600, 3600), 1);
+        assert_eq!(epoch(7201, 3600), 2);
+        // A zero length is a misuse; it must not panic (treated as 1s).
+        assert_eq!(epoch(42, 0), 42);
+    }
+
+    #[test]
+    fn blinded_topic_is_deterministic_rotates_and_is_opaque() {
+        let pk = Keypair::from_seed(&[9u8; 32]).public();
+        // Deterministic within an epoch — so every participant computes the same
+        // topic and the provider set does not fragment.
+        assert_eq!(pk.blinded_topic(100), pk.blinded_topic(100));
+        // Rotates: a different epoch yields an unrelated topic, so a crawler's
+        // catalogue of this epoch's topic is stale next epoch.
+        assert_ne!(pk.blinded_topic(100), pk.blinded_topic(101));
+        // Opaque: not the cleartext key, and distinct from the static discovery key.
+        assert_ne!(pk.blinded_topic(100), pk.to_bytes());
+        assert_ne!(pk.blinded_topic(100), pk.discovery_key());
+    }
+
+    #[test]
+    fn blinded_topic_is_key_specific() {
+        // Two different feeds produce different topics in the same epoch, so a
+        // topic reveals nothing about another feed and can't be found without the
+        // specific key.
+        let a = Keypair::from_seed(&[1u8; 32]).public();
+        let b = Keypair::from_seed(&[2u8; 32]).public();
+        assert_ne!(a.blinded_topic(100), b.blinded_topic(100));
+    }
+
+    // Pin the wire construction (domain tag ‖ little-endian epoch, keyed by the
+    // public key). If the format ever changes, participants on different versions
+    // would compute different topics and silently fail to rendezvous — this KAT
+    // turns that into a test failure.
+    #[test]
+    fn blinded_topic_matches_its_documented_construction() {
+        let pk = Keypair::from_seed(&[9u8; 32]).public();
+        let mut hasher = blake3::Hasher::new_keyed(pk.as_bytes());
+        hasher.update(b"holepunch:blinded-topic:v1");
+        hasher.update(&7u64.to_le_bytes());
+        assert_eq!(pk.blinded_topic(7), *hasher.finalize().as_bytes());
+    }
+
+    #[test]
+    fn psk_blinded_topic_depends_on_psk_and_differs_from_key_blinded() {
+        let pk = Keypair::from_seed(&[9u8; 32]).public();
+        // Deterministic and rotates, like the key-blinded variant.
+        assert_eq!(
+            pk.blinded_topic_psk(b"secret", 5),
+            pk.blinded_topic_psk(b"secret", 5)
+        );
+        assert_ne!(
+            pk.blinded_topic_psk(b"secret", 5),
+            pk.blinded_topic_psk(b"secret", 6)
+        );
+        // A different PSK yields a different topic — a key-holding censor without
+        // the PSK cannot derive it.
+        assert_ne!(
+            pk.blinded_topic_psk(b"secret", 5),
+            pk.blinded_topic_psk(b"other", 5)
+        );
+        // And it is not the key-blinded topic (different keying regime).
+        assert_ne!(pk.blinded_topic_psk(b"secret", 5), pk.blinded_topic(5));
     }
 
     #[test]

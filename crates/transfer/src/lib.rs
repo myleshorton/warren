@@ -178,7 +178,7 @@ pub async fn download_blob<L: Link>(
 struct ChunkOutcome {
     /// Chunks fetched and verified this round.
     fetched: Vec<(Hash, Vec<u8>)>,
-    /// Whether the channel is still usable; a broken one retires the provider.
+    /// Whether the provider is still usable; a channel error or timeout retires it.
     alive: bool,
 }
 
@@ -194,11 +194,13 @@ struct Provider {
 /// interchangeable and each is verified by its hash — a provider can neither
 /// corrupt the blob nor be trusted beyond the bytes it proves.
 ///
-/// The manifest is fetched from whichever provider answers first; then the
-/// still-missing chunks are partitioned across the live providers and fetched in
-/// concurrent rounds. A chunk a provider was assigned but didn't return is
-/// re-partitioned to others, and a provider whose channel breaks is dropped.
-/// Returns [`TransferError::Incomplete`] if the survivors can't supply the rest.
+/// The manifest is fetched by trying the providers in turn, taking the first
+/// that serves it (a slow or dead first provider delays this — racing them for
+/// the manifest is future work). Then the still-missing chunks are partitioned
+/// across the live providers and fetched in concurrent rounds. A chunk a provider
+/// was assigned but didn't return is re-partitioned to others, and a provider
+/// that stops responding (a channel error or a timeout) is retired. Returns
+/// [`TransferError::Incomplete`] if the survivors can't supply the rest.
 ///
 /// v1 is round-based: a slow (but alive) provider can hold up its round — work
 /// isn't stolen mid-round yet — and chunks are chosen in manifest order
@@ -285,8 +287,9 @@ async fn fetch_manifest<L: Link>(
 
 /// Fetch the listed chunks from one provider over a single session (so its ids
 /// stay monotonic), verifying each by its hash. A chunk the provider lacks or
-/// sends wrong is skipped — left for another provider — and only a broken
-/// channel retires the provider (`alive = false`). Advances `next_id`.
+/// sends wrong is skipped — left for another provider — and a provider that
+/// stops responding (a channel error or a timeout) is retired (`alive = false`).
+/// Advances `next_id`.
 async fn download_chunks<L: Link>(
     channel: &mut L,
     wanted: &[Hash],

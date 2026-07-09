@@ -56,7 +56,7 @@ accept weaker guarantees.
 crates/
   wire      byte-level codec (varints, length-delimited frames)    — done
   crypto    ed25519 identity, blake3 hashing, discovery keys, and
-            blinded rotating topics (H(key ‖ epoch), key- or PSK-keyed) — done
+            blinded rotating topics (per-epoch keyed-BLAKE3, key- or PSK-keyed) — done
   swarm     sans-IO Kademlia DHT + deterministic network simulator  — phase-0
             + NAT self-classification (wired into DHT ping sampling)
             + hole-punch strategy/birthday model + packet-level NAT model

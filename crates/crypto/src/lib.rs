@@ -10,11 +10,12 @@
 //!   names — the same separation Hypercore draws between a key and its
 //!   discovery key.
 //! - **Blinded, rotating topics**: [`PublicKey::blinded_topic`] derives a
-//!   *time-rotating* topic `H(key ‖ epoch)` so a DHT crawler who does not hold
-//!   the specific key sees only opaque ids that change each [`epoch`] — it cannot
-//!   catalogue the network or keep a static blocklist. (It does *not* hide the
-//!   topic from a censor who already has the key; that is what the PSK variant,
-//!   [`PublicKey::blinded_topic_psk`], is for.)
+//!   *time-rotating* topic — conceptually `H(key ‖ epoch)`, concretely a keyed
+//!   BLAKE3 hash (see the method for the exact, KAT-pinned construction) — so a
+//!   DHT crawler who does not hold the specific key sees only opaque ids that
+//!   change each [`epoch`] — it cannot catalogue the network or keep a static
+//!   blocklist. (It does *not* hide the topic from a censor who already has the
+//!   key; that is what the PSK variant, [`PublicKey::blinded_topic_psk`], is for.)
 //!
 //! This crate is pure (no I/O) so it can be property- and known-answer-tested
 //! exhaustively.
@@ -79,8 +80,8 @@ pub fn hash_parts(parts: &[&[u8]]) -> Hash {
 /// The current epoch for time-synchronized topic rotation: `⌊now / epoch_len⌋`,
 /// both in whole seconds. Participants with roughly synchronized clocks compute
 /// the *same* epoch, so a rotating topic's provider set does not fragment. The
-/// caller owns the clock (this crate is pure); `epoch_len_secs` must be non-zero
-/// and is treated as at least one second.
+/// caller owns the clock (this crate is pure). A zero `epoch_len_secs` is a
+/// misuse; rather than divide by zero it is clamped to one second.
 ///
 /// Shorter epochs tighten the correlation window a crawler gets but add
 /// re-announce churn; longer epochs do the reverse. Epoch boundaries are covered
@@ -181,7 +182,10 @@ impl PublicKey {
     }
 
     /// Derive a **key-blinded, rotating topic** for the given [`epoch`]:
-    /// `H(key ‖ epoch)`, as a keyed BLAKE3 hash with this public key as the key.
+    /// conceptually `H(key ‖ epoch)`. Concretely — and this is what the KAT pins,
+    /// so a reimplementation must match it byte for byte — a keyed BLAKE3 hash
+    /// with this public key as the key, over
+    /// `BLINDED_TOPIC_DOMAIN ‖ epoch.to_le_bytes()`.
     ///
     /// Any viewer who knows this key (as they must, to verify the content) can
     /// compute the same topic and so discover providers. A DHT crawler who does
@@ -199,9 +203,11 @@ impl PublicKey {
     }
 
     /// Derive a **PSK-blinded, rotating topic** for the given [`epoch`]:
-    /// `H_psk(key ‖ epoch)`, keyed by a pre-shared key rather than the (often
-    /// public) content key. The 32-byte hash key is derived from `psk` of any
-    /// length via BLAKE3's `derive_key` KDF.
+    /// conceptually `H_psk(key ‖ epoch)`, keyed by a pre-shared key rather than
+    /// the (often public) content key. Concretely: a keyed BLAKE3 hash whose key
+    /// is `blake3::derive_key(BLINDED_TOPIC_PSK_CONTEXT, psk)` (so a `psk` of any
+    /// length is accepted), over `key.as_bytes() ‖ epoch.to_le_bytes()`. This is
+    /// BLAKE3 throughout, not HMAC.
     ///
     /// Only holders of the PSK can compute the topic, so even a censor who knows
     /// the content key but not the PSK is blind. The cost is distributing the

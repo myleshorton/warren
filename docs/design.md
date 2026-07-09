@@ -158,14 +158,20 @@ Announce and look content up under a *derived* topic rather than the cleartext
 content id, so a crawler near the key-space sees opaque, rotating identifiers
 instead of "provider of banned content X." Two regimes:
 
-- *Key-blinded* — `topic = H(feed_key ‖ epoch)`. Any viewer who knows the feed
-  key (as they must, to verify) can compute it; a censor who does *not* have that
-  specific key sees only rotating opaque ids and cannot cheaply catalogue the
-  network or keep a pre-computed blocklist current. Free — no extra coordination.
-- *PSK-blinded* — `topic = HMAC(PSK, feed_key ‖ epoch)`. Only holders of a channel
-  pre-shared key can derive the topic, so a censor with the feed key but not the
-  PSK is blind. Stronger, at the cost of distributing the PSK out-of-band (the
-  classic bootstrapping problem); opt-in, for private channels.
+- *Key-blinded* — conceptually `topic = H(feed_key ‖ epoch)`. Any viewer who knows
+  the feed key (as they must, to verify) can compute it; a censor who does *not*
+  have that specific key sees only rotating opaque ids and cannot cheaply
+  catalogue the network or keep a pre-computed blocklist current. Free — no extra
+  coordination.
+- *PSK-blinded* — conceptually `topic = MAC(PSK, feed_key ‖ epoch)`. Only holders
+  of a channel pre-shared key can derive the topic, so a censor with the feed key
+  but not the PSK is blind. Stronger, at the cost of distributing the PSK
+  out-of-band (the classic bootstrapping problem); opt-in, for private channels.
+
+Both are **keyed BLAKE3, not HMAC**, domain-separated, with the epoch encoded
+little-endian: key-blinded keys the hash with the feed key over `domain ‖ epoch`;
+PSK-blinded keys it with `derive_key(context, PSK)` over `feed_key ‖ epoch`. The
+exact bytes are pinned by a KAT in `crypto` so independent implementations agree.
 
 Rotation is **time-synchronized**: `epoch = floor(now / epoch_len)`, so every
 participant computes the *same* topic in a given epoch — the provider set does

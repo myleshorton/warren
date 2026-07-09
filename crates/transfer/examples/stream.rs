@@ -165,9 +165,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[viewer]  computing H(feed key ‖ epoch {viewer_ep}) = 0x{}… and looking it up (+ previous epoch)...",
         short(topic(viewer_ep).as_bytes())
     );
+    // Always query both the current and previous epoch and merge — the publisher
+    // might be present under one but not the other (partial DHT replication), and
+    // `saturating_sub` keeps epoch 0 from underflowing.
     let mut providers = timeout(T, viewer.lookup(topic(viewer_ep))).await??;
-    if providers.is_empty() {
-        providers = timeout(T, viewer.lookup(topic(viewer_ep - 1))).await??;
+    for c in timeout(T, viewer.lookup(topic(viewer_ep.saturating_sub(1)))).await?? {
+        if !providers.iter().any(|p| p.id == c.id) {
+            providers.push(c);
+        }
     }
     let provider = providers
         .iter()

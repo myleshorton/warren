@@ -4,11 +4,20 @@
 //!   cargo run -p transfer --example stream
 //!
 //! A publisher writes a short "video" as a signed feed and announces it on the
-//! DHT under its key. A viewer, knowing only that key, discovers the publisher,
-//! punches a direct connection, and streams the video back — verifying every
-//! frame against the publisher's signature. The feed's public key is both the
-//! video's id and the publisher's address (as in Hypercore), so one key does
-//! both jobs.
+//! DHT under a *topic* (the feed's public key). A viewer, knowing only that key,
+//! looks the topic up to discover *who* serves it, punches a direct connection to
+//! that node, and streams the video back — verifying every frame against the
+//! publisher's signature.
+//!
+//! The feed's public key is the video's id and its discovery topic, but the
+//! publisher's DHT node id is *random and independent*. So the key does not
+//! double as the *publisher's* node id: the publisher never runs the feed key as
+//! its node id (its content announce under that topic carries a random id), so
+//! `connect(feed_key)` doesn't reach the publisher — the demo shows it finding
+//! nothing (no node here runs that id) before the topic lookup reveals the real
+//! (random-id) provider. (The lookup still returns the provider's contact;
+//! decoupling the node id is not the same as hiding the provider — that is a job
+//! for blinded topics.)
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,6 +32,11 @@ use transfer::{download_feed, serve_feed, Config};
 
 const LO: &str = "127.0.0.1:0";
 const T: Duration = Duration::from_secs(20);
+
+/// First six bytes of an id as hex, for readable logging.
+fn short(bytes: &[u8]) -> String {
+    bytes.iter().take(6).map(|b| format!("{b:02x}")).collect()
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,7 +60,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Publisher ------------------------------------------------------------
     let feed_kp = Keypair::from_seed(&[42u8; 32]);
     let feed_pk = feed_kp.public();
-    let node_id = NodeId::from_bytes(feed_pk.to_bytes());
+    // The feed key is the video id and the discovery topic. The node id is
+    // random — deliberately unrelated to the key — so the key can't be dialed as
+    // a node id; discovery goes through a topic lookup instead.
+    let topic = NodeId::from_bytes(feed_pk.to_bytes());
+    let node_id = rng.node_id();
+    // Independent by construction; assert it (as the end-to-end test does) so the
+    // demo can't silently drift from the property it illustrates.
+    assert_ne!(
+        node_id, topic,
+        "the publisher's node id is independent of the feed key"
+    );
     // Each "frame" is ~40 KiB — larger than a single UDP datagram — so streaming
     // it exercises the transport's fragmentation: every block is split across
     // many datagrams and reassembled (then verified) on the viewer's side.
@@ -65,11 +89,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let log = Arc::new(log);
 
-    let key_hex: String = feed_pk.to_bytes()[..6]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    println!("[publish] feed key 0x{key_hex}…  (this key is both the video id and the publisher's DHT address)");
+    println!(
+        "[publish] feed key  0x{}…  (the video id and the discovery topic)",
+        short(&topic.as_bytes()[..])
+    );
+    println!(
+        "[publish] node id   0x{}…  (random — unrelated to the key, so the key doesn't point here)",
+        short(&node_id.as_bytes()[..])
+    );
     println!(
         "[publish] wrote {} frames ({} KiB total, ~{} KiB each — a frame is larger than one datagram) to a signed feed",
         frames.len(),
@@ -80,10 +107,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let publisher = Node::bind(lo, node_id).await?;
     publisher.add_contact(bootstrap).await?;
     timeout(T, publisher.bootstrap()).await??;
+    // Two announces: register the node so a coordinated connect can reach it, and
+    // register the content under its topic so a viewer can discover who serves it.
     timeout(T, publisher.announce(node_id)).await??;
+    timeout(T, publisher.announce(topic)).await??;
     println!(
-        "[publish] announced on the DHT at {}",
-        publisher.local_addr()
+        "[publish] announced: reachable as node 0x{}…, serving the feed under topic 0x{}…",
+        short(&node_id.as_bytes()[..]),
+        short(&topic.as_bytes()[..])
     );
 
     // Serve one inbound viewer.
@@ -101,8 +132,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     viewer.add_contact(bootstrap).await?;
     timeout(T, viewer.bootstrap()).await??;
 
-    println!("[viewer]  discovering the publisher by key and hole-punching a connection...");
-    let conn = timeout(T, viewer.connect(node_id)).await??;
+    // Decoupling, made visible: trying to dial the feed key *as a node id* — what
+    // a censor who only scraped the key would do — finds no one, because no node
+    // runs the feed key as its id.
+    println!(
+        "[viewer]  first, dialing the feed key as if it were a node id (as a censor would)..."
+    );
+    let by_key = timeout(T, viewer.connect(topic)).await??;
+    println!(
+        "[viewer]  → {:?}: the key is not a node id; you can't dial the publisher by it",
+        by_key.outcome
+    );
+
+    // The real path: look the topic up to learn which node serves the content,
+    // then connect to that node by its (random) id and punch a channel.
+    println!("[viewer]  now looking the feed key up as a topic to discover who serves it...");
+    let providers = timeout(T, viewer.lookup(topic)).await??;
+    let provider = providers
+        .iter()
+        .find(|c| c.id == node_id)
+        .ok_or("no provider announced under the topic")?;
+    println!(
+        "[viewer]  found provider node 0x{}… — connecting and hole-punching a direct channel...",
+        short(&provider.id.as_bytes()[..])
+    );
+    let conn = timeout(T, viewer.connect(provider.id)).await??;
     let outcome = conn.outcome;
     let mut channel = conn.channel.ok_or_else(|| {
         format!("connect resolved {outcome:?} with no data channel (a Relayed outcome yields none by design)")

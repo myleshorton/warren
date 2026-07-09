@@ -37,12 +37,18 @@ property that makes everything else safe, and in particular makes **multi-peer
 swarming** possible: any peer holding a chunk is interchangeable, because trust is
 in the hash, not the source.
 
-**3. One key, two jobs.**
-A feed's public key is simultaneously *what to verify against* and *where to
-find it* — a viewer who knows only the key can both discover the publisher and
-verify every byte it sends. (This elegance has a censorship cost — the key becomes
-a locator for the publisher — which we address in the threat model by decoupling
-the DHT node id from the content key.)
+**3. One key, two jobs — but not a node id.**
+A feed's public key is simultaneously *what to verify against* and *what to look
+up* — a viewer who knows only the key can both discover who serves the content
+and verify every byte it sends. Crucially, the key is *not* the publisher's DHT
+node id: publishers run a **random** node id and advertise content under the key
+as a *topic*. The publisher does not run the feed key *as its node id*, so
+dialing it (`connect(feed_key)`) doesn't reach the publisher, and the publisher
+no longer sits in the DHT keyspace at the content key. (Discovery still works — a
+topic lookup returns a provider contact — so this decouples the *node id*, not
+the lookup itself; hardening the lookup is what blinded topics do. Earlier
+revisions coupled key and node id for elegance; the threat model below is why we
+split them.)
 
 **4. Sans-IO, adversarially-verified cores.**
 The security-critical logic — DHT routing, the sync protocol, feed/blob
@@ -118,14 +124,34 @@ SIGMETRICS 2026) shows enumeration is turnkey:
   protocol-specific payload identifies participants without joining the DHT.
 - **Targeted surveillance.** A Sybil positioned near a content id in the key-space
   observes who *announces* (serves) and who *looks up* (fetches) that content.
-- **Warren-specific exposure.** Because a feed's public key doubles as its DHT
-  node id, anyone who knows a feed key can locate its publisher's node directly.
+- **Warren-specific exposure (node-id coupling removed).** A naive design in which
+  a feed's public key *is* the publisher's DHT node id lets anyone with the key
+  reach the publisher directly (`connect(feed_key)`) and pins the publisher into
+  the keyspace *at the content key*. Warren decouples the two (see mitigations):
+  the key is no longer a node id. Note this removes the node-id coupling, not the
+  fact that a topic lookup still returns a provider's contact — that residual
+  exposure is what blinded topics harden.
 
 ### Mitigations
 
-**Decouple the DHT node id from the content key.** Publishers use a random
-(or ephemeral) node id and advertise content under a *topic*, so knowing a feed
-key no longer points at the publisher's node/IP.
+**Decouple the DHT node id from the content key. (Implemented.)** Publishers run
+a random node id and advertise content under a *topic* (the feed key). A feed key
+therefore no longer *doubles as* the publisher's node id: the publisher does not
+run the feed key as its node id (no announce record exists whose *id* is the feed
+key — the content announce under that topic carries the publisher's *random* id),
+so dialing it (`connect(feed_key)`) no longer reaches the publisher. It resolves
+`NotFound` unless some *other* node has chosen to run that id, and even then
+content is verified by hash/signature so a squatter serves nothing valid. The publisher also no longer sits in the DHT
+keyspace at the content key. A viewer instead looks the topic up to learn which
+random-id node
+serves the content, then connects to *that* node. This does not by itself hide
+the provider — a topic lookup still returns its contact, address and all — but it
+removes the direct key→node coupling and confines the content→node mapping to the
+topic record, which blinded topics (next) then protect. The node's reachability
+registration (a self-announce under its own random id) and the content
+registration (an announce under the topic) are kept separate for exactly that
+reason. Random node ids also spread the DHT's coordinator/keyspace roles across
+unrelated identities rather than concentrating them on content keys.
 
 **Blinded, rotating topics.** Announce and look content up under a *derived* topic
 rather than the cleartext content id, so a crawler near the key-space sees opaque,
@@ -185,7 +211,8 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Signed feeds, content-addressed blobs, verified sync | built |
 | Reliable transport: fragmentation, selective repeat, AIMD + RTT pacing | built |
 | Multi-peer swarming (full seeders, round-based) | built |
-| Decoupled node id / blinded rotating topics | planned (this doc) |
+| Decoupled node id (random id + topic-based discovery) | built |
+| Blinded, rotating topics | planned |
 | Ephemeral/query-only client mode | planned |
 | Obfuscated transport, cover-DHT rendezvous | planned |
 | Holdings-aware (partial-seeder) swarming, rarest-first | planned |

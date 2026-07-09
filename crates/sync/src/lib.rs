@@ -187,12 +187,16 @@ impl FeedDownload {
         (self.cursor < head.len).then_some(Message::GetBlock { index: self.cursor })
     }
 
-    /// Verify and fold in a response. Returns [`SyncError`] if the peer sent
-    /// something that doesn't check out (a bad signature, a bad proof, an
-    /// over-long feed) — the caller can then drop the peer. Unexpected messages
-    /// (e.g. a stray `Absent`) are ignored so a syncing loop makes progress.
+    /// Verify and fold in a response. Every response has exactly two fates:
+    /// verified progress, or a terminal [`SyncError`] that ends the session (the
+    /// caller drops the peer). Nothing is silently ignored — an ignored response
+    /// plus a re-issuing [`Self::poll_request`] would be an infinite loop.
     pub fn handle_response(&mut self, response: &Message) -> Result<(), SyncError> {
         match response {
+            // First head wins. Once we hold a verified head, ignore later ones so
+            // a peer can't abort the download by following a good head with a bad
+            // one; validate (and possibly reject) only the first.
+            Message::Head(_) if self.head.is_some() => Ok(()),
             Message::Head(head) => {
                 if head.len > MAX_SYNC_BLOCKS {
                     return Err(SyncError::TooLong);
@@ -200,9 +204,7 @@ impl FeedDownload {
                 if !verify_head(&self.public_key, head) {
                     return Err(SyncError::BadHead);
                 }
-                // First head wins; a later differing head from a flaky/malicious
-                // peer doesn't rewrite what we're syncing.
-                self.head.get_or_insert_with(|| head.clone());
+                self.head = Some(head.clone());
                 Ok(())
             }
             Message::Block { index, data, proof } => {
@@ -213,8 +215,12 @@ impl FeedDownload {
                 self.received.entry(*index).or_insert_with(|| data.clone());
                 Ok(())
             }
-            // Nothing actionable; keep going.
-            Message::Absent | Message::GetHead | Message::GetBlock { .. } => Ok(()),
+            // The peer can't fulfill a request we made: terminal, so the caller
+            // drops it (and can try another peer) rather than us re-requesting
+            // forever.
+            Message::Absent => Err(SyncError::Absent),
+            // A request where a response was expected: a protocol violation.
+            Message::GetHead | Message::GetBlock { .. } => Err(SyncError::Unexpected),
         }
     }
 
@@ -255,6 +261,12 @@ pub enum SyncError {
     /// A block arrived before a verified head.
     #[error("block received before head")]
     Unsolicited,
+    /// The peer reported it can't serve a requested item.
+    #[error("peer reported the item absent")]
+    Absent,
+    /// A request-type message arrived where a response was expected.
+    #[error("unexpected message from peer")]
+    Unexpected,
     /// A field was malformed or a tag unrecognized.
     #[error("malformed: {0}")]
     Malformed(&'static str),
@@ -350,6 +362,43 @@ mod tests {
         let mut dl = FeedDownload::new(server.public_key());
         let block = serve_feed(&Message::GetBlock { index: 0 }, &server);
         assert_eq!(dl.handle_response(&block), Err(SyncError::Unsolicited));
+    }
+
+    #[test]
+    fn a_later_head_cannot_abort_an_in_progress_download() {
+        let server = log_with(3, 0x39);
+        let mut dl = FeedDownload::new(server.public_key());
+        dl.handle_response(&serve_feed(&Message::GetHead, &server))
+            .unwrap();
+        // A subsequent invalid head (over-long, or wrong key) is ignored, not an
+        // error — the peer can't abort us after a good head.
+        let mut overlong = server.head();
+        overlong.len = MAX_SYNC_BLOCKS + 1;
+        assert_eq!(dl.handle_response(&Message::Head(overlong)), Ok(()));
+        // ...and the sync still completes against the first head.
+        while let Some(request) = dl.poll_request() {
+            dl.handle_response(&serve_feed(&request, &server)).unwrap();
+        }
+        assert!(dl.is_complete());
+    }
+
+    #[test]
+    fn absent_response_is_terminal() {
+        let server = log_with(2, 0x4A);
+        let mut dl = FeedDownload::new(server.public_key());
+        dl.handle_response(&serve_feed(&Message::GetHead, &server))
+            .unwrap();
+        assert_eq!(dl.handle_response(&Message::Absent), Err(SyncError::Absent));
+    }
+
+    #[test]
+    fn a_request_message_as_response_is_unexpected() {
+        let server = log_with(2, 0x5B);
+        let mut dl = FeedDownload::new(server.public_key());
+        assert_eq!(
+            dl.handle_response(&Message::GetHead),
+            Err(SyncError::Unexpected)
+        );
     }
 
     #[test]

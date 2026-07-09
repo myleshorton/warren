@@ -53,14 +53,17 @@ proptest! {
 
         let index = (seed % blocks.len() as u64) as usize;
         let mut resp = serve_feed(&Message::GetBlock { index: index as u64 }, &server);
-        if let Message::Block { data, .. } = &mut resp {
-            // Perturb the block bytes (flip a byte, or add one if empty).
-            match data.first_mut() {
-                Some(b) => *b ^= 1,
-                None => data.push(0),
-            }
-            prop_assert_eq!(dl.handle_response(&resp), Err(SyncError::BadBlock));
+        // An in-range GetBlock must yield a Block; a hard failure otherwise (so a
+        // regression in serve_feed can't make this test vacuously pass).
+        let Message::Block { data, .. } = &mut resp else {
+            return Err(TestCaseError::fail("in-range GetBlock should return a Block"));
+        };
+        // Perturb the block bytes (flip a byte, or add one if empty).
+        match data.first_mut() {
+            Some(b) => *b ^= 1,
+            None => data.push(0),
         }
+        prop_assert_eq!(dl.handle_response(&resp), Err(SyncError::BadBlock));
     }
 
     /// Decoding arbitrary bytes never panics.

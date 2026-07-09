@@ -193,12 +193,16 @@ async fn discover_by_blinded_topic_and_stream_a_feed() {
     fetch_and_verify(&viewer, provider.id, feed_pk, &frames).await;
 }
 
-/// Poll `node.lookup(t)` until `id` appears under it, or panic after `T`.
+/// Poll `node.lookup(t)` until `id` appears under it, or panic after `T`. Each
+/// lookup is bounded by the time left, so a hung lookup can't outlast `T`.
 async fn wait_until_discovered(node: &Node, t: NodeId, id: NodeId) {
     let deadline = tokio::time::Instant::now() + T;
     loop {
-        if node.lookup(t).await.unwrap().iter().any(|c| c.id == id) {
-            return;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(res) = timeout(remaining, node.lookup(t)).await {
+            if res.unwrap().iter().any(|c| c.id == id) {
+                return;
+            }
         }
         assert!(
             tokio::time::Instant::now() < deadline,
@@ -208,12 +212,16 @@ async fn wait_until_discovered(node: &Node, t: NodeId, id: NodeId) {
     }
 }
 
-/// True iff `id` never appears under `t` for the whole `window`.
+/// True iff `id` never appears under `t` for the whole `window`. Each lookup is
+/// bounded by the time left in the window, so a hung lookup can't outlast it.
 async fn stays_absent(node: &Node, t: NodeId, id: NodeId, window: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + window;
     while tokio::time::Instant::now() < deadline {
-        if node.lookup(t).await.unwrap().iter().any(|c| c.id == id) {
-            return false;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if let Ok(res) = timeout(remaining, node.lookup(t)).await {
+            if res.unwrap().iter().any(|c| c.id == id) {
+                return false;
+            }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }

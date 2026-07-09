@@ -394,12 +394,13 @@ impl Node {
     /// topic — see the `stream` example). The clock and any rotation live in the
     /// caller's closure; this method only schedules the repetition.
     ///
-    /// The initial round is awaited, so the node is announced by the time this
-    /// returns; later rounds run in the background. The initial round's errors are
-    /// best-effort (ignored). In the background loop an announce error means the
-    /// node has shut down (`announce` only fails with [`Closed`]), so the loop
-    /// exits rather than spin. A zero `interval` is a misuse and is floored to a
-    /// nonzero value (otherwise the underlying timer would panic).
+    /// The first announce round is awaited before this returns (so a healthy node
+    /// is discoverable immediately), but it is best-effort: its errors are ignored,
+    /// so if the node is already shutting down the returned `Announcer` may wrap a
+    /// loop that never successfully announces. Later rounds run in the background;
+    /// there an announce error means the node has shut down (`announce` only fails
+    /// with [`Closed`]), so the loop exits rather than spin. A zero `interval` is a
+    /// misuse and is floored to a nonzero value (otherwise the timer would panic).
     pub async fn keep_announced<F>(&self, interval: Duration, topics: F) -> Announcer
     where
         F: Fn() -> Vec<NodeId> + Send + 'static,

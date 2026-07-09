@@ -395,13 +395,19 @@ impl Node {
     /// caller's closure; this method only schedules the repetition.
     ///
     /// The initial round is awaited, so the node is announced by the time this
-    /// returns; later rounds run in the background. Per-round announce errors are
-    /// ignored (the next round retries), but if the node has shut down the loop
-    /// exits rather than spin.
+    /// returns; later rounds run in the background. The initial round's errors are
+    /// best-effort (ignored). In the background loop an announce error means the
+    /// node has shut down (`announce` only fails with [`Closed`]), so the loop
+    /// exits rather than spin. A zero `interval` is a misuse and is floored to a
+    /// nonzero value (otherwise the underlying timer would panic).
     pub async fn keep_announced<F>(&self, interval: Duration, topics: F) -> Announcer
     where
         F: Fn() -> Vec<NodeId> + Send + 'static,
     {
+        // `interval_at` panics on a zero period; flooring at 1ms prevents that
+        // without disturbing any sensible cadence (a real re-announce interval is
+        // orders of magnitude larger).
+        let interval = interval.max(Duration::from_millis(1));
         for topic in topics() {
             let _ = self.announce(topic).await;
         }

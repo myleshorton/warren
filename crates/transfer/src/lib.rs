@@ -268,10 +268,10 @@ pub async fn download_blob_swarm(
     live.extend(rest); // providers we never had to try
     let manifest = manifest.ok_or(TransferError::Incomplete)?;
 
-    // Learn each live provider's holdings, so chunks are assigned only to
-    // providers that have them (and scheduled rarest-first). A provider whose
-    // channel fails here is retired; one that can't report holdings stays with an
-    // empty set (it simply won't be assigned anything).
+    // Learn each live provider's holdings, so chunks are assigned rarest-first to
+    // providers that have them. A provider whose channel fails here is retired;
+    // one that can't report holdings (`Absent`) is kept and probed optimistically
+    // (see `fetch_haveset`).
     let mut providers = Vec::with_capacity(live.len());
     for mut provider in live {
         match fetch_haveset(

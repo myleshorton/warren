@@ -381,8 +381,8 @@ pub fn serve_blob(request: &Message, store: &blob::Store) -> Message {
         },
         // Report holdings as a bitfield over the blob's manifest. Needs the
         // manifest to enumerate chunks; without it the server can't map its stored
-        // chunks to this blob, so it answers `Absent` (a swarm client then treats
-        // it as holding nothing).
+        // chunks to this blob, so it answers `Absent` (a swarm client then probes
+        // it optimistically rather than relying on a haveset).
         Message::GetHave { id } => match store.get(id).map(Manifest::decode) {
             Some(Ok(manifest)) => {
                 let mut bits = vec![0u8; manifest.chunks.len().div_ceil(8)];

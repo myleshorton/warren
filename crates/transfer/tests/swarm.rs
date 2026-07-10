@@ -155,7 +155,7 @@ async fn swarm_assembles_from_partial_seeders() {
 async fn swarm_uses_a_provider_that_cannot_report_holdings() {
     // One provider has the manifest + chunks {0,1}; the other has chunks {2,3} but
     // no manifest, so it answers `Absent` to GetHave. The client must still probe
-    // it (optimistically) to get {2,3), which no one else has — otherwise the blob
+    // it (optimistically) to get {2,3}, which no one else has — otherwise the blob
     // would look unavailable.
     let data: Vec<u8> = (0..blob::CHUNK_SIZE * 4)
         .map(|i| (i / blob::CHUNK_SIZE) as u8)

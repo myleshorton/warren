@@ -287,8 +287,15 @@ pub async fn download_blob_swarm(
                 provider.holds = holds;
                 providers.push(provider);
             }
+            // A dead channel (timeout / I/O) retires the provider.
             Err(TransferError::Timeout) | Err(TransferError::Io(_)) => {}
-            Err(_) => providers.push(provider),
+            // Any other failure to learn holdings (a protocol/decoding error):
+            // keep the provider, but as Unknown so it's still probed as a last
+            // resort rather than left with an empty haveset it'd never be assigned.
+            Err(_) => {
+                provider.holds = Holdings::Unknown;
+                providers.push(provider);
+            }
         }
     }
     let mut plan = Plan::new(manifest);

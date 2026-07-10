@@ -87,7 +87,7 @@ impl Plan {
     /// Chunks are ordered by how few *known* holders they have (rarest first, so
     /// the scarcest data is pulled while its holders are still around) and each is
     /// given to a *least-loaded* provider that can serve it, up to `cap` chunks
-    /// per provider. A known holder is always preferred over an [`Holdings::Unknown`]
+    /// per provider. A known holder is always preferred over a [`Holdings::Unknown`]
     /// provider, so the last copy of a chunk is never wasted on a speculative
     /// source while a known holder is idle. A chunk no one can serve is left
     /// pending. Assigned chunks are removed from pending; [`Plan::requeue`]
@@ -185,7 +185,9 @@ mod tests {
         Holdings::Known(indices.iter().map(|&i| chunks[i].0).collect())
     }
 
-    /// Deliver every chunk in `assignment[i]` that provider `i` actually holds.
+    /// Store every assigned chunk (looking its bytes up in `chunks`), simulating
+    /// each provider delivering its whole assignment. Relies on `assign` having
+    /// handed out only chunks a provider can serve.
     fn deliver(plan: &mut Plan, assignment: &[Vec<Hash>], chunks: &[(Hash, Vec<u8>)]) {
         for chunk_list in assignment {
             for h in chunk_list {

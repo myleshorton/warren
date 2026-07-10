@@ -993,15 +993,35 @@ async fn gather_candidates(
     candidates
 }
 
-/// Order a candidate set most-useful-first and keep at most [`MAX_CANDIDATES`].
-/// The sort is stable, so it preserves the caller's order within a priority tier
-/// (e.g. mapped before reflexive before local among equally-routable addresses).
-/// Applied to our own advertised set and, defensively, to an untrusted peer set —
-/// so a routable candidate survives the cap even if the peer front-loaded
-/// private/junk addresses.
+/// Keep the most-useful [`MAX_CANDIDATES`], best priority first, preserving order
+/// within a tier (e.g. mapped before reflexive before local among equally-routable
+/// addresses). Applied to our own advertised set and, defensively, to an untrusted
+/// peer set — so a routable candidate survives the cap even if the peer
+/// front-loaded private/junk addresses.
+///
+/// Bucketed in a single linear pass rather than sorted: the input can be a large
+/// untrusted peer set and we only ever keep a handful, so an attacker can't force
+/// an `O(n log n)` sort. Each tier holds at most `MAX_CANDIDATES`, and the scan
+/// stops early once tier 0 alone fills the cap (nothing lower could then survive).
 fn prioritize_and_cap(addrs: &mut Vec<SocketAddr>) {
-    addrs.sort_by_key(|a| candidate_priority(*a));
-    addrs.truncate(MAX_CANDIDATES);
+    let mut tiers: [Vec<SocketAddr>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for &addr in addrs.iter() {
+        let tier = candidate_priority(addr) as usize;
+        if tiers[tier].len() < MAX_CANDIDATES {
+            tiers[tier].push(addr);
+        }
+        if tiers[0].len() >= MAX_CANDIDATES {
+            break;
+        }
+    }
+    addrs.clear();
+    for tier in tiers {
+        for addr in tier {
+            if addrs.len() < MAX_CANDIDATES {
+                addrs.push(addr);
+            }
+        }
+    }
 }
 
 /// A candidate's usefulness as a punch target, lower = more preferred:
@@ -1009,7 +1029,16 @@ fn prioritize_and_cap(addrs: &mut Vec<SocketAddr>) {
 /// link-local / ULA — useful to a peer behind the same NAT), `2` everything else
 /// (loopback, unspecified, CGNAT, multicast, …).
 fn candidate_priority(addr: SocketAddr) -> u8 {
-    match addr.ip() {
+    // Rank an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) by its embedded v4 — a
+    // peer could otherwise encode a private v4 that way to dodge the v4 tiering.
+    let ip = match addr.ip() {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    match ip {
         IpAddr::V4(v4) => {
             if is_publicly_routable(IpAddr::V4(v4)) {
                 0
@@ -1268,6 +1297,9 @@ mod tests {
         assert_eq!(p("[::1]:1"), 2);
         assert_eq!(p("[2001:db8::1]:1"), 2); // v6 documentation, not reachable
         assert_eq!(p("[ff02::1]:1"), 2); // v6 multicast
+                                         // IPv4-mapped IPv6 is ranked by its embedded v4, not as generic v6.
+        assert_eq!(p("[::ffff:8.8.8.8]:1"), 0); // mapped public v4
+        assert_eq!(p("[::ffff:192.168.1.5]:1"), 1); // mapped private v4 → LAN, not 0
     }
 
     #[test]

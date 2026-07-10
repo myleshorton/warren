@@ -183,10 +183,15 @@ impl Plan {
             // position — i.e. those whose position is below the (window+1)-th
             // smallest.
             Selection::Streaming { window } => {
-                let mut positions_sorted: Vec<usize> =
-                    order.iter().map(|h| self.positions[h]).collect();
-                positions_sorted.sort_unstable();
-                let threshold = positions_sorted.get(window).copied().unwrap_or(usize::MAX);
+                // The window is the `window` pending chunks with the smallest
+                // playback position; find the cutoff (the (window+1)-th smallest)
+                // in O(n) via select_nth rather than fully sorting.
+                let mut positions: Vec<usize> = order.iter().map(|h| self.positions[h]).collect();
+                let threshold = if window < positions.len() {
+                    *positions.select_nth_unstable(window).1
+                } else {
+                    usize::MAX
+                };
                 order.sort_by_cached_key(|h| {
                     let pos = self.positions[h];
                     if pos < threshold {

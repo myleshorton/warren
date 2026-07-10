@@ -98,10 +98,12 @@ seam*, not baked into the protocol.
 ## Architecture
 
 Role-based crates, each a single responsibility, stacked lowest to highest:
-`crypto`, `wire` → `feed`, `blob` → `sync` → `swarm`, `puncher` → `driver` →
-`transfer`. The lower half is pure and sans-IO; `driver` and `transfer` are the
-thin I/O layers that pump those cores over real sockets. See the repository
-README for the full ladder and what each crate does.
+`crypto`, `wire` → `feed`, `blob` → `sync` → `swarm`, `puncher`, `portmap` →
+`driver` → `transfer`. The lower half is pure and sans-IO; `driver` and
+`transfer` are the thin I/O layers that pump those cores over real sockets
+(`portmap` is a small standalone connectivity aid, likewise a sans-IO codec plus
+a thin UDP layer). See the repository README for the full ladder and what each
+crate does.
 
 ---
 
@@ -237,7 +239,8 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Capability | State |
 | --- | --- |
 | DHT discovery, hole punching (incl. birthday punch) | built |
-| Signed feeds, content-addressed blobs, verified sync | built |
+| Port mapping (PCP / RFC 6887) to open a direct external port | built |
+| Signed feeds (O(log n) incremental Merkle head), content-addressed blobs, verified sync | built |
 | Reliable transport: fragmentation, selective repeat, AIMD + RTT pacing | built |
 | Multi-peer swarming (work-stealing, no round barrier) | built |
 | Decoupled node id (random id + topic-based discovery) | built |

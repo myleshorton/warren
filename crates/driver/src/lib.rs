@@ -1052,7 +1052,13 @@ fn candidate_priority(addr: SocketAddr) -> u8 {
             let seg = v6.segments();
             // 2001:db8::/32 is documentation space — not reachable.
             let documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
-            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || documentation {
+            // `::/96` — the unspecified/loopback addresses AND the obsolete
+            // IPv4-compatible form `::a.b.c.d` (RFC 4291), none routable. (The
+            // IPv4-*mapped* `::ffff:a.b.c.d` was already unwrapped to v4 above, so
+            // it doesn't reach here.) Ranking the whole block junk stops a peer
+            // encoding a v4 as `::a.b.c.d` to dodge the v4 tiering.
+            let low96_zero = seg[..6].iter().all(|&s| s == 0);
+            if v6.is_multicast() || documentation || low96_zero {
                 2
             } else if (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00 {
                 // Stable std has no v6 link-local/ULA predicate, so match by prefix:
@@ -1300,6 +1306,10 @@ mod tests {
                                          // IPv4-mapped IPv6 is ranked by its embedded v4, not as generic v6.
         assert_eq!(p("[::ffff:8.8.8.8]:1"), 0); // mapped public v4
         assert_eq!(p("[::ffff:192.168.1.5]:1"), 1); // mapped private v4 → LAN, not 0
+                                                    // Obsolete IPv4-compatible IPv6 (::/96) is junk, not routable — a peer
+                                                    // can't use it to smuggle a v4 past the tiering.
+        assert_eq!(p("[::8.8.8.8]:1"), 2);
+        assert_eq!(p("[::192.168.1.5]:1"), 2);
     }
 
     #[test]

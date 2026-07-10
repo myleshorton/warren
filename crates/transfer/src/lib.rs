@@ -43,7 +43,7 @@ mod congestion;
 mod frame;
 mod plan;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::Duration;
 
@@ -315,50 +315,80 @@ pub async fn download_blob_swarm(
     // onto whatever's still pending while the others keep running. `idle` holds
     // providers waiting for work; `in_flight` the fetch tasks currently running.
     let mut idle = providers;
-    let mut in_flight: JoinSet<(Provider, Vec<Hash>, ChunkOutcome)> = JoinSet::new();
-    dispatch(&mut plan, &mut idle, &mut in_flight, cfg);
-    while let Some(joined) = in_flight.join_next().await {
-        // A task that panicked/was cancelled (JoinError) loses its provider and
-        // leaves its chunks pending, rather than crashing the whole download.
-        if let Ok((mut provider, assignment, outcome)) = joined {
-            let fetched: HashSet<Hash> = outcome.fetched.iter().map(|(h, _)| *h).collect();
-            for (hash, data) in outcome.fetched {
-                plan.store(hash, data);
-            }
-            // Chunks this provider was assigned but didn't deliver. If it's alive
-            // it answered `Absent`, so record the refusal (it won't be re-offered
-            // them — the guard against a work-stealing livelock) before requeuing
-            // for others. A dead provider is dropped; its chunks return to the pool.
-            let undelivered = assignment.into_iter().filter(|h| !fetched.contains(h));
-            if outcome.alive {
-                let undelivered: Vec<Hash> = undelivered.collect();
-                for hash in &undelivered {
-                    provider.holds.refuse(hash);
+    let mut in_flight: JoinSet<(Provider, ChunkOutcome)> = JoinSet::new();
+    // Each in-flight task's assignment, keyed by its task id. `assign` removed
+    // these chunks from `pending`, so this is the only handle on them — it lets us
+    // requeue a task's chunks even if the task dies with a `JoinError` (panic /
+    // cancellation), rather than silently losing them.
+    let mut in_flight_chunks: HashMap<tokio::task::Id, Vec<Hash>> = HashMap::new();
+    dispatch(
+        &mut plan,
+        &mut idle,
+        &mut in_flight,
+        &mut in_flight_chunks,
+        cfg,
+    );
+    while let Some(joined) = in_flight.join_next_with_id().await {
+        match joined {
+            Ok((id, (mut provider, outcome))) => {
+                let assignment = in_flight_chunks.remove(&id).unwrap_or_default();
+                let fetched: HashSet<Hash> = outcome.fetched.iter().map(|(h, _)| *h).collect();
+                for (hash, data) in outcome.fetched {
+                    plan.store(hash, data);
                 }
-                plan.requeue(undelivered);
-                idle.push(provider);
-            } else {
-                plan.requeue(undelivered);
+                // Chunks this provider was assigned but didn't deliver (an `Absent`,
+                // an unexpected reply, or a hash mismatch). If it's still alive,
+                // record the refusal so it isn't re-offered them — the guard
+                // against a work-stealing livelock — then requeue for others. A
+                // dead provider is dropped; its chunks just return to the pool.
+                let undelivered: Vec<Hash> = assignment
+                    .into_iter()
+                    .filter(|h| !fetched.contains(h))
+                    .collect();
+                if outcome.alive {
+                    for hash in &undelivered {
+                        provider.holds.refuse(hash);
+                    }
+                    plan.requeue(undelivered);
+                    idle.push(provider);
+                } else {
+                    plan.requeue(undelivered);
+                }
+            }
+            // The task panicked or was cancelled: its provider is lost, but its
+            // chunks must go back to the pool or the download could stall forever.
+            Err(join_err) => {
+                if let Some(chunks) = in_flight_chunks.remove(&join_err.id()) {
+                    plan.requeue(chunks);
+                }
             }
         }
         if plan.is_complete() {
             break;
         }
-        dispatch(&mut plan, &mut idle, &mut in_flight, cfg);
+        dispatch(
+            &mut plan,
+            &mut idle,
+            &mut in_flight,
+            &mut in_flight_chunks,
+            cfg,
+        );
     }
 
     plan.reassemble().ok_or(TransferError::Incomplete)
 }
 
 /// Hand each idle provider a small batch of chunks it can serve (rarest-first, via
-/// [`Plan::assign`]) and spawn a fetch task for it in `in_flight`. Providers with
-/// nothing to do stay in `idle` — they may get work once other fetches requeue
-/// chunks. Batches are capped at [`STEAL_BATCH`] so most of the work stays in the
-/// pool for whichever provider frees up next.
+/// [`Plan::assign`]) and spawn a fetch task for it in `in_flight`, recording the
+/// batch in `tracker` (by task id) so it can be recovered if the task dies.
+/// Providers with nothing to do stay in `idle` — they may get work once other
+/// fetches requeue chunks. Batches are capped at [`STEAL_BATCH`] so most of the
+/// work stays in the pool for whichever provider frees up next.
 fn dispatch(
     plan: &mut Plan,
     idle: &mut Vec<Provider>,
-    in_flight: &mut JoinSet<(Provider, Vec<Hash>, ChunkOutcome)>,
+    in_flight: &mut JoinSet<(Provider, ChunkOutcome)>,
+    tracker: &mut HashMap<tokio::task::Id, Vec<Hash>>,
     cfg: &Config,
 ) {
     if idle.is_empty() || plan.pending() == 0 {
@@ -375,11 +405,13 @@ fn dispatch(
             continue;
         }
         let cfg = *cfg;
-        in_flight.spawn(async move {
+        let recover = chunks.clone();
+        let handle = in_flight.spawn(async move {
             let outcome =
                 download_chunks(&mut provider.channel, &chunks, &cfg, &mut provider.cursor).await;
-            (provider, chunks, outcome)
+            (provider, outcome)
         });
+        tracker.insert(handle.id(), recover);
     }
     *idle = still_idle;
 }

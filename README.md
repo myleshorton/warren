@@ -72,8 +72,9 @@ crates/
               birthday spray/open-sockets punch, chosen by the resolved strategy
             + candidate-set discovery (ICE-style): both sides gather several
               data-socket addresses — local, reflexive/STUN-observed, and an
-              optional UPnP-IGD port mapping (PunchTuning::port_mapping, off by
-              default) — advertise the whole set, and the punch tries them all
+              optional port mapping (PunchTuning::port_mapping, off by default;
+              PCP-first with a UPnP-IGD fallback) — advertise the whole set, and
+              the punch tries them all
               (Direct probes every candidate on one socket; the birthday punch
               sprays toward / accepts from each distinct candidate IP). One wrong
               guess (a per-destination NAT mapping, a CGNAT external IP, a
@@ -91,7 +92,9 @@ crates/
             and an anti-spoof nonce; and UPnP-IGD for gateways that don't speak
             PCP — SSDP discovery + a minimal HTTP/SOAP client (AddPortMapping,
             GetExternalIPAddress), with pure parsers KAT-tested and the HTTP flow
-            loopback-tested against a fake IGD
+            loopback-tested against a fake IGD. map_port_auto tries both in one
+            call — SSDP finds the gateway (and its IP), PCP is tried first (lean),
+            UPnP is the fallback
   feed      signed append-only log (the "log"/hypercore role): BLAKE3 Merkle tree
             over blocks (root maintained by an incremental O(log n) accumulator),
             a signed (len, root) head, and per-block inclusion proofs
@@ -137,10 +140,9 @@ crates/
             data layer finally rides the transport over a real, multi-peer
             connection.
 
-  next: automatic mapping renewal before lease expiry (so a mapping outlives one
-        connect), PCP-then-UPnP fallback in one call (PCP needs gateway discovery),
-        candidate prioritization/pruning (e.g. drop a private candidate when a
-        routable one exists), ...
+  next: candidate prioritization (advertise routable candidates first),
+        automatic mapping renewal before lease expiry (so a mapping outlives one
+        connect), obfuscated/pluggable transport for censored networks, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

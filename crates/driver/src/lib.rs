@@ -938,7 +938,8 @@ const MAP_LIFETIME: Duration = Duration::from_secs(120);
 const MAP_DESCRIPTION: &str = "warren";
 /// Overall bound on the port-mapping attempt, so a slow or half-speaking gateway
 /// can't stall a connect past this even though the reflexive probe has answered.
-const MAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Leaves room for the combined path (a brief PCP attempt, then a UPnP fallback).
+const MAP_TIMEOUT: Duration = Duration::from_secs(8);
 /// Cap on advertised candidate addresses. Only three sources exist today (mapped,
 /// reflexive, local); the cap bounds the set if that grows and keeps the Signal
 /// small.
@@ -959,18 +960,19 @@ async fn gather_candidates(
     port_mapping: bool,
 ) -> Vec<SocketAddr> {
     let reflexive_fut = reflexive_addr(sock, id, local, reflectors);
-    // UPnP-IGD is IPv4-only (SSDP is an IPv4 multicast, and it yields an IPv4
-    // external address), so skip the mapping for a v6 socket. When enabled it runs
+    // Port mapping is discovered via SSDP and (for PCP) an IPv4 gateway, and yields
+    // an IPv4 external address, so skip it for a v6 socket. When enabled it runs
     // concurrently with the reflexive probe — they touch different sockets.
     let (reflexive, mapped) = if port_mapping && local.is_ipv4() {
+        // PCP first, UPnP fallback, in one call.
         let mapped_fut = timeout(
             MAP_TIMEOUT,
-            portmap::map_port_upnp(local.port(), MAP_LIFETIME, MAP_DESCRIPTION),
+            portmap::map_port_auto(local.port(), MAP_LIFETIME, MAP_DESCRIPTION),
         );
         let (reflexive, mapped) = tokio::join!(reflexive_fut, mapped_fut);
         // Only offer the mapping when it fully succeeded within the timeout and
-        // its external IP is routable — under double-NAT/CGNAT `GetExternalIP`
-        // can return a private/`100.64/10` address that's useless as a target.
+        // its external IP is routable — under double-NAT/CGNAT the gateway can
+        // report a private/`100.64/10` address that's useless as a target.
         let mapped = match mapped {
             Ok(Ok(m)) if is_publicly_routable(m.external.ip()) => Some(m.external),
             _ => None,

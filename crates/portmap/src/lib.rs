@@ -33,6 +33,76 @@ pub use upnp::{map_port_upnp, UpnpError};
 /// The PCP (and NAT-PMP) server port on the gateway.
 pub const PCP_PORT: u16 = 5351;
 
+/// Time budget for the PCP attempt in [`map_port_auto`] before falling back to
+/// UPnP. Short: an unsupported gateway usually refuses immediately, and we don't
+/// want to sit through PCP's full retransmit budget when UPnP is the real path.
+const PCP_ATTEMPT: Duration = Duration::from_secs(1);
+
+/// An error from the combined [`map_port_auto`] path.
+#[derive(Debug, Error)]
+pub enum MapError {
+    /// No port-mapping gateway was found on the network (SSDP got no response).
+    #[error("no port-mapping gateway found on the network")]
+    NoGateway,
+    /// A gateway was found and PCP was tried, but the UPnP fallback failed.
+    #[error("PCP unavailable and UPnP fallback failed: {0}")]
+    Upnp(UpnpError),
+}
+
+/// Map an external UDP port to `internal_port`, trying **PCP first and UPnP-IGD as
+/// a fallback**, in one call. Discovers the gateway by SSDP — which finds the IGD
+/// and, from its device-description URL, its IP — then tries PCP against that
+/// gateway (the lean binary protocol, one exchange). If PCP doesn't answer within
+/// a short attempt window, falls back to UPnP against the same device.
+/// `description` labels the mapping in the router's UI (UPnP only; PCP carries no
+/// label).
+///
+/// A gateway that speaks PCP but *not* UPnP won't be found — SSDP is the only
+/// portable gateway discovery available here — but that combination is rare on
+/// consumer routers, which is where port mapping matters.
+///
+/// # Panics
+///
+/// Panics only if the OS entropy source is unavailable (via [`map_port`]).
+pub async fn map_port_auto(
+    internal_port: u16,
+    lifetime: Duration,
+    description: &str,
+) -> Result<Mapping, MapError> {
+    let location = match upnp::discover_location().await {
+        Ok(location) => location,
+        Err(UpnpError::NoGateway) => return Err(MapError::NoGateway),
+        Err(e) => return Err(MapError::Upnp(e)),
+    };
+    map_via_gateway(&location, internal_port, lifetime, description).await
+}
+
+/// The testable core of [`map_port_auto`]: given the gateway's device-description
+/// URL, try PCP at that host, then fall back to UPnP against the same URL.
+async fn map_via_gateway(
+    location: &str,
+    internal_port: u16,
+    lifetime: Duration,
+    description: &str,
+) -> Result<Mapping, MapError> {
+    // The device-description host is the gateway's IP — the PCP server too, if it
+    // speaks PCP. Try that lean path first; on any failure (refused, timeout,
+    // no IP-literal host) fall through to UPnP.
+    if let Some((host, _, _)) = upnp::parse_url(location) {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            let gateway = SocketAddr::new(ip, PCP_PORT);
+            if let Ok(Ok(mapping)) =
+                timeout(PCP_ATTEMPT, map_port(gateway, internal_port, lifetime)).await
+            {
+                return Ok(mapping);
+            }
+        }
+    }
+    upnp::map_via_location(location, internal_port, lifetime, description)
+        .await
+        .map_err(MapError::Upnp)
+}
+
 /// PCP version 2 (RFC 6887).
 const VERSION: u8 = 2;
 /// The MAP opcode.
@@ -461,5 +531,82 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PcpError::Rejected(8)));
+    }
+
+    /// A tiny fake IGD (device XML + AddPortMapping/GetExternalIPAddress SOAP),
+    /// serving one request per `Connection: close` socket. Returns its address.
+    async fn fake_igd(external_ip: &str) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let external_ip = external_ip.to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                        let need = head
+                            .lines()
+                            .find_map(|l| {
+                                l.split_once(':')
+                                    .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            })
+                            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if rest.len() >= need {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let body = if text.starts_with("GET ") {
+                    r#"<?xml version="1.0"?><root><device><serviceList><service>
+                    <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+                    <controlURL>/ctl/IPConn</controlURL></service></serviceList></device></root>"#
+                        .to_string()
+                } else if text.contains("GetExternalIPAddress") {
+                    format!(
+                        "<s:Envelope><s:Body><u:GetExternalIPAddressResponse>\
+                         <NewExternalIPAddress>{external_ip}</NewExternalIPAddress>\
+                         </u:GetExternalIPAddressResponse></s:Body></s:Envelope>"
+                    )
+                } else {
+                    "<s:Envelope><s:Body><u:AddPortMappingResponse></u:AddPortMappingResponse></s:Body></s:Envelope>".to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn map_via_gateway_falls_back_to_upnp_when_pcp_is_silent() {
+        // PCP is tried at the gateway host:5351 (nothing there on loopback, so it
+        // fails fast), then the UPnP fallback maps against the fake IGD. This
+        // exercises the fallback arm of the combined path; the PCP-success arm is
+        // covered by `map_port_completes_against_a_gateway`.
+        let igd = fake_igd("203.0.113.77").await;
+        let location = format!("http://{igd}/rootDesc.xml");
+        let mapping = map_via_gateway(&location, 40004, Duration::from_secs(3600), "warren")
+            .await
+            .expect("UPnP fallback should map");
+        assert_eq!(
+            mapping.external,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77)), 40004)
+        );
     }
 }

@@ -1020,18 +1020,18 @@ fn candidate_priority(addr: SocketAddr) -> u8 {
             }
         }
         IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+            let seg = v6.segments();
+            // 2001:db8::/32 is documentation space — not reachable.
+            let documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() || documentation {
                 2
-            } else {
+            } else if (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00 {
                 // Stable std has no v6 link-local/ULA predicate, so match by prefix:
-                // link-local fe80::/10, unique-local fc00::/7. Anything else is
-                // treated as globally routable (most v6 is).
-                let head = v6.segments()[0];
-                if (head & 0xffc0) == 0xfe80 || (head & 0xfe00) == 0xfc00 {
-                    1
-                } else {
-                    0
-                }
+                // link-local fe80::/10, unique-local fc00::/7.
+                1
+            } else {
+                // Anything else is treated as globally routable (most v6 is).
+                0
             }
         }
     }
@@ -1266,6 +1266,8 @@ mod tests {
         assert_eq!(p("127.0.0.1:1"), 2);
         assert_eq!(p("100.64.0.1:1"), 2); // CGNAT
         assert_eq!(p("[::1]:1"), 2);
+        assert_eq!(p("[2001:db8::1]:1"), 2); // v6 documentation, not reachable
+        assert_eq!(p("[ff02::1]:1"), 2); // v6 multicast
     }
 
     #[test]

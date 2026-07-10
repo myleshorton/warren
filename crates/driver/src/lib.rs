@@ -964,16 +964,18 @@ fn prefer_mapped(mapped: Option<SocketAddr>, reflexive: SocketAddr) -> SocketAdd
     }
 }
 
-/// A conservative "safe to advertise to a peer" check, using only stable
-/// std predicates (`IpAddr::is_global` is still unstable): reject the ranges that
-/// clearly can't be reached from off-network. CGNAT (`100.64.0.0/10`) has no
-/// stable predicate, so it's matched by hand — it's the common double-NAT case
-/// UPnP surfaces.
+/// A conservative "safe to advertise to a peer" check, using only stable std
+/// predicates: reject the ranges that clearly can't be reached from off-network.
+/// The precise predicates for CGNAT (`100.64.0.0/10`), benchmarking
+/// (`198.18.0.0/15`), reserved (`240.0.0.0/4`) — and `is_global` itself — are all
+/// still unstable (`feature(ip)`, rust#27709, unstable even on 1.93), so those
+/// ranges are matched by hand. CGNAT is the common double-NAT case UPnP surfaces.
 fn is_publicly_routable(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
-            let is_cgnat = a == 100 && (64..=127).contains(&b);
+            let is_cgnat = a == 100 && (64..=127).contains(&b); // 100.64.0.0/10
+            let is_benchmarking = a == 198 && (18..=19).contains(&b); // 198.18.0.0/15
             let is_reserved = a >= 240; // 240.0.0.0/4, reserved/experimental
             !v4.is_private()
                 && !v4.is_loopback()
@@ -983,6 +985,7 @@ fn is_publicly_routable(ip: IpAddr) -> bool {
                 && !v4.is_documentation()
                 && !v4.is_unspecified()
                 && !is_cgnat
+                && !is_benchmarking
                 && !is_reserved
         }
         // UPnP-IGD yields IPv4 only, so a v6 mapped address can't legitimately
@@ -1168,6 +1171,7 @@ mod tests {
             "100.64.0.1",           // CGNAT
             "203.0.113.1",          // TEST-NET-3 (documentation)
             "224.0.0.1",            // multicast
+            "198.18.0.1",           // benchmarking
             "240.0.0.1",            // reserved
             "255.255.255.255",      // broadcast
             "0.0.0.0",              // unspecified

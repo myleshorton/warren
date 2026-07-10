@@ -297,9 +297,10 @@ pub struct Node {
 
 /// A running periodic re-announce started by [`Node::keep_announced`]. Hold it
 /// for as long as the content should stay discoverable; dropping it stops the
-/// loop. (Announce records don't expire on their own, so a long-lived provider
-/// re-announces both to survive DHT churn — the closest-K set near a topic
-/// changes as peers come and go — and to follow a topic that rotates by epoch.)
+/// loop. Announce records expire unless refreshed, so a long-lived provider
+/// re-announces both to renew its lease, to survive DHT churn — the closest-K set
+/// near a topic changes as peers come and go — and to follow a topic that rotates
+/// by epoch.
 #[must_use = "dropping the Announcer immediately stops the re-announce loop; bind it to a variable that lives as long as you want to stay discoverable"]
 pub struct Announcer {
     task: tokio::task::JoinHandle<()>,

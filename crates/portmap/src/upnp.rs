@@ -95,12 +95,14 @@ async fn discover_location() -> Result<String, UpnpError> {
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, sock.recv_from(&mut buf)).await {
-            Ok(Ok((n, _from))) => {
+            Ok(Ok((n, from))) => {
                 let text = String::from_utf8_lossy(&buf[..n]);
                 if let Some(loc) = parse_location(&text) {
-                    return Ok(loc.to_string());
+                    if location_is_trustworthy(loc, from.ip()) {
+                        return Ok(loc.to_string());
+                    }
                 }
-                // Not a usable response — keep listening until the deadline.
+                // Spoofed, non-http, or headerless — keep listening to the deadline.
             }
             Ok(Err(e)) => return Err(UpnpError::Io(e)),
             Err(_) => return Err(UpnpError::NoGateway),
@@ -128,8 +130,10 @@ async fn map_via_location(
     let (host, _, _) = parse_url(&control_url).ok_or(UpnpError::Malformed)?;
     let internal_client = local_ip_towards(&host).await?;
 
-    // IGDv1 lease is a u32 of seconds; 0 means "until reboot".
-    let lease = lifetime.as_secs().min(u32::MAX as u64) as u32;
+    // IGDv1 lease is a u32 of seconds. Clamp to at least 1s: a gateway reads 0 as
+    // "until reboot", so a sub-second Duration truncating to 0 would silently
+    // request a permanent mapping. (Mirrors the PCP path's lifetime clamp.)
+    let lease = lifetime.as_secs().clamp(1, u32::MAX as u64) as u32;
     let add = soap_add_port_mapping(
         &service.service_type,
         internal_port,
@@ -193,6 +197,21 @@ fn parse_location(response: &str) -> Option<&str> {
     })
 }
 
+/// Whether a discovered LOCATION is safe to fetch. Any host on the LAN can reply
+/// to our multicast search, so we reject a LOCATION we can't fetch (non-`http`,
+/// which our client doesn't speak) and, when its host is an IP literal, one that
+/// doesn't match the responder's address — so a rogue peer can't redirect us to
+/// an arbitrary host (an SSRF-style pivot).
+fn location_is_trustworthy(location: &str, responder: IpAddr) -> bool {
+    let Some((host, _, _)) = parse_url(location) else {
+        return false; // not http:// — the HTTP client can't fetch it
+    };
+    match host.parse::<IpAddr>() {
+        Ok(ip) => ip == responder, // IP-literal LOCATION must come from that IP
+        Err(_) => true,            // a hostname can't be cheaply verified — allow
+    }
+}
+
 /// Find the first WAN connection service (and its control URL) in a device
 /// description, preferring `WANIPConnection` over `WANPPPConnection`.
 fn parse_igd_service(xml: &str) -> Option<Service> {
@@ -235,17 +254,39 @@ fn parse_url(url: &str) -> Option<(String, u16, String)> {
     Some((host, port, path))
 }
 
-/// Resolve a (possibly relative) control URL against the device-description URL.
+/// Resolve a (possibly relative) control URL against the device-description URL,
+/// per RFC 3986: an absolute-path reference replaces the path; a relative one is
+/// resolved against the base path's directory. An absolute URL is returned as-is
+/// (a non-`http` scheme then fails cleanly downstream in `parse_url`).
 fn resolve_url(base: &str, control: &str) -> Option<String> {
-    if control.starts_with("http://") || control.starts_with("https://") {
+    if control.contains("://") {
         return Some(control.to_string());
     }
-    let authority = base.strip_prefix("http://")?.split('/').next()?;
-    if let Some(abs) = control.strip_prefix('/') {
-        Some(format!("http://{authority}/{abs}"))
+    let rest = base.strip_prefix("http://")?;
+    let (authority, base_path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    if control.starts_with('/') {
+        Some(format!("http://{authority}{control}"))
     } else {
-        Some(format!("http://{authority}/{control}"))
+        // Relative reference: keep the base path up to and including its last '/'.
+        let dir = match base_path.rfind('/') {
+            Some(i) => &base_path[..=i],
+            None => "/",
+        };
+        Some(format!("http://{authority}{dir}{control}"))
     }
+}
+
+/// Escape text destined for an XML element body. `&` first, so already-escaped
+/// entities aren't double-escaped.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 /// A SOAP envelope for `action` on `service_type`, with the given inner argument
@@ -276,8 +317,9 @@ fn soap_add_port_mapping(
          <NewInternalPort>{internal_port}</NewInternalPort>\
          <NewInternalClient>{internal_client}</NewInternalClient>\
          <NewEnabled>1</NewEnabled>\
-         <NewPortMappingDescription>{description}</NewPortMappingDescription>\
-         <NewLeaseDuration>{lease}</NewLeaseDuration>"
+         <NewPortMappingDescription>{}</NewPortMappingDescription>\
+         <NewLeaseDuration>{lease}</NewLeaseDuration>",
+        xml_escape(description)
     );
     soap_body(service_type, "AddPortMapping", &args)
 }
@@ -417,14 +459,59 @@ mod tests {
     #[test]
     fn resolves_control_urls() {
         let base = "http://192.168.1.1:5000/rootDesc.xml";
+        // Absolute-path reference replaces the whole path.
         assert_eq!(
             resolve_url(base, "/ctl/IPConn").as_deref(),
             Some("http://192.168.1.1:5000/ctl/IPConn")
         );
+        // Absolute URL is passed through unchanged.
         assert_eq!(
             resolve_url(base, "http://192.168.1.1:5000/abs").as_deref(),
             Some("http://192.168.1.1:5000/abs")
         );
+        // Relative reference resolves against the base path's directory.
+        assert_eq!(
+            resolve_url("http://gw/foo/rootDesc.xml", "ctl/IPConn").as_deref(),
+            Some("http://gw/foo/ctl/IPConn")
+        );
+        assert_eq!(
+            resolve_url("http://gw/rootDesc.xml", "ctl/IPConn").as_deref(),
+            Some("http://gw/ctl/IPConn")
+        );
+    }
+
+    #[test]
+    fn ssdp_location_is_validated_against_the_responder() {
+        let gw: IpAddr = "192.168.1.1".parse().unwrap();
+        // IP-literal LOCATION that matches the sender — trusted.
+        assert!(location_is_trustworthy(
+            "http://192.168.1.1:5000/rootDesc.xml",
+            gw
+        ));
+        // IP-literal LOCATION from a different host — a redirect attempt, rejected.
+        assert!(!location_is_trustworthy("http://10.0.0.9/evil.xml", gw));
+        // Non-http scheme we can't fetch — rejected.
+        assert!(!location_is_trustworthy(
+            "https://192.168.1.1/rootDesc.xml",
+            gw
+        ));
+        // Hostname LOCATION can't be cheaply verified — allowed.
+        assert!(location_is_trustworthy("http://gateway.local/desc.xml", gw));
+    }
+
+    #[test]
+    fn description_is_xml_escaped_in_the_soap_body() {
+        let body = soap_add_port_mapping(
+            "urn:schemas-upnp-org:service:WANIPConnection:1",
+            40000,
+            40000,
+            IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)),
+            3600,
+            r#"a & b <x> "q""#,
+        );
+        assert!(body.contains("a &amp; b &lt;x&gt; &quot;q&quot;"));
+        // The raw, unescaped form must not leak into the request.
+        assert!(!body.contains("a & b <x>"));
     }
 
     #[test]

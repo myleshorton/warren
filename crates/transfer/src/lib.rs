@@ -242,14 +242,17 @@ pub async fn download_blob_swarm(
     plan.reassemble().ok_or(TransferError::Incomplete)
 }
 
-/// Stream a blob from several providers for **playback**: chunks are fetched
-/// playback-frontier-first — a `window`-chunk priority window in order, then
-/// rarest-first beyond it for swarm health — and handed to `on_chunk(index,
-/// bytes)` **in playback order** (indices `0..N`, strictly) as each becomes
-/// contiguously available, so a player can start before the whole blob arrives.
-/// Every chunk is still verified by its hash before delivery. Returns
-/// [`TransferError::Incomplete`] if the swarm can't supply the whole blob — the
-/// caller will have received a contiguous prefix.
+/// Stream a blob from several providers for **playback**, with **bounded memory**:
+/// only chunks within a `window`-sized window ahead of the playback frontier are
+/// fetched (in playback order) — nothing further ahead, so a slow chunk can't make
+/// providers race ahead and buffer the whole file — and each is handed to
+/// `on_chunk(index, bytes)` **in playback order** (indices `0..N`, strictly) as it
+/// becomes contiguously available, then freed. So a player can start before the
+/// whole blob arrives, and memory stays bounded to roughly `window` chunks rather
+/// than the whole blob. `window` is clamped to at least 1. Every chunk is still
+/// verified by its hash before delivery. Returns [`TransferError::Incomplete`] if
+/// the swarm can't supply the whole blob — the caller will have received a
+/// contiguous prefix.
 pub async fn download_blob_stream<F>(
     channels: Vec<Channel>,
     id: Hash,

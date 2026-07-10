@@ -195,7 +195,9 @@ impl Plan {
             // delivery blocks on, is filled first. Chunks beyond the window aren't
             // returned, so they aren't fetched until the frontier advances.
             Selection::Streaming { window } => {
-                let cutoff = self.frontier.saturating_add(window);
+                // Clamp to at least 1: a zero window would gate out every chunk
+                // (cutoff == frontier) and stall, even if a caller set it directly.
+                let cutoff = self.frontier.saturating_add(window.max(1));
                 order.retain(|h| self.positions[h] < cutoff);
                 order.sort_by_cached_key(|h| self.positions[h]);
             }
@@ -275,6 +277,12 @@ impl Plan {
     /// bytes once its *last* playback position has passed — so a deduplicated
     /// chunk still lasts until the later index, but memory stays bounded.
     pub fn advance_delivery(&mut self, drop_delivered: bool) {
+        // Never advance past the end — the running loop only calls this after a
+        // chunk was delivered, but guarding keeps `frontier` from exceeding the
+        // count (and wrapping) if it's ever called once too often.
+        if self.all_delivered() {
+            return;
+        }
         let index = self.frontier;
         self.frontier += 1;
         if drop_delivered {
@@ -609,11 +617,12 @@ mod tests {
     }
 
     impl Plan {
-        /// Test helper: is `hash` currently pending?
+        /// Test helper: how many chunks are currently held in the store.
         fn stored_count(&self) -> usize {
             self.have.len()
         }
 
+        /// Test helper: is `hash` currently pending?
         fn pending_contains(&self, hash: Hash) -> bool {
             self.pending.contains(&hash)
         }

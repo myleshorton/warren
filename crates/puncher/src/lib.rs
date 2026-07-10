@@ -132,8 +132,18 @@ pub async fn connect_to_any(
     let mut buf = [0u8; 64];
     while Instant::now() < deadline {
         let sent_at = Instant::now();
+        // A peer-supplied candidate may be unreachable or the wrong address family
+        // for this socket; a send error just skips that candidate, so one bad entry
+        // can't abort a dial that has good candidates. Only give up if *none* of
+        // them could be sent (retrying wouldn't help).
+        let mut any_sent = false;
         for peer in peers {
-            socket.send_to(&[PROBE], peer).await?;
+            if socket.send_to(&[PROBE], peer).await.is_ok() {
+                any_sent = true;
+            }
+        }
+        if !any_sent {
+            return Ok(None);
         }
         // Read until this round's window elapses, so stray datagrams that return
         // early don't make us re-probe faster than `probe_interval`.
@@ -370,8 +380,17 @@ pub async fn spray_any(
         if port == own_port {
             continue; // never spray our own socket (would self-hit)
         }
+        // Skip a host whose send errors (unreachable / wrong family), so one bad
+        // peer-supplied IP can't abort the spray; if none sent for this port, skip
+        // the reply wait entirely.
+        let mut any_sent = false;
         for host in peer_hosts {
-            socket.send_to(&[PROBE], (*host, port)).await?;
+            if socket.send_to(&[PROBE], (*host, port)).await.is_ok() {
+                any_sent = true;
+            }
+        }
+        if !any_sent {
+            continue;
         }
         // Spraying is intentionally fast: `probe_interval` here is the per-probe
         // reply wait, not a send-rate cap — racing a NAT's mappings wants many

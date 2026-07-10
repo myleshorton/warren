@@ -215,6 +215,30 @@ async fn empty_candidate_sets_fail_fast() {
 }
 
 #[tokio::test]
+async fn connect_to_any_skips_an_unsendable_candidate() {
+    // A candidate our socket can't even send to (a v6 address from a v4 socket)
+    // must not abort the dial — the good candidate still wins. This is the exact
+    // "one wrong address sinks the connect" failure the candidate set prevents.
+    let server = UdpSocket::bind(addr(0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = UdpSocket::bind(addr(0)).await.unwrap(); // bound v4
+    let wrong_family: SocketAddr = "[::1]:9".parse().unwrap();
+    let cfg = Config::default();
+    let candidates = [wrong_family, server_addr];
+
+    let (rs, rc) = tokio::join!(
+        accept(server, LO, &cfg),
+        connect_to_any(client, &candidates, &cfg)
+    );
+    let s = rs.unwrap().expect("server should accept");
+    let c = rc
+        .unwrap()
+        .expect("dial should succeed despite the unsendable candidate");
+    assert_eq!(c.peer, server_addr);
+    assert_bidirectional(&c, &s).await;
+}
+
+#[tokio::test]
 async fn accept_any_honors_any_listed_host() {
     // The accept side is given several candidate hosts; a probe from any of them
     // establishes. Here the real dialer is on loopback, listed alongside a decoy

@@ -240,7 +240,7 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Capability | State |
 | --- | --- |
 | DHT discovery, hole punching (incl. birthday punch, ICE-style candidate sets) | built |
-| Port mapping (PCP / RFC 6887 + UPnP-IGD) to open a direct external port | built |
+| Port mapping (PCP / RFC 6887 + UPnP-IGD, PCP-first in one call) to open a direct external port | built |
 | Signed feeds (O(log n) incremental Merkle head), content-addressed blobs, verified sync | built |
 | Reliable transport: fragmentation, selective repeat, AIMD + RTT pacing | built |
 | Multi-peer swarming (work-stealing, no round barrier) | built |

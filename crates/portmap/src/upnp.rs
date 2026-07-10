@@ -84,7 +84,7 @@ pub async fn map_port_upnp(
 }
 
 /// Discover a gateway and return the LOCATION URL of its device description.
-async fn discover_location() -> Result<String, UpnpError> {
+pub(crate) async fn discover_location() -> Result<String, UpnpError> {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     let msearch = build_msearch(IGD_DEVICE);
     sock.send_to(msearch.as_bytes(), (SSDP_ADDR, SSDP_PORT))
@@ -111,7 +111,7 @@ async fn discover_location() -> Result<String, UpnpError> {
 }
 
 /// Given a device-description URL, add the mapping and return the external address.
-async fn map_via_location(
+pub(crate) async fn map_via_location(
     location: &str,
     internal_port: u16,
     lifetime: Duration,
@@ -241,7 +241,7 @@ fn extract_tag<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
 }
 
 /// Split an `http://host[:port]/path` URL into (host, port, path).
-fn parse_url(url: &str) -> Option<(String, u16, String)> {
+pub(crate) fn parse_url(url: &str) -> Option<(String, u16, String)> {
     let rest = url.strip_prefix("http://")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),

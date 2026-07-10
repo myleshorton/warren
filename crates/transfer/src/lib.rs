@@ -361,26 +361,20 @@ async fn fetch_manifest<L: Link>(
     result
 }
 
-/// Ask one provider which of the blob's chunks it holds, returning them as a set
-/// of chunk hashes (decoded from the `Have` bitfield against `manifest`).
-/// Advances the `cursor`. A channel error or timeout is surfaced as `Err` so the
-/// caller can retire the provider.
+/// Ask one provider which of the blob's chunks it holds, decoded from the `Have`
+/// bitfield against `manifest`. Advances the `cursor`; a channel error or timeout
+/// is surfaced as `Err` so the caller can retire the provider.
 ///
-/// A provider that answers `Absent` can't enumerate its holdings for this blob
-/// (e.g. it serves chunks by hash but doesn't store the manifest). Rather than
-/// exclude a possibly-useful source — which could falsely report the blob
-/// unavailable — assume optimistically that it might hold *any* chunk and let
-/// hash-verified probing sort it out; the cost is some wasted requests to a
-/// provider that turns out to hold little. (Claiming everything adds one to every
-/// chunk's holder count uniformly, so it leaves the rarest-first order intact.)
-/// The holdings are a scheduling hint, not a trust boundary: every chunk is
+/// The holdings are a scheduling hint, not a trust boundary: every chunk is still
 /// verified by hash on receipt, so an inaccurate answer can never corrupt the
-/// blob. It can affect liveness, though — a false negative (a chunk held but not
-/// reported) means we won't request it from this provider. That's why an `Absent`
-/// (can't report at all) becomes [`Holdings::Unknown`] — a last-resort source the
-/// scheduler probes only when no known holder can serve a chunk, rather than
-/// either excluding it (risking a false "unavailable") or trusting it over a
-/// known holder. A genuinely unexpected reply is treated as holding nothing.
+/// blob — it can only affect liveness (a chunk a provider has but doesn't report
+/// won't be requested from it). So a provider that *can't* report its holdings —
+/// `Absent` (e.g. it serves chunks by hash but doesn't store the manifest), or a
+/// bitfield too short to cover the manifest — becomes [`Holdings::Unknown`]: a
+/// last-resort source the scheduler probes only when no known holder can serve a
+/// chunk, rather than excluding it (risking a false "unavailable") or reading a
+/// truncated bitfield as "lacks the missing chunks". A genuinely unexpected reply
+/// is treated as holding nothing.
 async fn fetch_haveset<L: Link>(
     channel: &mut L,
     id: Hash,
@@ -390,13 +384,16 @@ async fn fetch_haveset<L: Link>(
 ) -> Result<Holdings, TransferError> {
     let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *cursor);
     let result = match exchange(&mut wire, &Message::GetHave { id }, cfg).await {
+        // A bitfield shorter than the manifest needs is malformed/truncated;
+        // reading it would falsely mark the uncovered chunks absent, so probe the
+        // provider as a last resort instead. Extra trailing bytes are harmless.
+        Ok(Message::Have { bits }) if bits.len() < manifest.chunks.len().div_ceil(8) => {
+            Ok(Holdings::Unknown)
+        }
         Ok(Message::Have { bits }) => {
             let mut holds = HashSet::new();
             for (i, hash) in manifest.chunks.iter().enumerate() {
-                if bits
-                    .get(i / 8)
-                    .is_some_and(|byte| byte & (1 << (i % 8)) != 0)
-                {
+                if bits[i / 8] & (1 << (i % 8)) != 0 {
                     holds.insert(*hash);
                 }
             }

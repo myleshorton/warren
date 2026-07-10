@@ -434,6 +434,15 @@ mod tests {
         assert!(m.contains("MAN: \"ssdp:discover\""));
         assert!(m.contains(&format!("ST: {IGD_DEVICE}")));
         assert!(m.ends_with("\r\n\r\n"));
+        // No header line may begin with whitespace: a folded line (obs-fold) can
+        // make gateways drop the request. (The `\`-newline continuations strip
+        // the source indentation, so this holds — this guards that.)
+        for line in m.split("\r\n") {
+            assert!(
+                !line.starts_with([' ', '\t']),
+                "folded header line: {line:?}"
+            );
+        }
     }
 
     #[test]

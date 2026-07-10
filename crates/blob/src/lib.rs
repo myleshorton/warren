@@ -161,6 +161,13 @@ impl Store {
         self.chunks.contains_key(hash)
     }
 
+    /// Drop the chunk stored under `hash` (returning whether one was present) — so
+    /// a streaming consumer can free a chunk once it has been delivered, keeping
+    /// memory bounded rather than retaining the whole blob.
+    pub fn remove(&mut self, hash: &Hash) -> bool {
+        self.chunks.remove(hash).is_some()
+    }
+
     /// Number of distinct chunks stored.
     pub fn len(&self) -> usize {
         self.chunks.len()

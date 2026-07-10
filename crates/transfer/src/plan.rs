@@ -106,11 +106,18 @@ pub struct Plan {
     /// Earliest manifest index each distinct chunk appears at — its playback
     /// position, for the streaming selection policy.
     positions: HashMap<Hash, usize>,
+    /// Latest manifest index each distinct chunk appears at — so a deduplicated
+    /// chunk (shared by several positions) is dropped only after its *last* one
+    /// has been delivered.
+    last_positions: HashMap<Hash, usize>,
     /// Chunks received and verified, keyed by hash (dedup'd — identical chunks
     /// share a hash and are fetched once).
     have: Store,
     /// How pending chunks are ordered when handed out.
     selection: Selection,
+    /// Next playback index to deliver. Streaming fetches within a window ahead of
+    /// this and drops chunks behind it; it also marks completion (all delivered).
+    frontier: usize,
 }
 
 impl Plan {
@@ -121,16 +128,20 @@ impl Plan {
         let pending = manifest.chunks.iter().copied().collect();
         let wanted = manifest.chunks.iter().copied().collect();
         let mut positions = HashMap::new();
+        let mut last_positions = HashMap::new();
         for (i, hash) in manifest.chunks.iter().enumerate() {
             positions.entry(*hash).or_insert(i); // earliest index = playback position
+            last_positions.insert(*hash, i); // last write wins = latest index
         }
         Self {
             manifest,
             pending,
             wanted,
             positions,
+            last_positions,
             have: Store::new(),
             selection: Selection::default(),
+            frontier: 0,
         }
     }
 
@@ -178,28 +189,17 @@ impl Plan {
         match self.selection {
             // Rarest first; ties by hash so the schedule is deterministic.
             Selection::RarestFirst => order.sort_by_cached_key(|h| (known_holders(h), *h)),
-            // The playback window first (in playback order), then rarest-first. The
-            // window is the `window` pending chunks with the smallest playback
-            // position — i.e. those whose position is below the (window+1)-th
-            // smallest.
+            // A bounded sliding window: only fetch chunks within `window` playback
+            // positions of the frontier, in playback order — so memory stays
+            // bounded (nothing far ahead is fetched) and the frontier, which
+            // delivery blocks on, is filled first. Chunks beyond the window aren't
+            // returned, so they aren't fetched until the frontier advances.
             Selection::Streaming { window } => {
-                // The window is the `window` pending chunks with the smallest
-                // playback position; find the cutoff (the (window+1)-th smallest)
-                // in O(n) via select_nth rather than fully sorting.
-                let mut positions: Vec<usize> = order.iter().map(|h| self.positions[h]).collect();
-                let threshold = if window < positions.len() {
-                    *positions.select_nth_unstable(window).1
-                } else {
-                    usize::MAX
-                };
-                order.sort_by_cached_key(|h| {
-                    let pos = self.positions[h];
-                    if pos < threshold {
-                        (0usize, pos, 0usize) // in the window: strict playback order
-                    } else {
-                        (1usize, known_holders(h), pos) // beyond it: rarest-first
-                    }
-                });
+                // Clamp to at least 1: a zero window would gate out every chunk
+                // (cutoff == frontier) and stall, even if a caller set it directly.
+                let cutoff = self.frontier.saturating_add(window.max(1));
+                order.retain(|h| self.positions[h] < cutoff);
+                order.sort_by_cached_key(|h| self.positions[h]);
             }
         }
         order
@@ -236,7 +236,11 @@ impl Plan {
         self.pending.len()
     }
 
-    /// Whether every distinct chunk has arrived and verified.
+    /// Whether every distinct chunk has arrived and verified. The running download
+    /// tracks completion by *delivery* ([`all_delivered`](Self::all_delivered)),
+    /// since streaming drops delivered chunks; this storage-based view is used by
+    /// the unit tests, which store without delivering.
+    #[cfg(test)]
     pub fn is_complete(&self) -> bool {
         self.wanted.iter().all(|h| self.have.has(h))
     }
@@ -255,6 +259,39 @@ impl Plan {
     /// yet — for delivering a blob to a streaming consumer in order.
     pub fn chunk_at(&self, index: usize) -> Option<&[u8]> {
         self.have.get(self.manifest.chunks.get(index)?)
+    }
+
+    /// The next playback index not yet delivered — the frontier the streaming
+    /// window is measured from, and delivery blocks on.
+    pub fn frontier(&self) -> usize {
+        self.frontier
+    }
+
+    /// Whether every playback index has been delivered.
+    pub fn all_delivered(&self) -> bool {
+        self.frontier >= self.chunk_count()
+    }
+
+    /// Record that the chunk at the frontier has been delivered: advance the
+    /// frontier and, when `drop_delivered` is set (streaming), free the chunk's
+    /// bytes once its *last* playback position has passed — so a deduplicated
+    /// chunk still lasts until the later index, but memory stays bounded.
+    pub fn advance_delivery(&mut self, drop_delivered: bool) {
+        // Never advance past the end — the running loop only calls this after a
+        // chunk was delivered, but guarding keeps `frontier` from exceeding the
+        // count (and wrapping) if it's ever called once too often.
+        if self.all_delivered() {
+            return;
+        }
+        let index = self.frontier;
+        self.frontier += 1;
+        if drop_delivered {
+            if let Some(&hash) = self.manifest.chunks.get(index) {
+                if self.last_positions.get(&hash) == Some(&index) {
+                    self.have.remove(&hash);
+                }
+            }
+        }
     }
 }
 
@@ -406,24 +443,70 @@ mod tests {
     }
 
     #[test]
-    fn streaming_selection_prioritizes_the_playback_window() {
-        // Ten chunks. A holds 0..8, B holds all ten — so chunk 9 is the *rarest*
-        // (one holder). Rarest-first would hand out chunk 9 first; the streaming
-        // policy must instead lead with the playback window (chunks 0,1,2 in
-        // order), then fall back to rarest-first (chunk 9) beyond it.
+    fn streaming_window_gates_and_slides_with_the_frontier() {
+        // 10 chunks, window 3: only chunks within `window` positions of the
+        // frontier are eligible to fetch (in playback order); nothing further
+        // ahead, so memory stays bounded. As the frontier advances, the window
+        // slides.
         let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
         let (manifest, chunks) = blob(&data, 100); // 10 distinct chunks
-        let a = subset(&chunks, &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
-        let b = full(&chunks);
+        let seeder = full(&chunks);
         let mut plan = Plan::new(manifest);
         plan.set_selection(Selection::Streaming { window: 3 });
 
-        let order = plan.ordered_pending(&[&a, &b]);
-        let expected: Vec<Hash> = [0, 1, 2, 9, 3, 4, 5, 6, 7, 8]
-            .iter()
-            .map(|&i| chunks[i].0)
-            .collect();
-        assert_eq!(order, expected);
+        // Frontier at 0 → assign offers only 0,1,2, in playback order.
+        let a = plan.assign(&[&seeder], usize::MAX);
+        assert_eq!(a[0], vec![chunks[0].0, chunks[1].0, chunks[2].0]);
+
+        // Fetch + deliver them; the frontier advances to 3.
+        for (h, d) in chunks.iter().take(3) {
+            plan.store(*h, d.clone());
+            plan.advance_delivery(true);
+        }
+        assert_eq!(plan.frontier(), 3);
+
+        // The window has slid: now only 3,4,5 are eligible.
+        let a = plan.assign(&[&seeder], usize::MAX);
+        assert_eq!(a[0], vec![chunks[3].0, chunks[4].0, chunks[5].0]);
+    }
+
+    #[test]
+    fn streaming_drops_each_chunk_after_its_last_delivery() {
+        // Four distinct chunks: delivering each (with dropping on) frees exactly
+        // one, so memory shrinks to zero — not the whole blob retained.
+        let data: Vec<u8> = (0..400u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100); // 4 distinct chunks
+        let mut plan = Plan::new(manifest);
+        for (h, d) in &chunks {
+            plan.store(*h, d.clone());
+        }
+        assert_eq!(plan.stored_count(), 4);
+
+        for i in 0..4 {
+            plan.advance_delivery(true);
+            assert_eq!(plan.stored_count(), 4 - (i + 1));
+        }
+        assert!(plan.all_delivered());
+        assert_eq!(plan.stored_count(), 0);
+    }
+
+    #[test]
+    fn a_deduplicated_chunk_is_dropped_only_after_its_last_position() {
+        // Three identical chunks: the manifest lists one hash at indices 0,1,2. It
+        // must survive delivery of 0 and 1 and be freed only at 2.
+        let data = vec![0x5au8; 300];
+        let (manifest, chunks) = blob(&data, 100); // 1 distinct chunk, 3 positions
+        let mut plan = Plan::new(manifest);
+        plan.store(chunks[0].0, chunks[0].1.clone());
+        assert_eq!(plan.stored_count(), 1);
+
+        plan.advance_delivery(true); // index 0 — not the last position, kept
+        assert_eq!(plan.stored_count(), 1);
+        plan.advance_delivery(true); // index 1 — still not last, kept
+        assert_eq!(plan.stored_count(), 1);
+        plan.advance_delivery(true); // index 2 — last position, dropped
+        assert_eq!(plan.stored_count(), 0);
+        assert!(plan.all_delivered());
     }
 
     #[test]
@@ -534,6 +617,11 @@ mod tests {
     }
 
     impl Plan {
+        /// Test helper: how many chunks are currently held in the store.
+        fn stored_count(&self) -> usize {
+            self.have.len()
+        }
+
         /// Test helper: is `hash` currently pending?
         fn pending_contains(&self, hash: Hash) -> bool {
             self.pending.contains(&hash)

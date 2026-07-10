@@ -17,6 +17,35 @@ use std::collections::HashSet;
 use blob::{Manifest, Store};
 use crypto::Hash;
 
+/// What a provider can serve, as far as the scheduler knows — the input to
+/// [`Plan::assign`].
+#[derive(Clone, Debug)]
+pub enum Holdings {
+    /// The provider reported holding exactly these chunks (a `Have` bitfield).
+    Known(HashSet<Hash>),
+    /// The provider couldn't report its holdings, so it might hold anything.
+    /// Used only as a *last resort* — after known holders — so a speculative
+    /// provider can never be handed the last copy of a chunk while a provider
+    /// known to have it sits idle.
+    Unknown,
+}
+
+impl Holdings {
+    /// Whether this provider might serve `hash`: a known holder that has it, or
+    /// any `Unknown` provider (which might have anything).
+    fn can_serve(&self, hash: &Hash) -> bool {
+        match self {
+            Holdings::Known(set) => set.contains(hash),
+            Holdings::Unknown => true,
+        }
+    }
+
+    /// Whether this provider is a speculative (unknown-holdings) source.
+    fn is_unknown(&self) -> bool {
+        matches!(self, Holdings::Unknown)
+    }
+}
+
 /// Tracks which of a blob's chunks are still needed, hands them out to providers,
 /// and reassembles the blob once every chunk has arrived and verified.
 pub struct Plan {
@@ -48,31 +77,41 @@ impl Plan {
     }
 
     /// Assign pending chunks to providers for one round, **rarest-first** and
-    /// **holdings-aware**. `havesets[i]` is the set of chunk hashes live provider
-    /// `i` holds. Chunks are ordered by how few of these providers hold them
-    /// (rarest first, so the scarcest data is pulled while its holders are still
-    /// around), and each is given to a *least-loaded* provider that actually holds
-    /// it, up to `cap` chunks per provider. A chunk no provider holds is left
-    /// pending — the swarm can't supply it this round. Assigned chunks are removed
-    /// from pending; [`Plan::requeue`] returns any that aren't delivered. The
-    /// returned assignment is indexed to match `havesets`.
+    /// **holdings-aware**. `holdings[i]` is what live provider `i` can serve.
+    /// Chunks are ordered by how few *known* holders they have (rarest first, so
+    /// the scarcest data is pulled while its holders are still around) and each is
+    /// given to a *least-loaded* provider that can serve it, up to `cap` chunks
+    /// per provider. A known holder is always preferred over an [`Holdings::Unknown`]
+    /// provider, so the last copy of a chunk is never wasted on a speculative
+    /// source while a known holder is idle. A chunk no one can serve is left
+    /// pending. Assigned chunks are removed from pending; [`Plan::requeue`]
+    /// returns any that aren't delivered. The result is indexed to match `holdings`.
     ///
     /// Rarest-first is the right default for a partial-seeder swarm (it avoids
     /// piece starvation), but it is *not* ideal for streaming; keeping the choice
     /// to this one ordering makes a future deadline-aware policy a local change.
-    pub fn assign(&mut self, havesets: &[&HashSet<Hash>], cap: usize) -> Vec<Vec<Hash>> {
-        let mut assignment = vec![Vec::new(); havesets.len()];
-        let mut load = vec![0usize; havesets.len()];
+    pub fn assign(&mut self, holdings: &[&Holdings], cap: usize) -> Vec<Vec<Hash>> {
+        let mut assignment = vec![Vec::new(); holdings.len()];
+        let mut load = vec![0usize; holdings.len()];
 
-        // Rarest-first; ties broken by hash so the schedule is deterministic.
-        let holders = |h: &Hash| havesets.iter().filter(|hs| hs.contains(h)).count();
+        // Rarity counts only *known* holders — a speculative Unknown provider
+        // doesn't make a chunk look less scarce. Rarest first; ties by hash so the
+        // schedule is deterministic. `sort_by_cached_key` computes each key once.
+        let known_holders = |h: &Hash| {
+            holdings
+                .iter()
+                .filter(|hd| matches!(hd, Holdings::Known(set) if set.contains(h)))
+                .count()
+        };
         let mut order: Vec<Hash> = self.pending.iter().copied().collect();
-        order.sort_by_key(|h| (holders(h), *h));
+        order.sort_by_cached_key(|h| (known_holders(h), *h));
 
         for hash in order {
-            let pick = (0..havesets.len())
-                .filter(|&i| load[i] < cap && havesets[i].contains(&hash))
-                .min_by_key(|&i| (load[i], i));
+            // Prefer a known holder over a speculative Unknown (`is_unknown`:
+            // false sorts first), then least-loaded, then lowest index.
+            let pick = (0..holdings.len())
+                .filter(|&i| load[i] < cap && holdings[i].can_serve(&hash))
+                .min_by_key(|&i| (holdings[i].is_unknown(), load[i], i));
             if let Some(i) = pick {
                 assignment[i].push(hash);
                 load[i] += 1;
@@ -135,14 +174,14 @@ mod tests {
         (manifest, pairs)
     }
 
-    /// A haveset holding every chunk — a full seeder.
-    fn full(chunks: &[(Hash, Vec<u8>)]) -> HashSet<Hash> {
-        chunks.iter().map(|(h, _)| *h).collect()
+    /// Known holdings of every chunk — a full seeder.
+    fn full(chunks: &[(Hash, Vec<u8>)]) -> Holdings {
+        Holdings::Known(chunks.iter().map(|(h, _)| *h).collect())
     }
 
-    /// A haveset holding only the chunks at `indices`.
-    fn subset(chunks: &[(Hash, Vec<u8>)], indices: &[usize]) -> HashSet<Hash> {
-        indices.iter().map(|&i| chunks[i].0).collect()
+    /// Known holdings of only the chunks at `indices`.
+    fn subset(chunks: &[(Hash, Vec<u8>)], indices: &[usize]) -> Holdings {
+        Holdings::Known(indices.iter().map(|&i| chunks[i].0).collect())
     }
 
     /// Deliver every chunk in `assignment[i]` that provider `i` actually holds.
@@ -185,7 +224,7 @@ mod tests {
         for (i, held) in [&a, &b, &c].iter().enumerate() {
             for h in &assignment[i] {
                 assert!(
-                    held.contains(h),
+                    held.can_serve(h),
                     "provider {i} was assigned a chunk it lacks"
                 );
             }
@@ -233,6 +272,40 @@ mod tests {
         assert_eq!(plan.pending(), 1);
         assert!(plan.pending_contains(chunks[2].0));
         assert!(!plan.is_complete());
+    }
+
+    #[test]
+    fn a_known_holder_is_preferred_over_an_unknown_provider() {
+        // One chunk, cap 1, with the Unknown (speculative) provider listed *before*
+        // the real holder. It must go to the known holder, not be wasted on the
+        // Unknown — the regression this ordering guards against.
+        let data: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100); // 1 chunk
+        let only = chunks[0].0;
+        let unknown = Holdings::Unknown;
+        let holder = subset(&chunks, &[0]);
+        let mut plan = Plan::new(manifest);
+
+        let assignment = plan.assign(&[&unknown, &holder], 1);
+        assert!(
+            assignment[0].is_empty(),
+            "the unknown provider must not get it"
+        );
+        assert_eq!(assignment[1], vec![only], "the known holder must get it");
+    }
+
+    #[test]
+    fn an_unknown_provider_is_used_as_a_last_resort() {
+        // No one *reports* holding the chunk, so the only hope is to probe the
+        // Unknown provider optimistically.
+        let data: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100);
+        let only = chunks[0].0;
+        let unknown = Holdings::Unknown;
+        let mut plan = Plan::new(manifest);
+
+        let assignment = plan.assign(&[&unknown], usize::MAX);
+        assert_eq!(assignment[0], vec![only]);
     }
 
     #[test]

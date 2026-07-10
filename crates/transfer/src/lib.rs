@@ -52,7 +52,7 @@ use congestion::{Congestion, Rtt};
 use crypto::{Hash, PublicKey};
 use driver::Channel;
 use frame::{Packet, Reassembler};
-use plan::Plan;
+use plan::{Holdings, Plan};
 use sync::{BlobDownload, FeedDownload, Message, SyncError};
 use thiserror::Error;
 use tokio::time::{sleep, timeout, Instant};
@@ -204,12 +204,12 @@ struct Cursor {
 }
 
 /// A provider in a swarm download: its channel, the session `Cursor` carried
-/// across rounds, and the set of chunk hashes it advertised holding (learned once
-/// up front, so chunks are only assigned to a provider that has them).
+/// across rounds, and what it advertised holding (learned once up front, so
+/// chunks are assigned to providers that have them — see [`Holdings`]).
 struct Provider {
     channel: Channel,
     cursor: Cursor,
-    holds: HashSet<Hash>,
+    holds: Holdings,
 }
 
 /// Download and verify a blob by fetching its chunks from **several** providers
@@ -242,7 +242,7 @@ pub async fn download_blob_swarm(
         .map(|channel| Provider {
             channel,
             cursor: Cursor::default(),
-            holds: HashSet::new(),
+            holds: Holdings::Known(HashSet::new()),
         })
         .collect();
 
@@ -296,10 +296,10 @@ pub async fn download_blob_swarm(
     // Fetch chunks in rounds until complete, out of providers, or stuck.
     while !plan.is_complete() && !providers.is_empty() && plan.pending() > 0 {
         let cap = plan.pending().div_ceil(providers.len());
-        // Scope the haveset borrow so `providers` is free to move below.
+        // Scope the holdings borrow so `providers` is free to move below.
         let assignment = {
-            let havesets: Vec<&HashSet<Hash>> = providers.iter().map(|p| &p.holds).collect();
-            plan.assign(&havesets, cap)
+            let holdings: Vec<&Holdings> = providers.iter().map(|p| &p.holds).collect();
+            plan.assign(&holdings, cap)
         };
         let mut taken = Vec::new();
         let mut fetches = tokio::task::JoinSet::new();
@@ -376,16 +376,18 @@ async fn fetch_manifest<L: Link>(
 /// The holdings are a scheduling hint, not a trust boundary: every chunk is
 /// verified by hash on receipt, so an inaccurate answer can never corrupt the
 /// blob. It can affect liveness, though — a false negative (a chunk held but not
-/// reported) means we won't request it from this provider, which is exactly why
-/// an `Absent` (report nothing) is treated optimistically rather than as empty. A
-/// genuinely unexpected reply is treated as holding nothing.
+/// reported) means we won't request it from this provider. That's why an `Absent`
+/// (can't report at all) becomes [`Holdings::Unknown`] — a last-resort source the
+/// scheduler probes only when no known holder can serve a chunk, rather than
+/// either excluding it (risking a false "unavailable") or trusting it over a
+/// known holder. A genuinely unexpected reply is treated as holding nothing.
 async fn fetch_haveset<L: Link>(
     channel: &mut L,
     id: Hash,
     manifest: &Manifest,
     cfg: &Config,
     cursor: &mut Cursor,
-) -> Result<HashSet<Hash>, TransferError> {
+) -> Result<Holdings, TransferError> {
     let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *cursor);
     let result = match exchange(&mut wire, &Message::GetHave { id }, cfg).await {
         Ok(Message::Have { bits }) => {
@@ -398,11 +400,12 @@ async fn fetch_haveset<L: Link>(
                     holds.insert(*hash);
                 }
             }
-            Ok(holds)
+            Ok(Holdings::Known(holds))
         }
-        // Can't report holdings → optimistically assume it might have anything.
-        Ok(Message::Absent) => Ok(manifest.chunks.iter().copied().collect()),
-        Ok(_) => Ok(HashSet::new()),
+        // Responsive but can't enumerate its holdings → probe as a last resort.
+        Ok(Message::Absent) => Ok(Holdings::Unknown),
+        // A genuinely unexpected reply: don't rely on it.
+        Ok(_) => Ok(Holdings::Known(HashSet::new())),
         Err(e) => Err(e),
     };
     *cursor = wire.cursor();

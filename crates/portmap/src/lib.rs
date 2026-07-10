@@ -200,8 +200,8 @@ pub struct Mapping {
 }
 
 /// Validate the fixed header and length, returning the first [`MSG_LEN`] bytes.
-/// `opcode_byte` is the expected version-1 octet (opcode, with the response bit
-/// for a response).
+/// `opcode_byte` is the expected value of byte 1 — the R-bit-plus-opcode octet
+/// (the opcode alone for a request, or ORed with the response bit for a response).
 fn check_header(buf: &[u8], opcode_byte: u8) -> Result<&[u8], PcpError> {
     if buf.len() < MSG_LEN || buf[0] != VERSION || buf[1] != opcode_byte {
         return Err(PcpError::Malformed);
@@ -240,6 +240,11 @@ fn random_nonce() -> [u8; NONCE_LEN] {
 /// and only a response carrying our nonce, from the gateway, is accepted — so a
 /// spoofed or stale reply is ignored. A non-success result code is surfaced as
 /// [`PcpError::Rejected`].
+///
+/// # Panics
+///
+/// Panics only if the OS entropy source is unavailable (needed for the mapping
+/// nonce), which is unrecoverable.
 pub async fn map_port(
     gateway: SocketAddr,
     internal_port: u16,
@@ -261,7 +266,10 @@ pub async fn map_port(
     let client_ip = as_v6(sock.local_addr()?.ip());
 
     let nonce = random_nonce();
-    let secs = lifetime.as_secs().min(u32::MAX as u64) as u32;
+    // Clamp to at least 1s: PCP reads a zero lifetime as "delete the mapping", so
+    // a sub-second `lifetime` (which `as_secs` would truncate to 0) must not turn
+    // a map request into an unmap.
+    let secs = lifetime.as_secs().clamp(1, u32::MAX as u64) as u32;
     let request = MapRequest::map_udp(nonce, internal_port, secs, client_ip).encode();
 
     let mut buf = [0u8; 1100];

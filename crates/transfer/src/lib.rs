@@ -52,7 +52,7 @@ use congestion::{Congestion, Rtt};
 use crypto::{Hash, PublicKey};
 use driver::Channel;
 use frame::{Packet, Reassembler};
-use plan::Plan;
+use plan::{Holdings, Plan};
 use sync::{BlobDownload, FeedDownload, Message, SyncError};
 use thiserror::Error;
 use tokio::time::{sleep, timeout, Instant};
@@ -203,11 +203,13 @@ struct Cursor {
     accepted: Option<u64>,
 }
 
-/// A provider in a swarm download: its channel plus the session `Cursor` carried
-/// across rounds.
+/// A provider in a swarm download: its channel, the session `Cursor` carried
+/// across rounds, and what it advertised holding (learned once up front, so
+/// chunks are assigned to providers that have them — see [`Holdings`]).
 struct Provider {
     channel: Channel,
     cursor: Cursor,
+    holds: Holdings,
 }
 
 /// Download and verify a blob by fetching its chunks from **several** providers
@@ -217,15 +219,19 @@ struct Provider {
 ///
 /// The manifest is fetched by trying the providers in turn, taking the first
 /// that serves it (a slow or dead first provider delays this — racing them for
-/// the manifest is future work). Then the still-missing chunks are partitioned
-/// across the live providers and fetched in concurrent rounds. A chunk a provider
-/// was assigned but didn't return is re-partitioned to others, and a provider
-/// that stops responding (a channel error or a timeout) is retired. Returns
-/// [`TransferError::Incomplete`] if the survivors can't supply the rest.
+/// the manifest is future work). Each live provider is then asked which chunks it
+/// holds, so a **partial seeder** — one holding only some of the blob — can still
+/// contribute; several partial seeders together assemble a blob none of them has
+/// in full. Chunks are scheduled **rarest-first** (the scarcest data is pulled
+/// while its few holders are still around) and only to a provider that holds
+/// them. A chunk a provider was assigned but didn't return is re-assigned; a
+/// provider that stops responding (a channel error or a timeout) is retired.
+/// Returns [`TransferError::Incomplete`] if the survivors can't supply the rest.
 ///
 /// v1 is round-based: a slow (but alive) provider can hold up its round — work
-/// isn't stolen mid-round yet — and chunks are chosen in manifest order
-/// (streaming-friendly), not rarest-first.
+/// isn't stolen mid-round yet. Rarest-first is the right default for a
+/// partial-seeder swarm but not for streaming; the selection is isolated in the
+/// scheduler's `assign` step so a deadline-aware policy can replace it there.
 pub async fn download_blob_swarm(
     channels: Vec<Channel>,
     id: Hash,
@@ -236,6 +242,7 @@ pub async fn download_blob_swarm(
         .map(|channel| Provider {
             channel,
             cursor: Cursor::default(),
+            holds: Holdings::Known(HashSet::new()),
         })
         .collect();
 
@@ -259,30 +266,61 @@ pub async fn download_blob_swarm(
         }
     }
     live.extend(rest); // providers we never had to try
-    let mut providers = live;
-    let mut plan = Plan::new(manifest.ok_or(TransferError::Incomplete)?);
+    let manifest = manifest.ok_or(TransferError::Incomplete)?;
+
+    // Learn each live provider's holdings, so chunks are assigned rarest-first to
+    // providers that have them. A provider whose channel fails here is retired;
+    // one that can't report holdings (`Absent`) is kept and probed optimistically
+    // (see `fetch_haveset`).
+    let mut providers = Vec::with_capacity(live.len());
+    for mut provider in live {
+        match fetch_haveset(
+            &mut provider.channel,
+            id,
+            &manifest,
+            cfg,
+            &mut provider.cursor,
+        )
+        .await
+        {
+            Ok(holds) => {
+                provider.holds = holds;
+                providers.push(provider);
+            }
+            // A dead channel (timeout / I/O) retires the provider.
+            Err(TransferError::Timeout) | Err(TransferError::Io(_)) => {}
+            // Any other failure to learn holdings (a protocol/decoding error):
+            // keep the provider, but as Unknown so it's still probed as a last
+            // resort rather than left with an empty haveset it'd never be assigned.
+            Err(_) => {
+                provider.holds = Holdings::Unknown;
+                providers.push(provider);
+            }
+        }
+    }
+    let mut plan = Plan::new(manifest);
 
     // Fetch chunks in rounds until complete, out of providers, or stuck.
     while !plan.is_complete() && !providers.is_empty() && plan.pending() > 0 {
-        let share = plan.pending().div_ceil(providers.len());
+        let cap = plan.pending().div_ceil(providers.len());
+        // Scope the holdings borrow so `providers` is free to move below.
+        let assignment = {
+            let holdings: Vec<&Holdings> = providers.iter().map(|p| &p.holds).collect();
+            plan.assign(&holdings, cap)
+        };
         let mut taken = Vec::new();
         let mut fetches = tokio::task::JoinSet::new();
-        for mut provider in std::mem::take(&mut providers) {
-            let assignment = plan.take(share);
-            if assignment.is_empty() {
-                providers.push(provider); // more providers than chunks: idle this round, keep it
+        for (mut provider, chunks) in std::mem::take(&mut providers).into_iter().zip(assignment) {
+            if chunks.is_empty() {
+                providers.push(provider); // holds nothing still needed: idle, but keep it
                 continue;
             }
-            taken.extend(assignment.iter().copied());
+            taken.extend(chunks.iter().copied());
             let cfg = *cfg;
             fetches.spawn(async move {
-                let outcome = download_chunks(
-                    &mut provider.channel,
-                    &assignment,
-                    &cfg,
-                    &mut provider.cursor,
-                )
-                .await;
+                let outcome =
+                    download_chunks(&mut provider.channel, &chunks, &cfg, &mut provider.cursor)
+                        .await;
                 (provider, outcome)
             });
         }
@@ -324,6 +362,54 @@ async fn fetch_manifest<L: Link>(
         Ok(Message::Manifest(manifest)) if manifest.id() == id => Ok(manifest),
         Ok(Message::Manifest(_)) => Err(TransferError::Sync(SyncError::BadManifest)),
         Ok(_) => Err(TransferError::Sync(SyncError::Absent)),
+        Err(e) => Err(e),
+    };
+    *cursor = wire.cursor();
+    result
+}
+
+/// Ask one provider which of the blob's chunks it holds, decoded from the `Have`
+/// bitfield against `manifest`. Advances the `cursor`; a channel error or timeout
+/// is surfaced as `Err` so the caller can retire the provider.
+///
+/// The holdings are a scheduling hint, not a trust boundary: every chunk is still
+/// verified by hash on receipt, so an inaccurate answer can never corrupt the
+/// blob — it can only affect liveness (a chunk a provider has but doesn't report
+/// won't be requested from it). So a provider that *can't* report its holdings —
+/// `Absent` (e.g. it serves chunks by hash but doesn't store the manifest), or a
+/// bitfield too short to cover the manifest — becomes [`Holdings::Unknown`]: a
+/// last-resort source the scheduler probes only when no known holder can serve a
+/// chunk, rather than excluding it (risking a false "unavailable") or reading a
+/// truncated bitfield as "lacks the missing chunks". A genuinely unexpected reply
+/// is treated as holding nothing.
+async fn fetch_haveset<L: Link>(
+    channel: &mut L,
+    id: Hash,
+    manifest: &Manifest,
+    cfg: &Config,
+    cursor: &mut Cursor,
+) -> Result<Holdings, TransferError> {
+    let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *cursor);
+    let result = match exchange(&mut wire, &Message::GetHave { id }, cfg).await {
+        // A bitfield shorter than the manifest needs is malformed/truncated;
+        // reading it would falsely mark the uncovered chunks absent, so probe the
+        // provider as a last resort instead. Extra trailing bytes are harmless.
+        Ok(Message::Have { bits }) if bits.len() < manifest.chunks.len().div_ceil(8) => {
+            Ok(Holdings::Unknown)
+        }
+        Ok(Message::Have { bits }) => {
+            let mut holds = HashSet::new();
+            for (i, hash) in manifest.chunks.iter().enumerate() {
+                if bits[i / 8] & (1 << (i % 8)) != 0 {
+                    holds.insert(*hash);
+                }
+            }
+            Ok(Holdings::Known(holds))
+        }
+        // Responsive but can't enumerate its holdings → probe as a last resort.
+        Ok(Message::Absent) => Ok(Holdings::Unknown),
+        // A genuinely unexpected reply: don't rely on it.
+        Ok(_) => Ok(Holdings::Known(HashSet::new())),
         Err(e) => Err(e),
     };
     *cursor = wire.cursor();

@@ -64,6 +64,8 @@ const KIND_GET_MANIFEST: u8 = 6;
 const KIND_MANIFEST: u8 = 7;
 const KIND_GET_CHUNK: u8 = 8;
 const KIND_CHUNK: u8 = 9;
+const KIND_GET_HAVE: u8 = 10;
+const KIND_HAVE: u8 = 11;
 
 /// A sync protocol message: a request from the client, or a response from the
 /// server. A session is tied to one feed, so feed requests carry no id; blob
@@ -108,6 +110,24 @@ pub enum Message {
         /// The chunk bytes.
         data: Vec<u8>,
     },
+    /// Client → server: which chunks of blob `id` do you hold? Used by a swarm
+    /// download to schedule rarest-first among partial seeders.
+    GetHave {
+        /// The blob's content address.
+        id: Hash,
+    },
+    /// Server → client: a bitfield over the blob's manifest — bit `i` (bit `i%8`
+    /// of byte `i/8`, LSB-first) is set iff the server holds `manifest.chunks[i]`.
+    /// The client interprets it against the manifest it already fetched, as a
+    /// *scheduling hint*. Every chunk is still verified by hash on receipt, so an
+    /// inaccurate bitfield can never corrupt the download; it can only affect
+    /// availability — a bit wrongly *set* wastes a request (the chunk comes back
+    /// `Absent`), a bit wrongly *cleared* keeps the client from asking this
+    /// provider for a chunk it actually has.
+    Have {
+        /// The holdings bitfield.
+        bits: Vec<u8>,
+    },
     /// Server → client: the requested item isn't available.
     Absent,
 }
@@ -150,6 +170,14 @@ impl Message {
                 enc.u8(KIND_CHUNK);
                 enc.bytes(data);
             }
+            Message::GetHave { id } => {
+                enc.u8(KIND_GET_HAVE);
+                enc.raw(id);
+            }
+            Message::Have { bits } => {
+                enc.u8(KIND_HAVE);
+                enc.bytes(bits);
+            }
             Message::Absent => {
                 enc.u8(KIND_ABSENT);
             }
@@ -179,6 +207,12 @@ impl Message {
             KIND_CHUNK => Message::Chunk {
                 data: dec.bytes()?.to_vec(),
             },
+            KIND_GET_HAVE => Message::GetHave {
+                id: dec.array::<HASH_LEN>()?,
+            },
+            KIND_HAVE => Message::Have {
+                bits: dec.bytes()?.to_vec(),
+            },
             KIND_ABSENT => Message::Absent,
             _ => return Err(SyncError::Malformed("unknown message kind")),
         };
@@ -197,6 +231,7 @@ impl Message {
                 | Message::GetBlock { .. }
                 | Message::GetManifest { .. }
                 | Message::GetChunk { .. }
+                | Message::GetHave { .. }
         )
     }
 }
@@ -346,6 +381,22 @@ pub fn serve_blob(request: &Message, store: &blob::Store) -> Message {
                 data: data.to_vec(),
             },
             None => Message::Absent,
+        },
+        // Report holdings as a bitfield over the blob's manifest. Needs the
+        // manifest to enumerate chunks; without it the server can't map its stored
+        // chunks to this blob, so it answers `Absent` (a swarm client then probes
+        // it optimistically rather than relying on a haveset).
+        Message::GetHave { id } => match store.get(id).map(Manifest::decode) {
+            Some(Ok(manifest)) => {
+                let mut bits = vec![0u8; manifest.chunks.len().div_ceil(8)];
+                for (i, hash) in manifest.chunks.iter().enumerate() {
+                    if store.has(hash) {
+                        bits[i / 8] |= 1 << (i % 8);
+                    }
+                }
+                Message::Have { bits }
+            }
+            _ => Message::Absent,
         },
         _ => Message::Absent,
     }
@@ -688,6 +739,12 @@ mod tests {
             Message::Chunk {
                 data: b"chunk bytes".to_vec(),
             },
+            Message::GetHave {
+                id: crypto::hash(b"id"),
+            },
+            Message::Have {
+                bits: vec![0b1010_1101, 0x00, 0xff],
+            },
             Message::Absent,
         ];
         for m in msgs {
@@ -779,5 +836,38 @@ mod tests {
             serve_blob(&Message::GetChunk { hash: missing }, &server),
             Message::Absent
         );
+        // No manifest for this blob → can't enumerate its chunks → Absent.
+        assert_eq!(
+            serve_blob(&Message::GetHave { id: missing }, &server),
+            Message::Absent
+        );
+    }
+
+    #[test]
+    fn get_have_reports_a_holdings_bitfield() {
+        // A blob of 10 distinct chunks; a store holding the manifest plus only the
+        // even-indexed chunks reports a bitfield that matches exactly what it holds.
+        let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob::split_with(&data, 100);
+        assert_eq!(manifest.chunks.len(), 10);
+        let id = manifest.id();
+
+        let mut store = blob::Store::new();
+        store.put(manifest.encode());
+        for (i, chunk) in chunks.iter().enumerate() {
+            if i % 2 == 0 {
+                store.put(chunk.clone());
+            }
+        }
+
+        let Message::Have { bits } = serve_blob(&Message::GetHave { id }, &store) else {
+            panic!("a store holding the manifest should report a Have bitfield");
+        };
+        for (i, hash) in manifest.chunks.iter().enumerate() {
+            let bit_set = bits[i / 8] & (1 << (i % 8)) != 0;
+            assert_eq!(bit_set, store.has(hash), "bitfield disagrees at chunk {i}");
+        }
+        // The partial store genuinely holds some and lacks some.
+        assert!(store.has(&manifest.chunks[0]) && !store.has(&manifest.chunks[1]));
     }
 }

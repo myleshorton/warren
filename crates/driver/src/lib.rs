@@ -924,7 +924,11 @@ async fn discover_external(
     reflectors: &[SocketAddr],
     port_mapping: bool,
 ) -> SocketAddr {
-    if !port_mapping {
+    // UPnP-IGD is IPv4-only (SSDP is an IPv4 multicast and the mapping yields an
+    // IPv4 external address), so it can't produce a target for an IPv6 data
+    // socket — skip it and advertise the reflexive address, which is derived from
+    // the socket itself and so is correct for either family.
+    if !port_mapping || local.is_ipv6() {
         return reflexive_addr(sock, id, local, reflectors).await;
     }
     // Run both concurrently: the mapping touches its own sockets (SSDP/HTTP), so
@@ -1114,6 +1118,20 @@ mod tests {
         let local = sock.local_addr().unwrap();
         let observed =
             discover_external(&sock, NodeId::from_bytes([1u8; 32]), local, &[], false).await;
+        assert_eq!(observed, local);
+    }
+
+    #[tokio::test]
+    async fn discover_external_skips_ipv4_only_mapping_for_ipv6_sockets() {
+        // UPnP is IPv4-only, so even with mapping enabled a v6 socket must not
+        // attempt it (which could advertise an unreachable IPv4 address); it
+        // stays reflexive-only, falling back to `local` with no reflector.
+        let Ok(sock) = UdpSocket::bind("[::1]:0").await else {
+            return; // no IPv6 loopback in this environment — nothing to check
+        };
+        let local = sock.local_addr().unwrap();
+        let observed =
+            discover_external(&sock, NodeId::from_bytes([1u8; 32]), local, &[], true).await;
         assert_eq!(observed, local);
     }
 }

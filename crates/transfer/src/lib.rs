@@ -363,11 +363,19 @@ async fn fetch_manifest<L: Link>(
 
 /// Ask one provider which of the blob's chunks it holds, returning them as a set
 /// of chunk hashes (decoded from the `Have` bitfield against `manifest`).
-/// Advances the `cursor`. A provider that answers but can't report holdings
-/// (`Absent` or an unexpected message) is treated as holding nothing; a channel
-/// error or timeout is surfaced as `Err` so the caller can retire it. The
-/// holdings are advisory — every chunk is still verified by hash on receipt, so a
-/// wrong bitfield can only waste a request, never corrupt the blob.
+/// Advances the `cursor`. A channel error or timeout is surfaced as `Err` so the
+/// caller can retire the provider.
+///
+/// A provider that answers `Absent` can't enumerate its holdings for this blob
+/// (e.g. it serves chunks by hash but doesn't store the manifest). Rather than
+/// exclude a possibly-useful source — which could falsely report the blob
+/// unavailable — assume optimistically that it might hold *any* chunk and let
+/// hash-verified probing sort it out; the cost is some wasted requests to a
+/// provider that turns out to hold little. (Claiming everything adds one to every
+/// chunk's holder count uniformly, so it leaves the rarest-first order intact.)
+/// The holdings are advisory regardless — every chunk is still verified by hash
+/// on receipt, so an inaccurate answer can only waste a request, never corrupt
+/// the blob. A genuinely unexpected reply is treated as holding nothing.
 async fn fetch_haveset<L: Link>(
     channel: &mut L,
     id: Hash,
@@ -389,6 +397,8 @@ async fn fetch_haveset<L: Link>(
             }
             Ok(holds)
         }
+        // Can't report holdings → optimistically assume it might have anything.
+        Ok(Message::Absent) => Ok(manifest.chunks.iter().copied().collect()),
         Ok(_) => Ok(HashSet::new()),
         Err(e) => Err(e),
     };

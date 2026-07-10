@@ -198,7 +198,8 @@ mod tests {
 
     #[test]
     fn assigns_the_rarest_chunk_to_its_only_holder() {
-        // Every provider holds chunks 0..3; only provider 2 also holds chunk 3.
+        // All three providers hold chunks 0, 1, 2; only provider 2 also holds
+        // chunk 3 — so chunk 3 is the rarest.
         let data: Vec<u8> = (0..400u32).map(|i| i as u8).collect();
         let (manifest, chunks) = blob(&data, 100); // 4 chunks
         let rare = chunks[3].0;

@@ -49,6 +49,17 @@ fn partial_store(data: &[u8], indices: &[usize]) -> blob::Store {
     store
 }
 
+/// A provider that holds some chunks but *not* the manifest, so it can't report
+/// holdings (`GetHave` → `Absent`) yet can still serve those chunks by hash.
+fn chunks_only_store(data: &[u8], indices: &[usize]) -> blob::Store {
+    let (_manifest, chunks) = blob::split(data);
+    let mut store = blob::Store::new();
+    for &i in indices {
+        store.put(chunks[i].clone());
+    }
+    store
+}
+
 #[tokio::test]
 async fn swarm_downloads_from_several_full_providers() {
     // A blob of several chunks, held in full by three providers. The client
@@ -137,5 +148,39 @@ async fn swarm_assembles_from_partial_seeders() {
         .await
         .expect("swarm should finish")
         .expect("partial seeders should collectively assemble the blob");
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn swarm_uses_a_provider_that_cannot_report_holdings() {
+    // One provider has the manifest + chunks {0,1}; the other has chunks {2,3} but
+    // no manifest, so it answers `Absent` to GetHave. The client must still probe
+    // it (optimistically) to get {2,3), which no one else has — otherwise the blob
+    // would look unavailable.
+    let data: Vec<u8> = (0..blob::CHUNK_SIZE * 4)
+        .map(|i| (i / blob::CHUNK_SIZE) as u8)
+        .collect();
+    let id = blob::split(&data).0.id();
+
+    let (client_m, mut server_m) = connected_pair().await; // manifest + {0,1}
+    let (client_x, mut server_x) = connected_pair().await; // {2,3}, no manifest
+
+    let store_m = partial_store(&data, &[0, 1]);
+    let store_x = chunks_only_store(&data, &[2, 3]);
+    let _m = tokio::spawn(async move {
+        let _ = serve_blob(&mut server_m, &store_m, &Config::default()).await;
+    });
+    let _x = tokio::spawn(async move {
+        let _ = serve_blob(&mut server_x, &store_x, &Config::default()).await;
+    });
+
+    // Manifest-holder first, so the manifest is found and X is the odd one out.
+    let got = timeout(
+        T,
+        download_blob_swarm(vec![client_m, client_x], id, &Config::default()),
+    )
+    .await
+    .expect("swarm should finish")
+    .expect("a provider that can't report holdings must still be probed");
     assert_eq!(got, data);
 }

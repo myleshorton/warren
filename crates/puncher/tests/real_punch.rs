@@ -9,7 +9,10 @@
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
-use puncher::{accept, connect_to, open_birthday_sockets, spray, Config, Established};
+use puncher::{
+    accept, accept_any, connect_to, connect_to_any, open_birthday_sockets, spray, Config,
+    Established,
+};
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Duration};
 
@@ -160,4 +163,57 @@ async fn birthday_punch_over_real_sockets() {
     // The sprayed hit and the receiving socket are the same port.
     assert_eq!(c.peer.port(), r.socket.local_addr().unwrap().port());
     assert_bidirectional(&c, &r).await;
+}
+
+#[tokio::test]
+async fn connect_to_any_locks_onto_the_reachable_candidate() {
+    // Given several candidates — a live server plus a decoy that never answers —
+    // connect_to_any establishes with whichever responds, ignoring the dead one.
+    let server = UdpSocket::bind(addr(0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = UdpSocket::bind(addr(0)).await.unwrap();
+    // A bound-but-silent decoy: it swallows probes without replying (and, being
+    // bound, won't provoke an ICMP port-unreachable the way an empty port would).
+    let decoy = UdpSocket::bind(addr(0)).await.unwrap();
+    let decoy_addr = decoy.local_addr().unwrap();
+    let cfg = Config::default();
+    let candidates = [decoy_addr, server_addr];
+
+    let (rs, rc) = tokio::join!(
+        accept(server, LO, &cfg),
+        connect_to_any(client, &candidates, &cfg)
+    );
+    let s = rs.unwrap().expect("server should accept");
+    let c = rc
+        .unwrap()
+        .expect("client should connect to the live candidate");
+    assert_eq!(
+        c.peer, server_addr,
+        "connect_to_any locks onto the responding candidate, not the decoy"
+    );
+    assert_bidirectional(&c, &s).await;
+}
+
+#[tokio::test]
+async fn accept_any_honors_any_listed_host() {
+    // The accept side is given several candidate hosts; a probe from any of them
+    // establishes. Here the real dialer is on loopback, listed alongside a decoy
+    // host it is not.
+    let server = UdpSocket::bind(addr(0)).await.unwrap();
+    let server_addr = server.local_addr().unwrap();
+    let client = UdpSocket::bind(addr(0)).await.unwrap();
+    let other: IpAddr = "203.0.113.1".parse().unwrap(); // documentation range, not us
+    let cfg = Config::default();
+    let hosts = [other, LO];
+
+    let (rs, rc) = tokio::join!(
+        accept_any(server, &hosts, &cfg),
+        connect_to(client, server_addr, &cfg)
+    );
+    let s = rs
+        .unwrap()
+        .expect("server accepts a probe from a listed host");
+    let c = rc.unwrap().expect("client connects");
+    assert_eq!(c.peer, server_addr);
+    assert_bidirectional(&c, &s).await;
 }

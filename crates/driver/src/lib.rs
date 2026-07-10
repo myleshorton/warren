@@ -268,7 +268,12 @@ enum Command {
     Bootstrap(oneshot::Sender<()>),
     Announce(NodeId, oneshot::Sender<()>),
     Lookup(NodeId, oneshot::Sender<Vec<Contact>>),
-    Connect(NodeId, UdpSocket, SocketAddr, oneshot::Sender<ConnectReply>),
+    Connect(
+        NodeId,
+        UdpSocket,
+        Vec<SocketAddr>,
+        oneshot::Sender<ConnectReply>,
+    ),
     SetFirewall(Firewall),
     Reflectors(oneshot::Sender<Vec<SocketAddr>>),
 }
@@ -468,16 +473,16 @@ impl Node {
             .await
             .map_err(ConnectError::Bind)?;
         let local = data_sock.local_addr().map_err(ConnectError::Bind)?;
-        // Learn the data socket's external address to advertise as the punch
-        // target: a reflexive probe, optionally upgraded to an explicit UPnP port
-        // mapping. Falls back to `local` if neither yields anything (correct on an
+        // Gather the data socket's candidate addresses to advertise as punch
+        // targets: the reflexive probe, an optional explicit UPnP mapping, and the
+        // local address. Always includes `local`, so it's non-empty (correct on an
         // unNATed host).
         let reflectors = self.reflectors().await.map_err(|_| ConnectError::Closed)?;
-        let advertised =
-            discover_external(&data_sock, self.id, local, &reflectors, self.port_mapping).await;
+        let candidates =
+            gather_candidates(&data_sock, self.id, local, &reflectors, self.port_mapping).await;
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(Command::Connect(target, data_sock, advertised, tx))
+            .send(Command::Connect(target, data_sock, candidates, tx))
             .await
             .map_err(|_| ConnectError::Closed)?;
         match rx.await {
@@ -584,13 +589,10 @@ async fn run(
                         // Seed the birthday RNG from the pre-bound socket's port so
                         // concurrent connects don't spray identical port sequences.
                         let seed = data_sock.local_addr().map(|a| a.port()).unwrap_or(0) as u64;
-                        // PR-A wires the candidate set through the protocol but the
-                        // punch still uses the first candidate; trying the whole set
-                        // is the driver/puncher change in the follow-up.
                         spawn_connect_punch(PunchJob {
                             data_sock,
                             own_host: data_ip,
-                            peer: peer_data_addrs.first().copied(),
+                            peers: peer_data_addrs,
                             strategy,
                             outcome,
                             cfg: punch_cfg,
@@ -605,21 +607,17 @@ async fn run(
                     initiator_data_addrs,
                     strategy,
                 } => {
-                    // Stand up a data socket and discover its external address via
+                    // Stand up a data socket and gather its candidate addresses via
                     // a reflexive probe — off the actor (it awaits a round-trip),
-                    // feeding the result back so we then reply with that address
-                    // and run the punch (see the `reflexive_rx` branch below).
-                    // Decline if the node is bound to an unspecified address: the
-                    // data socket's address would be unspecified too, unpunchable
-                    // by the peer (mirrors the outbound `UnspecifiedLocalAddr`
-                    // check); the initiator times out. Decline too if the initiator
-                    // offered no candidate — there's nowhere to punch to.
-                    // PR-A punches toward the first candidate; the follow-up tries
-                    // the whole set.
-                    if let (false, Some(peer_addr)) =
-                        (data_ip.is_unspecified(), initiator_data_addrs.first())
-                    {
-                        let peer_host = peer_addr.ip();
+                    // feeding them back so we then reply with them and run the
+                    // punch (see the `reflexive_rx` branch below). Decline if the
+                    // node is bound to an unspecified address: the data socket's
+                    // address would be unspecified too, unpunchable by the peer
+                    // (mirrors the outbound `UnspecifiedLocalAddr` check); the
+                    // initiator times out. Decline too if the initiator offered no
+                    // candidate host — there's nowhere to punch to.
+                    let peer_hosts = candidate_hosts(&initiator_data_addrs);
+                    if !data_ip.is_unspecified() && !peer_hosts.is_empty() {
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
                             if let Ok(local) = data_sock.local_addr() {
                                 let id = dht.id();
@@ -634,7 +632,7 @@ async fn run(
                                     local,
                                     reflectors,
                                     initiator,
-                                    peer_host,
+                                    peer_hosts,
                                     strategy,
                                     seed: local.port() as u64,
                                     port_mapping,
@@ -683,7 +681,7 @@ async fn run(
                             dht.lookup(topic, now());
                         }
                     }
-                    Some(Command::Connect(target, data_sock, data_addr, tx)) => {
+                    Some(Command::Connect(target, data_sock, data_addrs, tx)) => {
                         // The socket is already bound by `Node::connect`. Only one
                         // connect per target at a time; reject a second rather than
                         // displace the in-flight one's waiter.
@@ -693,9 +691,7 @@ async fn run(
                             }
                             Entry::Vacant(slot) => {
                                 slot.insert((data_sock, tx));
-                                // PR-A: advertise a single-element candidate set;
-                                // gathering multiple candidates is the follow-up.
-                                dht.connect(target, vec![data_addr], now());
+                                dht.connect(target, data_addrs, now());
                             }
                         }
                     }
@@ -724,13 +720,13 @@ async fn run(
             done = reflexive_rx.recv() => {
                 if let Some(done) = done {
                     // The accept-side reflexive probe finished: reply to the
-                    // initiator with the discovered external address, then run the
-                    // punch on the data socket per the planned strategy.
-                    dht.accept_connect(done.initiator, vec![done.external_addr], now());
+                    // initiator with our candidate addresses, then run the punch on
+                    // the data socket per the planned strategy.
+                    dht.accept_connect(done.initiator, done.external_addrs, now());
                     spawn_accept_punch(AcceptJob {
                         data_sock: done.data_sock,
                         own_host: data_ip,
-                        peer_host: done.peer_host,
+                        peer_hosts: done.peer_hosts,
                         strategy: done.strategy,
                         cfg: punch_cfg,
                         birthday,
@@ -758,8 +754,10 @@ struct PunchJob {
     data_sock: UdpSocket,
     /// Our data host, to bind spray/birthday sockets on.
     own_host: IpAddr,
-    /// The peer's data address (its host is what we punch toward).
-    peer: Option<SocketAddr>,
+    /// The peer's data-socket candidate addresses (Direct dials the whole set; the
+    /// birthday roles spray toward / are targeted at their distinct hosts). Empty
+    /// when there is no peer to punch to.
+    peers: Vec<SocketAddr>,
     /// Our punch role, as planned by the core.
     strategy: Option<Strategy>,
     /// The reachability outcome to report alongside any channel.
@@ -774,8 +772,9 @@ struct PunchJob {
 struct AcceptJob {
     data_sock: UdpSocket,
     own_host: IpAddr,
-    /// The initiator's data host, the only source we accept a punch from.
-    peer_host: IpAddr,
+    /// The initiator's candidate data hosts — the only sources we accept a punch
+    /// from / spray toward.
+    peer_hosts: Vec<IpAddr>,
     strategy: Strategy,
     cfg: PunchConfig,
     birthday: BirthdayParams,
@@ -790,10 +789,10 @@ struct ReflexiveProbe {
     local: SocketAddr,
     reflectors: Vec<SocketAddr>,
     initiator: NodeId,
-    peer_host: IpAddr,
+    peer_hosts: Vec<IpAddr>,
     strategy: Strategy,
     seed: u64,
-    /// Whether to also attempt a port mapping when discovering the address.
+    /// Whether to also attempt a port mapping when gathering candidates.
     port_mapping: bool,
     done: mpsc::Sender<ReflexiveDone>,
 }
@@ -801,29 +800,28 @@ struct ReflexiveProbe {
 /// Result of an accept-side reflexive probe, fed back into the actor loop.
 struct ReflexiveDone {
     initiator: NodeId,
-    /// The data socket's externally-observed address (or its local address if no
-    /// reflector answered), to advertise to the initiator.
-    external_addr: SocketAddr,
+    /// Our own data-socket candidate addresses, to advertise to the initiator.
+    external_addrs: Vec<SocketAddr>,
     data_sock: UdpSocket,
-    peer_host: IpAddr,
+    peer_hosts: Vec<IpAddr>,
     strategy: Strategy,
     seed: u64,
 }
 
-/// Discover the accept-side data socket's external address off the actor, then
-/// hand it (and the socket) back so the actor can reply and punch. Runs in its
+/// Gather the accept-side data socket's candidate addresses off the actor, then
+/// hand them (and the socket) back so the actor can reply and punch. Runs in its
 /// own task because the probe awaits a reflector round-trip.
 fn spawn_reflexive_probe(p: ReflexiveProbe) {
     tokio::spawn(async move {
-        let external_addr =
-            discover_external(&p.data_sock, p.id, p.local, &p.reflectors, p.port_mapping).await;
+        let external_addrs =
+            gather_candidates(&p.data_sock, p.id, p.local, &p.reflectors, p.port_mapping).await;
         let _ = p
             .done
             .send(ReflexiveDone {
                 initiator: p.initiator,
-                external_addr,
+                external_addrs,
                 data_sock: p.data_sock,
-                peer_host: p.peer_host,
+                peer_hosts: p.peer_hosts,
                 strategy: p.strategy,
                 seed: p.seed,
             })
@@ -840,7 +838,7 @@ fn spawn_connect_punch(job: PunchJob) {
     let PunchJob {
         data_sock,
         own_host,
-        peer,
+        peers,
         strategy,
         outcome,
         cfg,
@@ -849,20 +847,26 @@ fn spawn_connect_punch(job: PunchJob) {
         tx,
     } = job;
     tokio::spawn(async move {
-        let channel = match (strategy, peer) {
-            (Some(Strategy::Direct), Some(peer)) => punch_direct(data_sock, peer, &cfg).await,
-            (Some(Strategy::SprayRandomPorts), Some(peer)) => {
+        let hosts = candidate_hosts(&peers);
+        let channel = match strategy {
+            // No candidate to punch to (should not happen post-`on_signal` guard).
+            _ if peers.is_empty() => {
+                drop(data_sock);
+                None
+            }
+            Some(Strategy::Direct) => punch_direct(data_sock, &peers, &cfg).await,
+            Some(Strategy::SprayRandomPorts) => {
                 // The birthday primitives bind their own sockets; free the
                 // pre-bound one now so its FD/port can't collide with them.
                 drop(data_sock);
-                punch_spray(own_host, peer.ip(), &cfg, birthday, seed).await
+                punch_spray(own_host, &hosts, &cfg, birthday, seed).await
             }
-            (Some(Strategy::OpenBirthdaySockets), Some(peer)) => {
+            Some(Strategy::OpenBirthdaySockets) => {
                 drop(data_sock);
-                punch_open(own_host, peer.ip(), &cfg, birthday, seed).await
+                punch_open(own_host, &hosts, &cfg, birthday, seed).await
             }
             // Relay (symmetric↔symmetric: no direct path, and relaying is not
-            // built by design) / no peer to punch to.
+            // built by design) / no strategy.
             _ => {
                 drop(data_sock);
                 None
@@ -879,7 +883,7 @@ fn spawn_accept_punch(job: AcceptJob) {
     let AcceptJob {
         data_sock,
         own_host,
-        peer_host,
+        peer_hosts,
         strategy,
         cfg,
         birthday,
@@ -888,15 +892,15 @@ fn spawn_accept_punch(job: AcceptJob) {
     } = job;
     tokio::spawn(async move {
         let channel = match strategy {
-            Strategy::Direct => punch_accept(data_sock, peer_host, &cfg).await,
+            Strategy::Direct => punch_accept(data_sock, &peer_hosts, &cfg).await,
             Strategy::SprayRandomPorts => {
                 // Birthday primitives bind their own sockets (see connect side).
                 drop(data_sock);
-                punch_spray(own_host, peer_host, &cfg, birthday, seed).await
+                punch_spray(own_host, &peer_hosts, &cfg, birthday, seed).await
             }
             Strategy::OpenBirthdaySockets => {
                 drop(data_sock);
-                punch_open(own_host, peer_host, &cfg, birthday, seed).await
+                punch_open(own_host, &peer_hosts, &cfg, birthday, seed).await
             }
             Strategy::Relay => {
                 drop(data_sock);
@@ -926,53 +930,67 @@ const MAP_DESCRIPTION: &str = "warren";
 /// Overall bound on the port-mapping attempt, so a slow or half-speaking gateway
 /// can't stall a connect past this even though the reflexive probe has answered.
 const MAP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cap on advertised candidate addresses. Only three sources exist today (mapped,
+/// reflexive, local); the cap bounds the set if that grows and keeps the Signal
+/// small.
+const MAX_CANDIDATES: usize = 4;
 
-/// The address to advertise as this data socket's punch target. Always runs the
-/// reflexive probe; when `port_mapping` is set, concurrently attempts a UPnP-IGD
-/// mapping and prefers that explicit forward when the gateway supports it. Any
-/// mapping failure (no gateway, timeout, rejection) falls back to the reflexive
-/// result, so enabling it can only add reachability, never remove it.
-async fn discover_external(
+/// Gather this data socket's candidate addresses to advertise, most-preferred
+/// first and deduplicated. Sources, in order: an explicit UPnP-IGD port mapping
+/// (when `port_mapping` is set, the socket is IPv4, and the mapped IP is publicly
+/// routable), the reflexive/STUN-observed mapping, and the local address. Always
+/// non-empty — the local address is the floor — and capped at [`MAX_CANDIDATES`].
+/// The peer tries them in order, so a wrong guess (a stale reflexive mapping, a
+/// CGNAT external IP, a multi-homed host) costs nothing.
+async fn gather_candidates(
     sock: &UdpSocket,
     id: NodeId,
     local: SocketAddr,
     reflectors: &[SocketAddr],
     port_mapping: bool,
-) -> SocketAddr {
-    // UPnP-IGD is IPv4-only (SSDP is an IPv4 multicast and the mapping yields an
-    // IPv4 external address), so it can't produce a target for an IPv6 data
-    // socket — skip it and advertise the reflexive address, which is derived from
-    // the socket itself and so is correct for either family.
-    if !port_mapping || local.is_ipv6() {
-        return reflexive_addr(sock, id, local, reflectors).await;
-    }
-    // Run both concurrently: the mapping touches its own sockets (SSDP/HTTP), so
-    // it doesn't contend with the reflexive probe on `sock`.
-    let reflexive = reflexive_addr(sock, id, local, reflectors);
-    let mapped = timeout(
-        MAP_TIMEOUT,
-        portmap::map_port_upnp(local.port(), MAP_LIFETIME, MAP_DESCRIPTION),
-    );
-    let (reflexive, mapped) = tokio::join!(reflexive, mapped);
-    // `mapped` is Ok(Ok(_)) only when the mapping fully succeeded within the
-    // timeout; a timeout (outer Err) or a UPnP error (inner Err) both fall back.
-    let external = match mapped {
-        Ok(Ok(m)) => Some(m.external),
-        _ => None,
+) -> Vec<SocketAddr> {
+    let reflexive_fut = reflexive_addr(sock, id, local, reflectors);
+    // UPnP-IGD is IPv4-only (SSDP is an IPv4 multicast, and it yields an IPv4
+    // external address), so skip the mapping for a v6 socket. When enabled it runs
+    // concurrently with the reflexive probe — they touch different sockets.
+    let (reflexive, mapped) = if port_mapping && local.is_ipv4() {
+        let mapped_fut = timeout(
+            MAP_TIMEOUT,
+            portmap::map_port_upnp(local.port(), MAP_LIFETIME, MAP_DESCRIPTION),
+        );
+        let (reflexive, mapped) = tokio::join!(reflexive_fut, mapped_fut);
+        // Only offer the mapping when it fully succeeded within the timeout and
+        // its external IP is routable — under double-NAT/CGNAT `GetExternalIP`
+        // can return a private/`100.64/10` address that's useless as a target.
+        let mapped = match mapped {
+            Ok(Ok(m)) if is_publicly_routable(m.external.ip()) => Some(m.external),
+            _ => None,
+        };
+        (reflexive, mapped)
+    } else {
+        (reflexive_fut.await, None)
     };
-    prefer_mapped(external, reflexive)
+
+    let mut candidates = Vec::with_capacity(MAX_CANDIDATES);
+    for addr in mapped.into_iter().chain([reflexive, local]) {
+        if !candidates.contains(&addr) {
+            candidates.push(addr);
+        }
+    }
+    candidates.truncate(MAX_CANDIDATES);
+    candidates
 }
 
-/// Choose the address to advertise: the explicit mapping, but only when its IP is
-/// publicly routable — otherwise the reflexive observation. Under double-NAT /
-/// CGNAT, a UPnP `GetExternalIPAddress` returns the *first* NAT's address, which
-/// can itself be private or carrier-grade (`100.64/10`); advertising that as a
-/// punch target would be worse than the reflexive address a public reflector saw.
-fn prefer_mapped(mapped: Option<SocketAddr>, reflexive: SocketAddr) -> SocketAddr {
-    match mapped {
-        Some(m) if is_publicly_routable(m.ip()) => m,
-        _ => reflexive,
+/// The distinct hosts among a candidate set, preserving order — the set of source
+/// IPs a punch may arrive from / should be sprayed toward.
+fn candidate_hosts(addrs: &[SocketAddr]) -> Vec<IpAddr> {
+    let mut hosts = Vec::new();
+    for a in addrs {
+        if !hosts.contains(&a.ip()) {
+            hosts.push(a.ip());
+        }
     }
+    hosts
 }
 
 /// A conservative "safe to advertise to a peer" check, using only stable std
@@ -1067,46 +1085,55 @@ async fn reflexive_addr(
     local
 }
 
-/// Dial a reachable peer on the pre-bound socket.
-async fn punch_direct(sock: UdpSocket, peer: SocketAddr, cfg: &PunchConfig) -> Option<Channel> {
-    match puncher::connect_to(sock, peer, cfg).await {
+/// Dial a peer's candidate addresses on the pre-bound socket, locking onto the
+/// first that answers.
+async fn punch_direct(sock: UdpSocket, peers: &[SocketAddr], cfg: &PunchConfig) -> Option<Channel> {
+    match puncher::connect_to_any(sock, peers, cfg).await {
         Ok(est) => connect_channel(est).await.ok().flatten(),
         Err(_) => None,
     }
 }
 
-/// Wait for a punch from `peer_host` on the pre-bound socket.
-async fn punch_accept(sock: UdpSocket, peer_host: IpAddr, cfg: &PunchConfig) -> Option<Channel> {
-    match puncher::accept(sock, peer_host, cfg).await {
+/// Wait for a punch from any of `peer_hosts` on the pre-bound socket.
+async fn punch_accept(
+    sock: UdpSocket,
+    peer_hosts: &[IpAddr],
+    cfg: &PunchConfig,
+) -> Option<Channel> {
+    match puncher::accept_any(sock, peer_hosts, cfg).await {
         Ok(est) => connect_channel(est).await.ok().flatten(),
         Err(_) => None,
     }
 }
 
-/// The Consistent side of a birthday punch: spray random ports at `peer_host`.
+/// The Consistent side of a birthday punch: spray random ports at every candidate
+/// host in `peer_hosts`.
 async fn punch_spray(
     own_host: IpAddr,
-    peer_host: IpAddr,
+    peer_hosts: &[IpAddr],
     cfg: &PunchConfig,
     b: BirthdayParams,
     seed: u64,
 ) -> Option<Channel> {
     let bind = SocketAddr::new(own_host, 0);
-    match puncher::spray(bind, peer_host, b.range, b.probes, seed, cfg).await {
+    match puncher::spray_any(bind, peer_hosts, b.range, b.probes, seed, cfg).await {
         Ok(est) => connect_channel(est).await.ok().flatten(),
         Err(_) => None,
     }
 }
 
-/// The Random side of a birthday punch: open many sockets and await a probe.
+/// The Random side of a birthday punch: open many sockets and await a probe from
+/// any of `peer_hosts`.
 async fn punch_open(
     own_host: IpAddr,
-    peer_host: IpAddr,
+    peer_hosts: &[IpAddr],
     cfg: &PunchConfig,
     b: BirthdayParams,
     seed: u64,
 ) -> Option<Channel> {
-    match puncher::open_birthday_sockets(own_host, peer_host, b.range, b.sockets, seed, cfg).await {
+    match puncher::open_birthday_sockets_any(own_host, peer_hosts, b.range, b.sockets, seed, cfg)
+        .await
+    {
         Ok(est) => connect_channel(est).await.ok().flatten(),
         Err(_) => None,
     }
@@ -1153,20 +1180,19 @@ mod tests {
     }
 
     #[test]
-    fn prefer_mapped_uses_a_routable_forward_but_not_a_private_one() {
-        // Globally-routable addresses (not TEST-NET / private / CGNAT).
-        let reflexive: SocketAddr = "93.184.216.34:41000".parse().unwrap();
-        let mapped: SocketAddr = "8.8.8.8:5000".parse().unwrap();
-        // A routable explicit mapping wins when present.
-        assert_eq!(prefer_mapped(Some(mapped), reflexive), mapped);
-        // With no mapping, the reflexive observation is advertised.
-        assert_eq!(prefer_mapped(None, reflexive), reflexive);
-        // A non-routable mapping (double-NAT/CGNAT) must NOT override a routable
-        // reflexive address — it would only reduce reachability.
-        let private: SocketAddr = "192.168.1.50:5000".parse().unwrap();
-        let cgnat: SocketAddr = "100.64.5.5:5000".parse().unwrap();
-        assert_eq!(prefer_mapped(Some(private), reflexive), reflexive);
-        assert_eq!(prefer_mapped(Some(cgnat), reflexive), reflexive);
+    fn candidate_hosts_dedups_ips_preserving_order() {
+        let addrs: Vec<SocketAddr> = ["1.1.1.1:5", "1.1.1.1:6", "2.2.2.2:7"]
+            .iter()
+            .map(|s| s.parse().unwrap())
+            .collect();
+        let hosts = candidate_hosts(&addrs);
+        assert_eq!(
+            hosts,
+            vec![
+                "1.1.1.1".parse::<IpAddr>().unwrap(),
+                "2.2.2.2".parse::<IpAddr>().unwrap()
+            ]
+        );
     }
 
     #[test]
@@ -1195,29 +1221,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discover_external_delegates_to_reflexive_when_mapping_off() {
-        // With port mapping off, discovery is exactly the reflexive probe — here,
-        // no reflector, so it falls back to `local`. (The mapping-enabled path
-        // fires real SSDP, so its mechanics are exercised by portmap's fake-IGD
-        // integration test rather than a live multicast here.)
+    async fn gather_candidates_falls_back_to_local_with_mapping_off() {
+        // With port mapping off and no reflector, the only candidate is `local`
+        // (the reflexive probe falls back to it, and the two dedup to one). The
+        // mapping-enabled path fires real SSDP, so its mechanics are exercised by
+        // portmap's fake-IGD integration test rather than a live multicast here.
         let sock = UdpSocket::bind(lo()).await.unwrap();
         let local = sock.local_addr().unwrap();
-        let observed =
-            discover_external(&sock, NodeId::from_bytes([1u8; 32]), local, &[], false).await;
-        assert_eq!(observed, local);
+        let candidates =
+            gather_candidates(&sock, NodeId::from_bytes([1u8; 32]), local, &[], false).await;
+        assert_eq!(candidates, vec![local]);
     }
 
     #[tokio::test]
-    async fn discover_external_skips_ipv4_only_mapping_for_ipv6_sockets() {
+    async fn gather_candidates_skips_ipv4_only_mapping_for_ipv6_sockets() {
         // UPnP is IPv4-only, so even with mapping enabled a v6 socket must not
-        // attempt it (which could advertise an unreachable IPv4 address); it
-        // stays reflexive-only, falling back to `local` with no reflector.
+        // attempt it (which could advertise an unreachable IPv4 candidate); it
+        // stays reflexive-only, yielding just `local` with no reflector.
         let Ok(sock) = UdpSocket::bind("[::1]:0").await else {
             return; // no IPv6 loopback in this environment — nothing to check
         };
         let local = sock.local_addr().unwrap();
-        let observed =
-            discover_external(&sock, NodeId::from_bytes([1u8; 32]), local, &[], true).await;
-        assert_eq!(observed, local);
+        let candidates =
+            gather_candidates(&sock, NodeId::from_bytes([1u8; 32]), local, &[], true).await;
+        assert_eq!(candidates, vec![local]);
     }
 }

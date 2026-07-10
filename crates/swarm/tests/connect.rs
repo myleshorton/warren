@@ -198,39 +198,42 @@ fn connect_exchanges_data_addresses_both_ways() {
     sim.run(100_000);
     let events = sim.take_events();
 
-    // Initiator side: `Connected` carries the target's data address to punch to.
-    let peer_data_addr = events
+    // Initiator side: `Connected` carries the target's data-address candidates to
+    // punch to. The sim advertises a single candidate (its DHT address).
+    let peer_data_addrs = events
         .iter()
         .find_map(|(node, ev)| match ev {
             Event::Connected {
                 target,
-                peer_data_addr,
+                peer_data_addrs,
                 ..
-            } if *node == client && *target == server_id => Some(*peer_data_addr),
+            } if *node == client && *target == server_id => Some(peer_data_addrs.clone()),
             _ => None,
         })
         .expect("client should report Connected");
     assert_eq!(
-        peer_data_addr,
-        Some(server_addr),
-        "initiator should learn the target's data address"
+        peer_data_addrs,
+        vec![server_addr],
+        "initiator should learn the target's data-address candidates"
     );
 
-    // Target side: `IncomingConnect` carries the initiator's id and data address.
+    // Target side: `IncomingConnect` carries the initiator's id and data-address
+    // candidates.
     let (inc_initiator, inc_data) = events
         .iter()
         .find_map(|(node, ev)| match ev {
             Event::IncomingConnect {
                 initiator,
-                initiator_data_addr,
+                initiator_data_addrs,
                 ..
-            } if *node == server => Some((*initiator, *initiator_data_addr)),
+            } if *node == server => Some((*initiator, initiator_data_addrs.clone())),
             _ => None,
         })
         .expect("server should report IncomingConnect");
     assert_eq!(inc_initiator, client_id, "target learns the initiator's id");
     assert_eq!(
-        inc_data, client_addr,
-        "target learns the initiator's data address"
+        inc_data,
+        vec![client_addr],
+        "target learns the initiator's data-address candidates"
     );
 }

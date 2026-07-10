@@ -43,7 +43,7 @@ mod congestion;
 mod frame;
 mod plan;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::Duration;
 
@@ -55,6 +55,7 @@ use frame::{Packet, Reassembler};
 use plan::{Holdings, Plan};
 use sync::{BlobDownload, FeedDownload, Message, SyncError};
 use thiserror::Error;
+use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Instant};
 
 pub use frame::MAX_MESSAGE;
@@ -79,6 +80,12 @@ const FRAGMENT: usize = 1200;
 /// this — bursting a few fragments between pauses on a short-RTT path, spacing
 /// them out on a long one.
 const MIN_PACING_SLEEP: Duration = Duration::from_millis(1);
+
+/// How many chunks a swarm provider is handed at once before it comes back for
+/// more. Small on purpose: most of the work stays in the shared pool so whichever
+/// provider frees up next can pick it up (work-stealing), rather than being
+/// hoarded behind a slow provider.
+const STEAL_BATCH: usize = 4;
 
 /// A datagram link a transfer runs over: send and receive whole datagrams to a
 /// single connected peer. [`driver::Channel`] is the real one; a test supplies a
@@ -228,8 +235,10 @@ struct Provider {
 /// provider that stops responding (a channel error or a timeout) is retired.
 /// Returns [`TransferError::Incomplete`] if the survivors can't supply the rest.
 ///
-/// v1 is round-based: a slow (but alive) provider can hold up its round — work
-/// isn't stolen mid-round yet. Rarest-first is the right default for a
+/// Fetching is **work-stealing**, not round-based: each provider pulls a small
+/// batch and, the moment it finishes, is re-dispatched onto whatever's still
+/// pending — so a slow provider only delays its own current batch, never the
+/// others (no round barrier). Rarest-first is the right default for a
 /// partial-seeder swarm but not for streaming; the selection is isolated in the
 /// scheduler's `assign` step so a deadline-aware policy can replace it there.
 pub async fn download_blob_swarm(
@@ -293,61 +302,123 @@ pub async fn download_blob_swarm(
             // keep the provider, but as Unknown so it's still probed as a last
             // resort rather than left with an empty haveset it'd never be assigned.
             Err(_) => {
-                provider.holds = Holdings::Unknown;
+                provider.holds = Holdings::unknown();
                 providers.push(provider);
             }
         }
     }
     let mut plan = Plan::new(manifest);
 
-    // Fetch chunks in rounds until complete, out of providers, or stuck.
-    while !plan.is_complete() && !providers.is_empty() && plan.pending() > 0 {
-        let cap = plan.pending().div_ceil(providers.len());
-        // Scope the holdings borrow so `providers` is free to move below.
-        let assignment = {
-            let holdings: Vec<&Holdings> = providers.iter().map(|p| &p.holds).collect();
-            plan.assign(&holdings, cap)
-        };
-        let mut taken = Vec::new();
-        let mut fetches = tokio::task::JoinSet::new();
-        for (mut provider, chunks) in std::mem::take(&mut providers).into_iter().zip(assignment) {
-            if chunks.is_empty() {
-                providers.push(provider); // holds nothing still needed: idle, but keep it
-                continue;
-            }
-            taken.extend(chunks.iter().copied());
-            let cfg = *cfg;
-            fetches.spawn(async move {
-                let outcome =
-                    download_chunks(&mut provider.channel, &chunks, &cfg, &mut provider.cursor)
-                        .await;
-                (provider, outcome)
-            });
-        }
-
-        let mut progressed = false;
-        while let Some(joined) = fetches.join_next().await {
-            // A task that panicked or was cancelled yields a JoinError; its
-            // chunks simply stay unfetched (requeued below) rather than crashing
-            // the whole download.
-            if let Ok((provider, outcome)) = joined {
+    // Work-stealing: instead of assigning a whole round and waiting for every
+    // provider at a barrier (where one slow provider stalls the fast ones), each
+    // provider pulls a small batch, and the moment it finishes we re-dispatch *it*
+    // onto whatever's still pending while the others keep running. `idle` holds
+    // providers waiting for work; `in_flight` the fetch tasks currently running.
+    let mut idle = providers;
+    let mut in_flight: JoinSet<(Provider, ChunkOutcome)> = JoinSet::new();
+    // Each in-flight task's assignment, keyed by its task id. `assign` removed
+    // these chunks from `pending`, so this is the only handle on them — it lets us
+    // requeue a task's chunks even if the task dies with a `JoinError` (panic /
+    // cancellation), rather than silently losing them.
+    let mut in_flight_chunks: HashMap<tokio::task::Id, Vec<Hash>> = HashMap::new();
+    dispatch(
+        &mut plan,
+        &mut idle,
+        &mut in_flight,
+        &mut in_flight_chunks,
+        cfg,
+    );
+    while let Some(joined) = in_flight.join_next_with_id().await {
+        match joined {
+            Ok((id, (mut provider, outcome))) => {
+                // dispatch records every task's chunks before it can be joined, so
+                // a completed task's assignment is always present; a miss would be
+                // a bug that silently loses work, so fail loudly instead.
+                let assignment = in_flight_chunks
+                    .remove(&id)
+                    .expect("a completed task's assignment is tracked");
+                let fetched: HashSet<Hash> = outcome.fetched.iter().map(|(h, _)| *h).collect();
                 for (hash, data) in outcome.fetched {
-                    progressed |= plan.store(hash, data);
+                    plan.store(hash, data);
                 }
+                // Chunks this provider was assigned but didn't deliver (an `Absent`,
+                // an unexpected reply, or a hash mismatch). If it's still alive,
+                // record the refusal so it isn't re-offered them — the guard
+                // against a work-stealing livelock — then requeue for others. A
+                // dead provider is dropped; its chunks just return to the pool.
+                let undelivered: Vec<Hash> = assignment
+                    .into_iter()
+                    .filter(|h| !fetched.contains(h))
+                    .collect();
                 if outcome.alive {
-                    providers.push(provider); // survives to the next round
+                    for hash in &undelivered {
+                        provider.holds.refuse(hash);
+                    }
+                    plan.requeue(undelivered);
+                    idle.push(provider);
+                } else {
+                    plan.requeue(undelivered);
+                }
+            }
+            // The task panicked or was cancelled: its provider is lost, but its
+            // chunks must go back to the pool or the download could stall forever.
+            Err(join_err) => {
+                if let Some(chunks) = in_flight_chunks.remove(&join_err.id()) {
+                    plan.requeue(chunks);
                 }
             }
         }
-        // Re-pend everything handed out this round that didn't arrive (requeue
-        // skips chunks already stored) — robust even if a fetch task was lost.
-        plan.requeue(taken);
-        if !progressed {
-            break; // no live provider could supply any remaining chunk
+        if plan.is_complete() {
+            break;
         }
+        dispatch(
+            &mut plan,
+            &mut idle,
+            &mut in_flight,
+            &mut in_flight_chunks,
+            cfg,
+        );
     }
 
     plan.reassemble().ok_or(TransferError::Incomplete)
+}
+
+/// Hand each idle provider a small batch of chunks it can serve (rarest-first, via
+/// [`Plan::assign`]) and spawn a fetch task for it in `in_flight`, recording the
+/// batch in `tracker` (by task id) so it can be recovered if the task dies.
+/// Providers with nothing to do stay in `idle` — they may get work once other
+/// fetches requeue chunks. Batches are capped at [`STEAL_BATCH`] so most of the
+/// work stays in the pool for whichever provider frees up next.
+fn dispatch(
+    plan: &mut Plan,
+    idle: &mut Vec<Provider>,
+    in_flight: &mut JoinSet<(Provider, ChunkOutcome)>,
+    tracker: &mut HashMap<tokio::task::Id, Vec<Hash>>,
+    cfg: &Config,
+) {
+    if idle.is_empty() || plan.pending() == 0 {
+        return;
+    }
+    let assignment = {
+        let holdings: Vec<&Holdings> = idle.iter().map(|p| &p.holds).collect();
+        plan.assign(&holdings, STEAL_BATCH)
+    };
+    let mut still_idle = Vec::new();
+    for (mut provider, chunks) in std::mem::take(idle).into_iter().zip(assignment) {
+        if chunks.is_empty() {
+            still_idle.push(provider);
+            continue;
+        }
+        let cfg = *cfg;
+        let recover = chunks.clone();
+        let handle = in_flight.spawn(async move {
+            let outcome =
+                download_chunks(&mut provider.channel, &chunks, &cfg, &mut provider.cursor).await;
+            (provider, outcome)
+        });
+        tracker.insert(handle.id(), recover);
+    }
+    *idle = still_idle;
 }
 
 /// Fetch and verify a blob's manifest from one provider, advancing its `cursor`.
@@ -395,7 +466,7 @@ async fn fetch_haveset<L: Link>(
         // reading it would falsely mark the uncovered chunks absent, so probe the
         // provider as a last resort instead. Extra trailing bytes are harmless.
         Ok(Message::Have { bits }) if bits.len() < manifest.chunks.len().div_ceil(8) => {
-            Ok(Holdings::Unknown)
+            Ok(Holdings::unknown())
         }
         Ok(Message::Have { bits }) => {
             let mut holds = HashSet::new();
@@ -407,7 +478,7 @@ async fn fetch_haveset<L: Link>(
             Ok(Holdings::Known(holds))
         }
         // Responsive but can't enumerate its holdings → probe as a last resort.
-        Ok(Message::Absent) => Ok(Holdings::Unknown),
+        Ok(Message::Absent) => Ok(Holdings::unknown()),
         // A genuinely unexpected reply: don't rely on it.
         Ok(_) => Ok(Holdings::Known(HashSet::new())),
         Err(e) => Err(e),

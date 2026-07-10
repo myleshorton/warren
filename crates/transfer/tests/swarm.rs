@@ -152,6 +152,35 @@ async fn swarm_assembles_from_partial_seeders() {
 }
 
 #[tokio::test]
+async fn swarm_refills_providers_as_they_finish() {
+    // Twenty distinct chunks with two full seeders: far more than one batch per
+    // provider (STEAL_BATCH), so providers must be re-dispatched several times as
+    // they finish — exercising the work-stealing refill path, not a single
+    // assignment. Correctness (exact bytes) must survive the repeated dispatch.
+    let data: Vec<u8> = (0..blob::CHUNK_SIZE * 20)
+        .map(|i| (i / blob::CHUNK_SIZE) as u8)
+        .collect();
+    let id = blob::split(&data).0.id();
+
+    let mut clients = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..2 {
+        let (client, mut server) = connected_pair().await;
+        clients.push(client);
+        let store = full_store(&data);
+        servers.push(tokio::spawn(async move {
+            let _ = serve_blob(&mut server, &store, &Config::default()).await;
+        }));
+    }
+
+    let got = timeout(T, download_blob_swarm(clients, id, &Config::default()))
+        .await
+        .expect("swarm should finish")
+        .expect("swarm should verify");
+    assert_eq!(got, data);
+}
+
+#[tokio::test]
 async fn swarm_uses_a_provider_that_cannot_report_holdings() {
     // One provider has the manifest + chunks {0,1}; the other has chunks {2,3} but
     // no manifest, so it answers `Absent` to GetHave. The client must still probe

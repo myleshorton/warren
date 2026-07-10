@@ -54,10 +54,10 @@ pub enum MapError {
 /// Map an external UDP port to `internal_port`, trying **PCP first and UPnP-IGD as
 /// a fallback**, in one call. Discovers the gateway by SSDP — which finds the IGD
 /// and, from its device-description URL, its IP — then tries PCP against that
-/// gateway (the lean binary protocol, one exchange). If PCP doesn't answer within
-/// a short attempt window, falls back to UPnP against the same device.
-/// `description` labels the mapping in the router's UI (UPnP only; PCP carries no
-/// label).
+/// gateway (the lean binary protocol, one exchange). On any PCP failure — no
+/// answer within a short attempt window, an ICMP-refused socket error, or an
+/// explicit rejection — falls back to UPnP against the same device. `description`
+/// labels the mapping in the router's UI (UPnP only; PCP carries no label).
 ///
 /// A gateway that speaks PCP but *not* UPnP won't be found — SSDP is the only
 /// portable gateway discovery available here — but that combination is rare on

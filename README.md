@@ -73,8 +73,10 @@ crates/
             + candidate-set discovery (ICE-style): both sides gather several
               data-socket addresses — local, reflexive/STUN-observed, and an
               optional port mapping (PunchTuning::port_mapping, off by default;
-              PCP-first with a UPnP-IGD fallback) — advertise the whole set, and
-              the punch tries them all
+              PCP-first with a UPnP-IGD fallback) — order them most-reachable-first
+              (routable > LAN > other), advertise the whole set, and the punch
+              tries them all; an untrusted peer's set is likewise prioritized and
+              capped so its routable candidate survives
               (Direct probes every candidate on one socket; the birthday punch
               sprays toward / accepts from each distinct candidate IP). One wrong
               guess (a per-destination NAT mapping, a CGNAT external IP, a
@@ -140,8 +142,7 @@ crates/
             data layer finally rides the transport over a real, multi-peer
             connection.
 
-  next: candidate prioritization (advertise routable candidates first),
-        automatic mapping renewal before lease expiry (so a mapping outlives one
+  next: automatic mapping renewal before lease expiry (so a mapping outlives one
         connect), obfuscated/pluggable transport for censored networks, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying

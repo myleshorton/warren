@@ -72,11 +72,10 @@ pub struct PunchTuning {
     pub config: PunchConfig,
     /// Birthday-punch parameters for the symmetric-NAT (`Punched`) path.
     pub birthday: BirthdayParams,
-    /// Attempt a UPnP-IGD port mapping while discovering the data socket's
-    /// external address, advertising the explicit forward when the gateway
-    /// supports it (falling back to the reflexive observation otherwise).
-    /// Off by default: it fires an SSDP multicast per connect and waits out the
-    /// discovery window on networks with no UPnP gateway.
+    /// Attempt a port mapping (PCP first, UPnP-IGD fallback) while discovering the
+    /// data socket's address, advertising the explicit forward as a candidate when
+    /// the gateway supports it. Off by default: it fires an SSDP multicast per
+    /// connect and waits out the discovery window on networks with no gateway.
     pub port_mapping: bool,
 }
 
@@ -587,11 +586,12 @@ async fn run(
                 } => {
                     if let Some((data_sock, tx)) = pending_connect.remove(&target) {
                         // The peer's candidate set is untrusted (from a Signal, so
-                        // only buffer-bounded); cap what we actually probe, keeping
-                        // preference order, so a peer can't make us spray hundreds
-                        // of packets at addresses of its choosing (a UDP-scan /
-                        // amplification vector).
-                        peer_data_addrs.truncate(MAX_CANDIDATES);
+                        // only buffer-bounded); prioritize and cap what we actually
+                        // probe, so a peer can't make us spray hundreds of packets
+                        // at addresses of its choosing (a UDP-scan / amplification
+                        // vector) and its routable candidate survives the cap even
+                        // if it front-loaded junk.
+                        prioritize_and_cap(&mut peer_data_addrs);
                         // Seed the birthday RNG from the pre-bound socket's port so
                         // concurrent connects don't spray identical port sequences.
                         let seed = data_sock.local_addr().map(|a| a.port()).unwrap_or(0) as u64;
@@ -622,9 +622,10 @@ async fn run(
                     // (mirrors the outbound `UnspecifiedLocalAddr` check); the
                     // initiator times out. Decline too if the initiator offered no
                     // candidate host — there's nowhere to punch to. The candidate
-                    // list is untrusted (buffer-bounded only), so cap it first —
-                    // this bounds both the O(n^2) dedup and the spray fan-out.
-                    initiator_data_addrs.truncate(MAX_CANDIDATES);
+                    // list is untrusted (buffer-bounded only), so prioritize and
+                    // cap it first — this bounds both the O(n^2) dedup and the
+                    // spray fan-out, and keeps its routable hosts.
+                    prioritize_and_cap(&mut initiator_data_addrs);
                     let peer_hosts = candidate_hosts(&initiator_data_addrs);
                     if !data_ip.is_unspecified() && !peer_hosts.is_empty() {
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
@@ -988,8 +989,87 @@ async fn gather_candidates(
             candidates.push(addr);
         }
     }
-    candidates.truncate(MAX_CANDIDATES);
+    prioritize_and_cap(&mut candidates);
     candidates
+}
+
+/// Keep the most-useful [`MAX_CANDIDATES`], best priority first, preserving order
+/// within a tier (e.g. mapped before reflexive before local among equally-routable
+/// addresses). Applied to our own advertised set and, defensively, to an untrusted
+/// peer set — so a routable candidate survives the cap even if the peer
+/// front-loaded private/junk addresses.
+///
+/// Bucketed in a single linear pass rather than sorted: the input can be a large
+/// untrusted peer set and we only ever keep a handful, so an attacker can't force
+/// an `O(n log n)` sort. Each tier holds at most `MAX_CANDIDATES`, and the scan
+/// stops early once tier 0 alone fills the cap (nothing lower could then survive).
+fn prioritize_and_cap(addrs: &mut Vec<SocketAddr>) {
+    let mut tiers: [Vec<SocketAddr>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for &addr in addrs.iter() {
+        let tier = candidate_priority(addr) as usize;
+        if tiers[tier].len() < MAX_CANDIDATES {
+            tiers[tier].push(addr);
+        }
+        if tiers[0].len() >= MAX_CANDIDATES {
+            break;
+        }
+    }
+    addrs.clear();
+    for tier in tiers {
+        for addr in tier {
+            if addrs.len() < MAX_CANDIDATES {
+                addrs.push(addr);
+            }
+        }
+    }
+}
+
+/// A candidate's usefulness as a punch target, lower = more preferred:
+/// `0` globally routable (reaches a remote peer), `1` LAN-reachable (private /
+/// link-local / ULA — useful to a peer behind the same NAT), `2` everything else
+/// (loopback, unspecified, CGNAT, multicast, …).
+fn candidate_priority(addr: SocketAddr) -> u8 {
+    // Rank an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) by its embedded v4 — a
+    // peer could otherwise encode a private v4 that way to dodge the v4 tiering.
+    let ip = match addr.ip() {
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            if is_publicly_routable(IpAddr::V4(v4)) {
+                0
+            } else if v4.is_private() || v4.is_link_local() {
+                1
+            } else {
+                2
+            }
+        }
+        IpAddr::V6(v6) => {
+            let seg = v6.segments();
+            // 2001:db8::/32 is documentation space — not reachable.
+            let documentation = seg[0] == 0x2001 && seg[1] == 0x0db8;
+            // `::/96` — the unspecified/loopback addresses AND the obsolete
+            // IPv4-compatible form `::a.b.c.d` (RFC 4291), none routable. (The
+            // IPv4-*mapped* `::ffff:a.b.c.d` was already unwrapped to v4 above, so
+            // it doesn't reach here.) Ranking the whole block junk stops a peer
+            // encoding a v4 as `::a.b.c.d` to dodge the v4 tiering.
+            let low96_zero = seg[..6].iter().all(|&s| s == 0);
+            if v6.is_multicast() || documentation || low96_zero {
+                2
+            } else if (seg[0] & 0xffc0) == 0xfe80 || (seg[0] & 0xfe00) == 0xfc00 {
+                // Stable std has no v6 link-local/ULA predicate, so match by prefix:
+                // link-local fe80::/10, unique-local fc00::/7.
+                1
+            } else {
+                // Anything else is treated as globally routable (most v6 is).
+                0
+            }
+        }
+    }
 }
 
 /// The distinct hosts among a candidate set, preserving order — the set of source
@@ -1204,6 +1284,59 @@ mod tests {
                 "2.2.2.2".parse::<IpAddr>().unwrap()
             ]
         );
+    }
+
+    #[test]
+    fn candidate_priority_ranks_by_reachability() {
+        let p = |s: &str| candidate_priority(s.parse().unwrap());
+        // Globally routable → 0.
+        assert_eq!(p("8.8.8.8:1"), 0);
+        assert_eq!(p("[2606:4700:4700::1111]:1"), 0);
+        // LAN-reachable → 1.
+        assert_eq!(p("192.168.1.5:1"), 1);
+        assert_eq!(p("169.254.1.1:1"), 1);
+        assert_eq!(p("[fe80::1]:1"), 1); // link-local
+        assert_eq!(p("[fc00::1]:1"), 1); // ULA
+                                         // Neither → 2.
+        assert_eq!(p("127.0.0.1:1"), 2);
+        assert_eq!(p("100.64.0.1:1"), 2); // CGNAT
+        assert_eq!(p("[::1]:1"), 2);
+        assert_eq!(p("[2001:db8::1]:1"), 2); // v6 documentation, not reachable
+        assert_eq!(p("[ff02::1]:1"), 2); // v6 multicast
+                                         // IPv4-mapped IPv6 is ranked by its embedded v4, not as generic v6.
+        assert_eq!(p("[::ffff:8.8.8.8]:1"), 0); // mapped public v4
+        assert_eq!(p("[::ffff:192.168.1.5]:1"), 1); // mapped private v4 → LAN, not 0
+                                                    // Obsolete IPv4-compatible IPv6 (::/96) is junk, not routable — a peer
+                                                    // can't use it to smuggle a v4 past the tiering.
+        assert_eq!(p("[::8.8.8.8]:1"), 2);
+        assert_eq!(p("[::192.168.1.5]:1"), 2);
+    }
+
+    #[test]
+    fn prioritize_and_cap_keeps_routable_past_the_cap() {
+        // A set that front-loads junk and buries the one routable candidate: after
+        // prioritization the routable one survives the cap, junk is dropped.
+        let mut addrs: Vec<SocketAddr> = [
+            "127.0.0.1:1",
+            "127.0.0.2:2",
+            "192.168.0.9:3",
+            "10.0.0.9:4",
+            "203.0.113.1:5", // TEST-NET (rank 2)
+            "8.8.8.8:6",     // the one globally-routable candidate, last
+        ]
+        .iter()
+        .map(|s| s.parse().unwrap())
+        .collect();
+        prioritize_and_cap(&mut addrs);
+        assert_eq!(addrs.len(), MAX_CANDIDATES);
+        assert_eq!(
+            addrs[0],
+            "8.8.8.8:6".parse().unwrap(),
+            "routable floats first"
+        );
+        // The two private/LAN addresses (rank 1) come next, ahead of loopback.
+        assert!(addrs.contains(&"192.168.0.9:3".parse().unwrap()));
+        assert!(addrs.contains(&"10.0.0.9:4".parse().unwrap()));
     }
 
     #[test]

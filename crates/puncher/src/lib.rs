@@ -25,6 +25,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -263,6 +264,9 @@ pub async fn open_birthday_sockets_any(
     let mut opened = 0;
     let mut attempts = 0;
     let max_attempts = count.saturating_mul(20);
+    // The accepted hosts are shared across all listener tasks (each is 'static) via
+    // a cheap Arc clone rather than a fresh Vec per socket.
+    let hosts: Arc<[IpAddr]> = Arc::from(peer_hosts);
     while opened < count && attempts < max_attempts {
         if Instant::now() >= deadline {
             break; // binding also counts against the overall deadline
@@ -271,9 +275,7 @@ pub async fn open_birthday_sockets_any(
         let port = range.0 + (rng.next_u64() % span) as u16;
         if let Ok(socket) = UdpSocket::bind((host, port)).await {
             opened += 1;
-            // Each listener owns a copy of the accepted hosts (the tasks are
-            // 'static); the set is tiny (a peer's distinct candidate IPs).
-            let hosts: Vec<IpAddr> = peer_hosts.to_vec();
+            let hosts = Arc::clone(&hosts);
             set.spawn(async move {
                 let mut buf = [0u8; 64];
                 loop {

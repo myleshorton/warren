@@ -582,10 +582,16 @@ async fn run(
                 Event::Connected {
                     target,
                     outcome,
-                    peer_data_addrs,
+                    mut peer_data_addrs,
                     strategy,
                 } => {
                     if let Some((data_sock, tx)) = pending_connect.remove(&target) {
+                        // The peer's candidate set is untrusted (from a Signal, so
+                        // only buffer-bounded); cap what we actually probe, keeping
+                        // preference order, so a peer can't make us spray hundreds
+                        // of packets at addresses of its choosing (a UDP-scan /
+                        // amplification vector).
+                        peer_data_addrs.truncate(MAX_CANDIDATES);
                         // Seed the birthday RNG from the pre-bound socket's port so
                         // concurrent connects don't spray identical port sequences.
                         let seed = data_sock.local_addr().map(|a| a.port()).unwrap_or(0) as u64;
@@ -604,7 +610,7 @@ async fn run(
                 }
                 Event::IncomingConnect {
                     initiator,
-                    initiator_data_addrs,
+                    mut initiator_data_addrs,
                     strategy,
                 } => {
                     // Stand up a data socket and gather its candidate addresses via
@@ -615,7 +621,10 @@ async fn run(
                     // address would be unspecified too, unpunchable by the peer
                     // (mirrors the outbound `UnspecifiedLocalAddr` check); the
                     // initiator times out. Decline too if the initiator offered no
-                    // candidate host — there's nowhere to punch to.
+                    // candidate host — there's nowhere to punch to. The candidate
+                    // list is untrusted (buffer-bounded only), so cap it first —
+                    // this bounds both the O(n^2) dedup and the spray fan-out.
+                    initiator_data_addrs.truncate(MAX_CANDIDATES);
                     let peer_hosts = candidate_hosts(&initiator_data_addrs);
                     if !data_ip.is_unspecified() && !peer_hosts.is_empty() {
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {

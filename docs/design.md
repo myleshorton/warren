@@ -79,7 +79,10 @@ runs unchanged over real sockets.
   seeders* — none holding the whole blob — collectively assemble it, scheduled
   *rarest-first*. Fetching is *work-stealing*: a provider that finishes its batch
   is re-dispatched immediately, so a slow one never stalls the others at a round
-  barrier.
+  barrier. For video, a *streaming* mode instead fetches a playback-order priority
+  window first (rarest-first beyond it) and delivers chunks to the player in
+  playback order as the contiguous prefix fills in (an early-arriving chunk waits
+  for the ones before it), so playback can start before the whole blob does.
 
 **6. Collateral-freedom by lineage.**
 The DHT is Kademlia — the same family as BitTorrent's Mainline DHT (millions of
@@ -241,4 +244,4 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Ephemeral/query-only client mode | planned |
 | Obfuscated transport, cover-DHT rendezvous | planned |
 | Holdings-aware (partial-seeder) swarming, rarest-first | built |
-| Deadline-aware chunk selection for streaming (vs rarest-first) | planned |
+| Streaming download: playback-order selection + in-order delivery | built |

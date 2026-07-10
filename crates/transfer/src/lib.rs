@@ -52,7 +52,7 @@ use congestion::{Congestion, Rtt};
 use crypto::{Hash, PublicKey};
 use driver::Channel;
 use frame::{Packet, Reassembler};
-use plan::{Holdings, Plan};
+use plan::{Holdings, Plan, Selection};
 use sync::{BlobDownload, FeedDownload, Message, SyncError};
 use thiserror::Error;
 use tokio::task::JoinSet;
@@ -219,33 +219,83 @@ struct Provider {
     holds: Holdings,
 }
 
-/// Download and verify a blob by fetching its chunks from **several** providers
-/// concurrently. A chunk is content-addressed, so any provider holding it is
+/// Download and verify a blob from **several** providers at once, returning its
+/// bytes. A chunk is content-addressed, so any provider holding it is
 /// interchangeable and each is verified by its hash — a provider can neither
-/// corrupt the blob nor be trusted beyond the bytes it proves.
-///
-/// The manifest is fetched by trying the providers in turn, taking the first
-/// that serves it (a slow or dead first provider delays this — racing them for
-/// the manifest is future work). Each live provider is then asked which chunks it
-/// holds, so a **partial seeder** — one holding only some of the blob — can still
-/// contribute; several partial seeders together assemble a blob none of them has
-/// in full. Chunks are scheduled **rarest-first** (the scarcest data is pulled
-/// while its few holders are still around) and only to a provider that holds
-/// them. A chunk a provider was assigned but didn't return is re-assigned; a
-/// provider that stops responding (a channel error or a timeout) is retired.
-/// Returns [`TransferError::Incomplete`] if the survivors can't supply the rest.
-///
-/// Fetching is **work-stealing**, not round-based: each provider pulls a small
-/// batch and, the moment it finishes, is re-dispatched onto whatever's still
-/// pending — so a slow provider only delays its own current batch, never the
-/// others (no round barrier). Rarest-first is the right default for a
-/// partial-seeder swarm but not for streaming; the selection is isolated in the
-/// scheduler's `assign` step so a deadline-aware policy can replace it there.
+/// corrupt the blob nor be trusted beyond the bytes it proves. Chunks are
+/// scheduled **rarest-first**, best for a partial-seeder swarm's health. For
+/// playback order instead, see [`download_blob_stream`].
 pub async fn download_blob_swarm(
     channels: Vec<Channel>,
     id: Hash,
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
+    // Rarest-first; no incremental delivery needed, so reassemble at the end.
+    let plan = run_swarm(
+        channels,
+        id,
+        cfg,
+        Selection::RarestFirst,
+        |_index, _bytes| {},
+    )
+    .await?;
+    plan.reassemble().ok_or(TransferError::Incomplete)
+}
+
+/// Stream a blob from several providers for **playback**: chunks are fetched
+/// playback-frontier-first — a `window`-chunk priority window in order, then
+/// rarest-first beyond it for swarm health — and handed to `on_chunk(index,
+/// bytes)` **in playback order** (indices `0..N`, strictly) as each becomes
+/// contiguously available, so a player can start before the whole blob arrives.
+/// Every chunk is still verified by its hash before delivery. Returns
+/// [`TransferError::Incomplete`] if the swarm can't supply the whole blob — the
+/// caller will have received a contiguous prefix.
+pub async fn download_blob_stream<F>(
+    channels: Vec<Channel>,
+    id: Hash,
+    cfg: &Config,
+    window: usize,
+    on_chunk: F,
+) -> Result<(), TransferError>
+where
+    F: FnMut(usize, &[u8]),
+{
+    let plan = run_swarm(channels, id, cfg, Selection::Streaming { window }, on_chunk).await?;
+    if plan.is_complete() {
+        Ok(())
+    } else {
+        Err(TransferError::Incomplete)
+    }
+}
+
+/// The swarm engine behind [`download_blob_swarm`] and [`download_blob_stream`].
+///
+/// The manifest is fetched by trying the providers in turn, taking the first that
+/// serves it (a slow or dead first provider delays this — racing them is future
+/// work). Each live provider is then asked which chunks it holds, so a **partial
+/// seeder** — one holding only some of the blob — can still contribute; several
+/// together assemble a blob none of them has in full. Chunks are ordered by
+/// `selection` and handed only to a provider that holds them; an assigned-but-
+/// undelivered chunk is re-assigned, and a provider that stops responding is
+/// retired.
+///
+/// Fetching is **work-stealing**, not round-based: each provider pulls a small
+/// batch and, the moment it finishes, is re-dispatched onto whatever's still
+/// pending, so a slow provider only delays its own current batch (no round
+/// barrier). As chunks arrive, `emit(index, bytes)` is called in contiguous
+/// playback order — index `k` only once `0..=k` are all stored — exactly once per
+/// playback index (`0..N`; a chunk shared by several indices, from dedup, is
+/// delivered at each of them, since a player needs every position). It's the seam
+/// through which both a bulk collector and a streaming consumer receive the data.
+/// Returns the (possibly incomplete) [`Plan`]; the caller checks
+/// [`Plan::is_complete`].
+async fn run_swarm(
+    channels: Vec<Channel>,
+    id: Hash,
+    cfg: &Config,
+    selection: Selection,
+    mut emit: impl FnMut(usize, &[u8]),
+) -> Result<Plan, TransferError> {
     let providers: Vec<Provider> = channels
         .into_iter()
         .map(|channel| Provider {
@@ -308,6 +358,10 @@ pub async fn download_blob_swarm(
         }
     }
     let mut plan = Plan::new(manifest);
+    plan.set_selection(selection);
+    // The next chunk index to hand to `emit`; advances as the contiguous prefix
+    // from the front fills in, so chunks are delivered strictly in playback order.
+    let mut next_emit = 0usize;
 
     // Work-stealing: instead of assigning a whole round and waiting for every
     // provider at a barrier (where one slow provider stalls the fast ones), each
@@ -340,6 +394,15 @@ pub async fn download_blob_swarm(
                 let fetched: HashSet<Hash> = outcome.fetched.iter().map(|(h, _)| *h).collect();
                 for (hash, data) in outcome.fetched {
                     plan.store(hash, data);
+                }
+                // Deliver any chunks now contiguously available from the front, in
+                // playback order (index k only once every earlier chunk is stored).
+                while next_emit < plan.chunk_count() {
+                    let Some(bytes) = plan.chunk_at(next_emit) else {
+                        break;
+                    };
+                    emit(next_emit, bytes);
+                    next_emit += 1;
                 }
                 // Chunks this provider was assigned but didn't deliver (an `Absent`,
                 // an unexpected reply, or a hash mismatch). If it's still alive,
@@ -380,7 +443,7 @@ pub async fn download_blob_swarm(
         );
     }
 
-    plan.reassemble().ok_or(TransferError::Incomplete)
+    Ok(plan)
 }
 
 /// Hand each idle provider a small batch of chunks it can serve (rarest-first, via

@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use driver::{open_channel, Channel, DataListener, PunchConfig};
 use tokio::time::timeout;
-use transfer::{download_blob_swarm, serve_blob, Config};
+use transfer::{download_blob_stream, download_blob_swarm, serve_blob, Config};
 
 const LO: &str = "127.0.0.1:0";
 const T: Duration = Duration::from_secs(15);
@@ -149,6 +149,49 @@ async fn swarm_assembles_from_partial_seeders() {
         .expect("swarm should finish")
         .expect("partial seeders should collectively assemble the blob");
     assert_eq!(got, data);
+}
+
+#[tokio::test]
+async fn stream_delivers_chunks_in_playback_order() {
+    // Eight distinct chunks across three full seeders. Streaming must hand every
+    // chunk to the callback exactly once, strictly in playback order (0..8), and
+    // the concatenation must equal the blob — even though fetches complete out of
+    // order across the providers (emission is gated on contiguity from the front).
+    let data: Vec<u8> = (0..blob::CHUNK_SIZE * 8)
+        .map(|i| (i / blob::CHUNK_SIZE) as u8)
+        .collect();
+    let id = blob::split(&data).0.id();
+
+    let mut clients = Vec::new();
+    let mut servers = Vec::new();
+    for _ in 0..3 {
+        let (client, mut server) = connected_pair().await;
+        clients.push(client);
+        let store = full_store(&data);
+        servers.push(tokio::spawn(async move {
+            let _ = serve_blob(&mut server, &store, &Config::default()).await;
+        }));
+    }
+
+    let mut order: Vec<usize> = Vec::new();
+    let mut received: Vec<u8> = Vec::new();
+    timeout(
+        T,
+        download_blob_stream(clients, id, &Config::default(), 4, |index, bytes| {
+            order.push(index);
+            received.extend_from_slice(bytes);
+        }),
+    )
+    .await
+    .expect("stream should finish")
+    .expect("stream should complete");
+
+    assert_eq!(
+        order,
+        (0..8).collect::<Vec<usize>>(),
+        "chunks must be delivered strictly in playback order"
+    );
+    assert_eq!(received, data);
 }
 
 #[tokio::test]

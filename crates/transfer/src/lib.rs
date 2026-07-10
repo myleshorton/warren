@@ -331,7 +331,12 @@ pub async fn download_blob_swarm(
     while let Some(joined) = in_flight.join_next_with_id().await {
         match joined {
             Ok((id, (mut provider, outcome))) => {
-                let assignment = in_flight_chunks.remove(&id).unwrap_or_default();
+                // dispatch records every task's chunks before it can be joined, so
+                // a completed task's assignment is always present; a miss would be
+                // a bug that silently loses work, so fail loudly instead.
+                let assignment = in_flight_chunks
+                    .remove(&id)
+                    .expect("a completed task's assignment is tracked");
                 let fetched: HashSet<Hash> = outcome.fetched.iter().map(|(h, _)| *h).collect();
                 for (hash, data) in outcome.fetched {
                     plan.store(hash, data);

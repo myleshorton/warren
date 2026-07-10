@@ -37,8 +37,9 @@ impl Holdings {
         Holdings::Unknown(HashSet::new())
     }
 
-    /// Record that this provider does *not* have `hash` after all — it was asked
-    /// and answered `Absent`. A known holder drops it from its set (a stale or
+    /// Record that this provider won't serve `hash` after all — it was asked for
+    /// it but didn't return it (an `Absent`, an unexpected reply, or a chunk that
+    /// failed verification). A known holder drops it from its set (a stale or
     /// dishonest bitfield); an unknown provider remembers the refusal. Either way
     /// [`Plan::assign`] won't offer this provider that chunk again, which is what
     /// keeps a work-stealing loop from re-handing a chunk to a provider that

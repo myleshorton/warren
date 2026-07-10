@@ -108,9 +108,9 @@ pub fn root_from_path(leaf: Hash, index: usize, len: usize, path: &[Hash]) -> Op
 /// An incremental Merkle accumulator: the right-spine subtree roots ("peaks") of
 /// an append-only RFC 6962 tree, so the [`root`](Accumulator::root) is maintained
 /// as leaves are pushed instead of recomputed from scratch. `peaks[h]`, if set, is
-/// the root of a pending perfect subtree of height `h` (i.e. `2^h` leaves); the
-/// set peaks are exactly the ones at the set bits of the leaf count, and there are
-/// at most `log2(n)` of them — so `push` and `root` are O(log n), not O(n).
+/// the root of a pending perfect subtree of height `h` (i.e. `2^h` leaves). There
+/// is one peak per set bit of the leaf count — at most `floor(log2 n) + 1` of them
+/// — so `push` and `root` are O(log n), not O(n).
 #[derive(Clone, Default)]
 pub struct Accumulator {
     peaks: Vec<Option<Hash>>,

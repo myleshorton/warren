@@ -902,10 +902,14 @@ fn spawn_accept_punch(job: AcceptJob) {
     });
 }
 
-/// Lifetime requested for a connect's port mapping — comfortably outlasts the
-/// connect and its punch. (Renewal for long-lived reachability is future work;
-/// each connect maps afresh.)
-const MAP_LIFETIME: Duration = Duration::from_secs(3600);
+/// Lifetime requested for a connect's port mapping. Kept short deliberately: the
+/// mapping only has to survive until the punch completes — once punched, the
+/// channel rides the hole our own outbound packets keep open, so the forward is
+/// no longer needed. A short lease means a forward auto-expires soon after the
+/// connect instead of lingering on the gateway (we hold no handle to delete it,
+/// and don't renew — both are future work), so many connects can't pile up
+/// long-lived forwards.
+const MAP_LIFETIME: Duration = Duration::from_secs(120);
 /// Label the mapping carries in the router's UI.
 const MAP_DESCRIPTION: &str = "warren";
 /// Overall bound on the port-mapping attempt, so a slow or half-speaking gateway
@@ -948,10 +952,40 @@ async fn discover_external(
     prefer_mapped(external, reflexive)
 }
 
-/// Choose the address to advertise: the explicit mapping when present, else the
-/// reflexive observation.
+/// Choose the address to advertise: the explicit mapping, but only when its IP is
+/// publicly routable — otherwise the reflexive observation. Under double-NAT /
+/// CGNAT, a UPnP `GetExternalIPAddress` returns the *first* NAT's address, which
+/// can itself be private or carrier-grade (`100.64/10`); advertising that as a
+/// punch target would be worse than the reflexive address a public reflector saw.
 fn prefer_mapped(mapped: Option<SocketAddr>, reflexive: SocketAddr) -> SocketAddr {
-    mapped.unwrap_or(reflexive)
+    match mapped {
+        Some(m) if is_publicly_routable(m.ip()) => m,
+        _ => reflexive,
+    }
+}
+
+/// A conservative "safe to advertise to a peer" check, using only stable
+/// std predicates (`IpAddr::is_global` is still unstable): reject the ranges that
+/// clearly can't be reached from off-network. CGNAT (`100.64.0.0/10`) has no
+/// stable predicate, so it's matched by hand — it's the common double-NAT case
+/// UPnP surfaces.
+fn is_publicly_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            let is_cgnat = a == 100 && (64..=127).contains(&b);
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_documentation()
+                && !v4.is_unspecified()
+                && !is_cgnat
+        }
+        // UPnP-IGD yields IPv4 only, so a v6 mapped address shouldn't occur; be
+        // conservative and reject the plainly-unreachable ones.
+        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+    }
 }
 
 /// Discover `sock`'s externally-observed address by asking reflectors to echo
@@ -1099,13 +1133,39 @@ mod tests {
     }
 
     #[test]
-    fn prefer_mapped_uses_the_explicit_forward_when_present() {
-        let reflexive: SocketAddr = "203.0.113.7:41000".parse().unwrap();
-        let mapped: SocketAddr = "198.51.100.9:5000".parse().unwrap();
-        // The explicit port mapping wins when it exists.
+    fn prefer_mapped_uses_a_routable_forward_but_not_a_private_one() {
+        // Globally-routable addresses (not TEST-NET / private / CGNAT).
+        let reflexive: SocketAddr = "93.184.216.34:41000".parse().unwrap();
+        let mapped: SocketAddr = "8.8.8.8:5000".parse().unwrap();
+        // A routable explicit mapping wins when present.
         assert_eq!(prefer_mapped(Some(mapped), reflexive), mapped);
         // With no mapping, the reflexive observation is advertised.
         assert_eq!(prefer_mapped(None, reflexive), reflexive);
+        // A non-routable mapping (double-NAT/CGNAT) must NOT override a routable
+        // reflexive address — it would only reduce reachability.
+        let private: SocketAddr = "192.168.1.50:5000".parse().unwrap();
+        let cgnat: SocketAddr = "100.64.5.5:5000".parse().unwrap();
+        assert_eq!(prefer_mapped(Some(private), reflexive), reflexive);
+        assert_eq!(prefer_mapped(Some(cgnat), reflexive), reflexive);
+    }
+
+    #[test]
+    fn public_routability_rejects_unreachable_ranges() {
+        let pub_ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(is_publicly_routable(pub_ip));
+        for bad in [
+            "10.0.0.1",    // private
+            "192.168.1.1", // private
+            "172.16.0.1",  // private
+            "127.0.0.1",   // loopback
+            "169.254.1.1", // link-local
+            "100.64.0.1",  // CGNAT
+            "203.0.113.1", // TEST-NET-3 (documentation)
+            "0.0.0.0",     // unspecified
+        ] {
+            let ip: IpAddr = bad.parse().unwrap();
+            assert!(!is_publicly_routable(ip), "{bad} must not be advertisable");
+        }
     }
 
     #[tokio::test]

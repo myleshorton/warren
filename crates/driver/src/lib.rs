@@ -974,17 +974,23 @@ fn is_publicly_routable(ip: IpAddr) -> bool {
         IpAddr::V4(v4) => {
             let [a, b, ..] = v4.octets();
             let is_cgnat = a == 100 && (64..=127).contains(&b);
+            let is_reserved = a >= 240; // 240.0.0.0/4, reserved/experimental
             !v4.is_private()
                 && !v4.is_loopback()
                 && !v4.is_link_local()
                 && !v4.is_broadcast()
+                && !v4.is_multicast() // 224.0.0.0/4
                 && !v4.is_documentation()
                 && !v4.is_unspecified()
                 && !is_cgnat
+                && !is_reserved
         }
-        // UPnP-IGD yields IPv4 only, so a v6 mapped address shouldn't occur; be
-        // conservative and reject the plainly-unreachable ones.
-        IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+        // UPnP-IGD yields IPv4 only, so a v6 mapped address can't legitimately
+        // occur here. Rather than partially re-implement v6 global-routability
+        // with hand-rolled range checks (the stable std predicates don't cover
+        // link-local / ULA), refuse to advertise a v6 mapped address at all —
+        // maximally conservative, and the branch is unreachable in practice.
+        IpAddr::V6(_) => false,
     }
 }
 
@@ -1154,14 +1160,19 @@ mod tests {
         let pub_ip: IpAddr = "8.8.8.8".parse().unwrap();
         assert!(is_publicly_routable(pub_ip));
         for bad in [
-            "10.0.0.1",    // private
-            "192.168.1.1", // private
-            "172.16.0.1",  // private
-            "127.0.0.1",   // loopback
-            "169.254.1.1", // link-local
-            "100.64.0.1",  // CGNAT
-            "203.0.113.1", // TEST-NET-3 (documentation)
-            "0.0.0.0",     // unspecified
+            "10.0.0.1",             // private
+            "192.168.1.1",          // private
+            "172.16.0.1",           // private
+            "127.0.0.1",            // loopback
+            "169.254.1.1",          // link-local
+            "100.64.0.1",           // CGNAT
+            "203.0.113.1",          // TEST-NET-3 (documentation)
+            "224.0.0.1",            // multicast
+            "240.0.0.1",            // reserved
+            "255.255.255.255",      // broadcast
+            "0.0.0.0",              // unspecified
+            "::1",                  // v6 loopback
+            "2606:4700:4700::1111", // a global v6 — still refused (UPnP is v4-only)
         ] {
             let ip: IpAddr = bad.parse().unwrap();
             assert!(!is_publicly_routable(ip), "{bad} must not be advertisable");

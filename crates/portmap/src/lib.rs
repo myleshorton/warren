@@ -27,6 +27,9 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
+mod upnp;
+pub use upnp::{map_port_upnp, UpnpError};
+
 /// The PCP (and NAT-PMP) server port on the gateway.
 pub const PCP_PORT: u16 = 5351;
 

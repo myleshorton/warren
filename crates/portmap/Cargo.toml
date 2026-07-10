@@ -10,7 +10,7 @@ publish = false
 [dependencies]
 getrandom = "0.2"
 thiserror.workspace = true
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "io-util"] }
 
 [dev-dependencies]
 proptest.workspace = true

@@ -1,0 +1,543 @@
+//! Port mapping via **UPnP-IGD** — for the many home gateways that speak UPnP
+//! rather than PCP.
+//!
+//! Where PCP is one compact binary exchange, UPnP is a small stack of text
+//! protocols, so this follows the crate's split: pure parsing/formatting helpers
+//! (unit-tested against realistic payloads) under a thin I/O layer.
+//!
+//!  1. **Discover** — SSDP `M-SEARCH` (UDP multicast to `239.255.255.250:1900`);
+//!     responders reply unicast with a `LOCATION:` URL for their device
+//!     description. (We only *send* to the multicast group, so no group
+//!     membership is needed; replies are unicast to our socket.)
+//!  2. **Describe** — HTTP GET the LOCATION, and find the `WANIPConnection` /
+//!     `WANPPPConnection` service's control URL in the device XML.
+//!  3. **Map** — SOAP POST `AddPortMapping` (open an external UDP port to us) and
+//!     `GetExternalIPAddress` (learn the address to advertise).
+//!
+//! The HTTP client and XML handling are deliberately minimal (no HTTP/XML crates,
+//! matching the rest of the stack). Known limits, left as hardening: namespace-
+//! prefixed device XML, chunked transfer-encoding, and IPv6 LOCATION URLs.
+
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
+use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpStream, UdpSocket};
+use tokio::time::{timeout, Instant};
+
+use crate::Mapping;
+
+/// SSDP multicast address and port.
+const SSDP_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
+const SSDP_PORT: u16 = 1900;
+/// The device type we search for.
+const IGD_DEVICE: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
+/// The services that can add a port mapping (IGDv1), newest-preferred order.
+const WAN_SERVICES: [&str; 2] = [
+    "urn:schemas-upnp-org:service:WANIPConnection:1",
+    "urn:schemas-upnp-org:service:WANPPPConnection:1",
+];
+/// How long to wait for an SSDP responder.
+const DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a single HTTP request to the gateway may take.
+const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Errors from UPnP port mapping.
+#[derive(Debug, Error)]
+pub enum UpnpError {
+    /// A socket/HTTP transport error.
+    #[error("UPnP I/O error: {0}")]
+    Io(#[from] io::Error),
+    /// No IGD answered the SSDP search.
+    #[error("no UPnP gateway found on the network")]
+    NoGateway,
+    /// The device description couldn't be understood (no usable WAN service).
+    #[error("could not parse the gateway's device description")]
+    BadDescription,
+    /// The gateway returned a non-200 HTTP status where 200 was expected.
+    #[error("gateway returned HTTP status {0}")]
+    Http(u16),
+    /// The gateway rejected the SOAP action (UPnP error code, e.g. 718 conflict).
+    #[error("gateway rejected the mapping (UPnP error {0})")]
+    Soap(u16),
+    /// A response was missing an expected field.
+    #[error("malformed gateway response")]
+    Malformed,
+}
+
+/// Map an external UDP port to `internal_port` on this host via UPnP, discovering
+/// the gateway by SSDP. `description` labels the mapping in the router's UI.
+/// Returns the external `ip:port` inbound traffic can reach.
+///
+/// # Panics
+///
+/// Does not panic.
+pub async fn map_port_upnp(
+    internal_port: u16,
+    lifetime: Duration,
+    description: &str,
+) -> Result<Mapping, UpnpError> {
+    let location = discover_location().await?;
+    map_via_location(&location, internal_port, lifetime, description).await
+}
+
+/// Discover a gateway and return the LOCATION URL of its device description.
+async fn discover_location() -> Result<String, UpnpError> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    let msearch = build_msearch(IGD_DEVICE);
+    sock.send_to(msearch.as_bytes(), (SSDP_ADDR, SSDP_PORT))
+        .await?;
+
+    let mut buf = [0u8; 2048];
+    let deadline = Instant::now() + DISCOVER_TIMEOUT;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, _from))) => {
+                let text = String::from_utf8_lossy(&buf[..n]);
+                if let Some(loc) = parse_location(&text) {
+                    return Ok(loc.to_string());
+                }
+                // Not a usable response — keep listening until the deadline.
+            }
+            Ok(Err(e)) => return Err(UpnpError::Io(e)),
+            Err(_) => return Err(UpnpError::NoGateway),
+        }
+    }
+}
+
+/// Given a device-description URL, add the mapping and return the external address.
+async fn map_via_location(
+    location: &str,
+    internal_port: u16,
+    lifetime: Duration,
+    description: &str,
+) -> Result<Mapping, UpnpError> {
+    let (status, xml) = http_request("GET", location, &[], "").await?;
+    if status != 200 {
+        return Err(UpnpError::Http(status));
+    }
+    let service = parse_igd_service(&xml).ok_or(UpnpError::BadDescription)?;
+    let control_url =
+        resolve_url(location, &service.control_url).ok_or(UpnpError::BadDescription)?;
+
+    // Our LAN address on the interface toward the gateway — the internal client
+    // the mapping forwards to.
+    let (host, _, _) = parse_url(&control_url).ok_or(UpnpError::Malformed)?;
+    let internal_client = local_ip_towards(&host).await?;
+
+    // IGDv1 lease is a u32 of seconds; 0 means "until reboot".
+    let lease = lifetime.as_secs().min(u32::MAX as u64) as u32;
+    let add = soap_add_port_mapping(
+        &service.service_type,
+        internal_port,
+        internal_port,
+        internal_client,
+        lease,
+        description,
+    );
+    soap_call(&control_url, &service.service_type, "AddPortMapping", &add).await?;
+
+    let get = soap_body(&service.service_type, "GetExternalIPAddress", "");
+    let resp = soap_call(
+        &control_url,
+        &service.service_type,
+        "GetExternalIPAddress",
+        &get,
+    )
+    .await?;
+    let external_ip: IpAddr = extract_tag(&resp, "NewExternalIPAddress")
+        .and_then(|s| s.parse().ok())
+        .ok_or(UpnpError::Malformed)?;
+
+    Ok(Mapping {
+        external: SocketAddr::new(external_ip, internal_port),
+        lifetime: Duration::from_secs(lease as u64),
+    })
+}
+
+/// The interface address this host uses to reach `host` (via a route lookup on a
+/// connected UDP socket; no packet is sent).
+async fn local_ip_towards(host: &str) -> Result<IpAddr, UpnpError> {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+    sock.connect((host, 9)).await?; // port 9 = discard; connect only resolves the route
+    Ok(sock.local_addr()?.ip())
+}
+
+/// A WAN connection service found in a device description.
+struct Service {
+    service_type: String,
+    control_url: String,
+}
+
+/// The SSDP `M-SEARCH` datagram searching for device type `st`.
+fn build_msearch(st: &str) -> String {
+    format!(
+        "M-SEARCH * HTTP/1.1\r\n\
+         HOST: 239.255.255.250:1900\r\n\
+         MAN: \"ssdp:discover\"\r\n\
+         MX: 2\r\n\
+         ST: {st}\r\n\r\n"
+    )
+}
+
+/// The `LOCATION` header value from an SSDP response (case-insensitive), if any.
+fn parse_location(response: &str) -> Option<&str> {
+    response.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case("location")
+            .then(|| value.trim())
+    })
+}
+
+/// Find the first WAN connection service (and its control URL) in a device
+/// description, preferring `WANIPConnection` over `WANPPPConnection`.
+fn parse_igd_service(xml: &str) -> Option<Service> {
+    for wanted in WAN_SERVICES {
+        for block in xml.split("<service>").skip(1) {
+            let block = block.split("</service>").next().unwrap_or(block);
+            if extract_tag(block, "serviceType") == Some(wanted) {
+                if let Some(control) = extract_tag(block, "controlURL") {
+                    return Some(Service {
+                        service_type: wanted.to_string(),
+                        control_url: control.to_string(),
+                    });
+                }
+            }
+        }
+    }
+    None
+}
+
+/// The text between `<tag>` and `</tag>` (unprefixed), trimmed.
+fn extract_tag<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = s.find(&open)? + open.len();
+    let end = s[start..].find(&close)? + start;
+    Some(s[start..end].trim())
+}
+
+/// Split an `http://host[:port]/path` URL into (host, port, path).
+fn parse_url(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("http://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/".to_string()),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (authority.to_string(), 80),
+    };
+    Some((host, port, path))
+}
+
+/// Resolve a (possibly relative) control URL against the device-description URL.
+fn resolve_url(base: &str, control: &str) -> Option<String> {
+    if control.starts_with("http://") || control.starts_with("https://") {
+        return Some(control.to_string());
+    }
+    let authority = base.strip_prefix("http://")?.split('/').next()?;
+    if let Some(abs) = control.strip_prefix('/') {
+        Some(format!("http://{authority}/{abs}"))
+    } else {
+        Some(format!("http://{authority}/{control}"))
+    }
+}
+
+/// A SOAP envelope for `action` on `service_type`, with the given inner argument
+/// XML (may be empty).
+fn soap_body(service_type: &str, action: &str, args: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\"?>\
+         <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+         s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+         <s:Body><u:{action} xmlns:u=\"{service_type}\">{args}</u:{action}></s:Body>\
+         </s:Envelope>"
+    )
+}
+
+/// The SOAP body for `AddPortMapping` of a UDP port.
+fn soap_add_port_mapping(
+    service_type: &str,
+    external_port: u16,
+    internal_port: u16,
+    internal_client: IpAddr,
+    lease: u32,
+    description: &str,
+) -> String {
+    let args = format!(
+        "<NewRemoteHost></NewRemoteHost>\
+         <NewExternalPort>{external_port}</NewExternalPort>\
+         <NewProtocol>UDP</NewProtocol>\
+         <NewInternalPort>{internal_port}</NewInternalPort>\
+         <NewInternalClient>{internal_client}</NewInternalClient>\
+         <NewEnabled>1</NewEnabled>\
+         <NewPortMappingDescription>{description}</NewPortMappingDescription>\
+         <NewLeaseDuration>{lease}</NewLeaseDuration>"
+    );
+    soap_body(service_type, "AddPortMapping", &args)
+}
+
+/// POST a SOAP `action` to `control_url`; return the response body on HTTP 200,
+/// else map a fault's `errorCode` to [`UpnpError::Soap`] (or the status).
+async fn soap_call(
+    control_url: &str,
+    service_type: &str,
+    action: &str,
+    body: &str,
+) -> Result<String, UpnpError> {
+    let headers = [
+        (
+            "Content-Type".to_string(),
+            "text/xml; charset=\"utf-8\"".to_string(),
+        ),
+        (
+            "SOAPAction".to_string(),
+            format!("\"{service_type}#{action}\""),
+        ),
+    ];
+    let (status, resp) = http_request("POST", control_url, &headers, body).await?;
+    if status == 200 {
+        Ok(resp)
+    } else {
+        // A UPnP fault carries <errorCode> inside the SOAP fault detail.
+        match extract_tag(&resp, "errorCode").and_then(|c| c.parse().ok()) {
+            Some(code) => Err(UpnpError::Soap(code)),
+            None => Err(UpnpError::Http(status)),
+        }
+    }
+}
+
+/// A minimal HTTP/1.1 request over TCP: `Connection: close`, read the response to
+/// EOF, split off the body. Returns (status, body).
+async fn http_request(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: &str,
+) -> Result<(u16, String), UpnpError> {
+    let (host, port, path) = parse_url(url).ok_or(UpnpError::Malformed)?;
+    let request = || async {
+        let mut stream = TcpStream::connect((host.as_str(), port)).await?;
+        let mut req = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
+             Connection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        for (k, v) in headers {
+            req.push_str(&format!("{k}: {v}\r\n"));
+        }
+        req.push_str("\r\n");
+        req.push_str(body);
+        stream.write_all(req.as_bytes()).await?;
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await?;
+        Ok::<_, io::Error>(raw)
+    };
+    let raw = timeout(HTTP_TIMEOUT, request()).await.map_err(|_| {
+        UpnpError::Io(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "gateway HTTP timeout",
+        ))
+    })??;
+    let text = String::from_utf8_lossy(&raw);
+    let status = parse_status(&text).ok_or(UpnpError::Malformed)?;
+    let resp_body = text
+        .split_once("\r\n\r\n")
+        .map(|(_, b)| b.to_string())
+        .unwrap_or_default();
+    Ok((status, resp_body))
+}
+
+/// The status code from an HTTP status line (`HTTP/1.1 200 OK`).
+fn parse_status(response: &str) -> Option<u16> {
+    response
+        .lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SSDP_RESPONSE: &str = "HTTP/1.1 200 OK\r\n\
+        CACHE-CONTROL: max-age=120\r\n\
+        LOCATION: http://192.168.1.1:5000/rootDesc.xml\r\n\
+        ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n";
+
+    const DEVICE_XML: &str = r#"<?xml version="1.0"?>
+        <root><device><serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:WANCommonInterfaceConfig:1</serviceType>
+            <controlURL>/ctl/CommonIfCfg</controlURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+            <controlURL>/ctl/IPConn</controlURL>
+          </service>
+        </serviceList></device></root>"#;
+
+    #[test]
+    fn msearch_targets_the_igd() {
+        let m = build_msearch(IGD_DEVICE);
+        assert!(m.starts_with("M-SEARCH * HTTP/1.1\r\n"));
+        assert!(m.contains("MAN: \"ssdp:discover\""));
+        assert!(m.contains(&format!("ST: {IGD_DEVICE}")));
+        assert!(m.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn parses_the_ssdp_location() {
+        assert_eq!(
+            parse_location(SSDP_RESPONSE),
+            Some("http://192.168.1.1:5000/rootDesc.xml")
+        );
+        assert_eq!(parse_location("HTTP/1.1 200 OK\r\nST: foo\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn finds_the_wan_connection_control_url() {
+        let s = parse_igd_service(DEVICE_XML).expect("a WAN service");
+        assert_eq!(
+            s.service_type,
+            "urn:schemas-upnp-org:service:WANIPConnection:1"
+        );
+        assert_eq!(s.control_url, "/ctl/IPConn");
+        assert!(parse_igd_service("<root></root>").is_none());
+    }
+
+    #[test]
+    fn resolves_control_urls() {
+        let base = "http://192.168.1.1:5000/rootDesc.xml";
+        assert_eq!(
+            resolve_url(base, "/ctl/IPConn").as_deref(),
+            Some("http://192.168.1.1:5000/ctl/IPConn")
+        );
+        assert_eq!(
+            resolve_url(base, "http://192.168.1.1:5000/abs").as_deref(),
+            Some("http://192.168.1.1:5000/abs")
+        );
+    }
+
+    #[test]
+    fn parses_urls() {
+        assert_eq!(
+            parse_url("http://192.168.1.1:5000/ctl/IPConn"),
+            Some(("192.168.1.1".to_string(), 5000, "/ctl/IPConn".to_string()))
+        );
+        assert_eq!(
+            parse_url("http://host/x"),
+            Some(("host".to_string(), 80, "/x".to_string()))
+        );
+        assert_eq!(parse_url("ftp://nope"), None);
+    }
+
+    #[test]
+    fn extracts_the_external_ip_and_soap_faults() {
+        let ok = "<s:Envelope><s:Body><u:GetExternalIPAddressResponse>\
+                  <NewExternalIPAddress>203.0.113.42</NewExternalIPAddress>\
+                  </u:GetExternalIPAddressResponse></s:Body></s:Envelope>";
+        assert_eq!(
+            extract_tag(ok, "NewExternalIPAddress"),
+            Some("203.0.113.42")
+        );
+
+        let fault = "<s:Envelope><s:Body><s:Fault><detail><UPnPError>\
+                     <errorCode>718</errorCode></UPnPError></detail></s:Fault></s:Body></s:Envelope>";
+        assert_eq!(extract_tag(fault, "errorCode"), Some("718"));
+    }
+
+    #[test]
+    fn parses_http_status() {
+        assert_eq!(parse_status("HTTP/1.1 200 OK\r\n\r\n"), Some(200));
+        assert_eq!(
+            parse_status("HTTP/1.1 500 Internal Server Error\r\n"),
+            Some(500)
+        );
+        assert_eq!(parse_status("garbage"), None);
+    }
+
+    /// A tiny fake IGD over loopback TCP: serves the device description, then
+    /// answers AddPortMapping and GetExternalIPAddress. Handles one request per
+    /// connection (the client uses `Connection: close`).
+    async fn fake_igd(external_ip: &str) -> SocketAddr {
+        use tokio::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let external_ip = external_ip.to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                // Read the request (headers + any Content-Length body).
+                let mut buf = Vec::new();
+                let mut tmp = [0u8; 1024];
+                loop {
+                    let n = sock.read(&mut tmp).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                        let need = head
+                            .lines()
+                            .find_map(|l| {
+                                l.split_once(':')
+                                    .filter(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            })
+                            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if rest.len() >= need {
+                            break;
+                        }
+                    }
+                }
+                let text = String::from_utf8_lossy(&buf);
+                let body = if text.starts_with("GET ") {
+                    r#"<?xml version="1.0"?><root><device><serviceList><service>
+                        <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
+                        <controlURL>/ctl/IPConn</controlURL></service></serviceList></device></root>"#
+                        .to_string()
+                } else if text.contains("GetExternalIPAddress") {
+                    format!(
+                        "<s:Envelope><s:Body><u:GetExternalIPAddressResponse>\
+                         <NewExternalIPAddress>{external_ip}</NewExternalIPAddress>\
+                         </u:GetExternalIPAddressResponse></s:Body></s:Envelope>"
+                    )
+                } else {
+                    // AddPortMapping success — an empty response body.
+                    "<s:Envelope><s:Body><u:AddPortMappingResponse></u:AddPortMappingResponse></s:Body></s:Envelope>".to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                sock.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn maps_a_port_against_a_fake_igd() {
+        let igd = fake_igd("203.0.113.42").await;
+        let location = format!("http://{igd}/rootDesc.xml");
+        let mapping = map_via_location(&location, 40000, Duration::from_secs(3600), "warren")
+            .await
+            .expect("mapping should succeed");
+        assert_eq!(
+            mapping.external,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)), 40000)
+        );
+        assert_eq!(mapping.lifetime, Duration::from_secs(3600));
+    }
+}

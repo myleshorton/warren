@@ -76,11 +76,14 @@ crates/
               topic set on an interval until its handle drops, so a provider stays
               discoverable across DHT churn and epoch rotation
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
-  portmap   PCP (RFC 6887) port mapping: ask the gateway to forward an external
-            UDP port to us — a complement to punching that makes a peer directly
-            reachable. Sans-IO MAP request/response codec (round-trip + KAT tested)
-            + map_port over UDP with retransmit and a nonce that rejects spoofed
-            replies (loopback-tested against a fake gateway)
+  portmap   port mapping: ask the gateway to forward an external UDP port to us
+            — a complement to punching that makes a peer directly reachable. Two
+            protocols behind one Mapping type: PCP (RFC 6887), a compact binary
+            MAP codec (round-trip + KAT tested) driven over UDP with retransmit
+            and an anti-spoof nonce; and UPnP-IGD for gateways that don't speak
+            PCP — SSDP discovery + a minimal HTTP/SOAP client (AddPortMapping,
+            GetExternalIPAddress), with pure parsers KAT-tested and the HTTP flow
+            loopback-tested against a fake IGD
   feed      signed append-only log (the "log"/hypercore role): BLAKE3 Merkle tree
             over blocks (root maintained by an incremental O(log n) accumulator),
             a signed (len, root) head, and per-block inclusion proofs
@@ -127,8 +130,8 @@ crates/
             connection.
 
   next: wire port mapping into connect's address discovery (alongside the
-        reflexive probe), automatic mapping renewal, UPnP-IGD fallback for
-        gateways that don't speak PCP, ...
+        reflexive probe), PCP-then-UPnP fallback in one call, automatic mapping
+        renewal before lease expiry, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

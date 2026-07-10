@@ -195,6 +195,26 @@ async fn connect_to_any_locks_onto_the_reachable_candidate() {
 }
 
 #[tokio::test]
+async fn empty_candidate_sets_fail_fast() {
+    // No candidate means no target: the `_any` primitives return None promptly
+    // rather than spinning to the overall deadline.
+    let cfg = Config::default();
+    let sock = UdpSocket::bind(addr(0)).await.unwrap();
+    let out = timeout(Duration::from_millis(200), connect_to_any(sock, &[], &cfg))
+        .await
+        .expect("connect_to_any([]) must return without waiting out the deadline")
+        .unwrap();
+    assert!(out.is_none());
+
+    let sock = UdpSocket::bind(addr(0)).await.unwrap();
+    let out = timeout(Duration::from_millis(200), accept_any(sock, &[], &cfg))
+        .await
+        .expect("accept_any([]) must return promptly")
+        .unwrap();
+    assert!(out.is_none());
+}
+
+#[tokio::test]
 async fn accept_any_honors_any_listed_host() {
     // The accept side is given several candidate hosts; a probe from any of them
     // establishes. Here the real dialer is on loopback, listed alongside a decoy

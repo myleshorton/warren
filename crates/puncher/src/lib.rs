@@ -124,6 +124,9 @@ pub async fn connect_to_any(
     peers: &[SocketAddr],
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    if peers.is_empty() {
+        return Ok(None); // nothing to dial — fail fast rather than spin to the deadline
+    }
     let deadline = Instant::now() + cfg.overall;
     let mut buf = [0u8; 64];
     while Instant::now() < deadline {
@@ -185,6 +188,9 @@ pub async fn accept_any(
     peer_hosts: &[IpAddr],
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    if peer_hosts.is_empty() {
+        return Ok(None); // no host to accept from — fail fast
+    }
     let deadline = Instant::now() + cfg.overall;
     let mut buf = [0u8; 64];
     loop {
@@ -243,6 +249,9 @@ pub async fn open_birthday_sockets_any(
     seed: u64,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    if peer_hosts.is_empty() {
+        return Ok(None); // no host to accept a probe from — fail fast
+    }
     assert!(
         range.0 >= 1 && range.0 < range.1,
         "invalid port range {range:?}: need 1 <= start < end"
@@ -337,6 +346,9 @@ pub async fn spray_any(
     seed: u64,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    if peer_hosts.is_empty() {
+        return Ok(None); // no host to spray toward — fail fast
+    }
     assert!(
         range.0 >= 1 && range.0 < range.1,
         "invalid port range {range:?}: need 1 <= start < end"

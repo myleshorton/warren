@@ -119,10 +119,10 @@ pub enum Event {
         strategy: Option<Strategy>,
     },
     /// A peer wants to connect to us (we are the target). The caller stands up a
-    /// data socket, calls [`Dht::accept_connect`] with its address to complete
-    /// the signaling, and runs the punch primitive `strategy` indicates —
-    /// dial-accept, spray, or open birthday sockets — toward `initiator_data_addrs`.
-    /// Ignore the event to decline.
+    /// data socket, calls [`Dht::accept_connect`] with its candidate address(es)
+    /// to complete the signaling, and runs the punch primitive `strategy`
+    /// indicates — dial-accept, spray, or open birthday sockets — toward
+    /// `initiator_data_addrs`. Ignore the event to decline.
     IncomingConnect {
         /// The peer initiating the connection.
         initiator: NodeId,

@@ -118,9 +118,12 @@ pub enum Message {
     },
     /// Server → client: a bitfield over the blob's manifest — bit `i` (bit `i%8`
     /// of byte `i/8`, LSB-first) is set iff the server holds `manifest.chunks[i]`.
-    /// The client interprets it against the manifest it already fetched; because
-    /// every chunk is still verified by hash on receipt, an inaccurate bitfield
-    /// can at worst waste a request, never corrupt the download.
+    /// The client interprets it against the manifest it already fetched, as a
+    /// *scheduling hint*. Every chunk is still verified by hash on receipt, so an
+    /// inaccurate bitfield can never corrupt the download; it can only affect
+    /// availability — a bit wrongly *set* wastes a request (the chunk comes back
+    /// `Absent`), a bit wrongly *cleared* keeps the client from asking this
+    /// provider for a chunk it actually has.
     Have {
         /// The holdings bitfield.
         bits: Vec<u8>,

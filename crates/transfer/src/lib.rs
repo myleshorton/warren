@@ -373,9 +373,12 @@ async fn fetch_manifest<L: Link>(
 /// hash-verified probing sort it out; the cost is some wasted requests to a
 /// provider that turns out to hold little. (Claiming everything adds one to every
 /// chunk's holder count uniformly, so it leaves the rarest-first order intact.)
-/// The holdings are advisory regardless — every chunk is still verified by hash
-/// on receipt, so an inaccurate answer can only waste a request, never corrupt
-/// the blob. A genuinely unexpected reply is treated as holding nothing.
+/// The holdings are a scheduling hint, not a trust boundary: every chunk is
+/// verified by hash on receipt, so an inaccurate answer can never corrupt the
+/// blob. It can affect liveness, though — a false negative (a chunk held but not
+/// reported) means we won't request it from this provider, which is exactly why
+/// an `Absent` (report nothing) is treated optimistically rather than as empty. A
+/// genuinely unexpected reply is treated as holding nothing.
 async fn fetch_haveset<L: Link>(
     channel: &mut L,
     id: Hash,

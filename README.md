@@ -112,10 +112,11 @@ crates/
             re-dispatched immediately, so a slow one never stalls the others at a
             round barrier. A dropped provider's chunks are re-assigned to the rest.
             For video, download_blob_stream instead fetches a playback-order
-            priority window first (rarest-first beyond it) and hands chunks to the
-            player in order as they arrive, so playback starts before the whole
-            blob does. The seam where the data layer finally rides the transport
-            over a real, multi-peer connection.
+            priority window first (rarest-first beyond it) and hands the player
+            each chunk in playback order as the contiguous prefix fills in (a chunk
+            that arrives early is held until the ones before it are in), so
+            playback can start before the whole blob does. The seam where the data
+            layer finally rides the transport over a real, multi-peer connection.
 
   next: port mapping (UPnP/PCP) to raise direct-connect success, an incremental
         Merkle accumulator for feed, memory-bounded streaming (drop chunks after

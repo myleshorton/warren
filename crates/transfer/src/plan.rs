@@ -139,20 +139,16 @@ impl Plan {
         self.selection = selection;
     }
 
-    /// Assign pending chunks to providers for one round, **rarest-first** and
-    /// **holdings-aware**. `holdings[i]` is what live provider `i` can serve.
-    /// Chunks are ordered by how few *known* holders they have (rarest first, so
-    /// the scarcest data is pulled while its holders are still around) and each is
-    /// given to a *least-loaded* provider that can serve it, up to `cap` chunks
-    /// per provider. A known holder is always preferred over a [`Holdings::Unknown`]
+    /// Assign pending chunks to providers for one round, **holdings-aware**.
+    /// `holdings[i]` is what live provider `i` can serve. Chunks are considered in
+    /// the order set by the current [`Selection`] (see [`ordered_pending`](Self::ordered_pending)
+    /// — rarest-first by default, playback-order for streaming) and each is given
+    /// to a *least-loaded* provider that can serve it, up to `cap` chunks per
+    /// provider. A known holder is always preferred over a [`Holdings::Unknown`]
     /// provider, so the last copy of a chunk is never wasted on a speculative
     /// source while a known holder is idle. A chunk no one can serve is left
     /// pending. Assigned chunks are removed from pending; [`Plan::requeue`]
     /// returns any that aren't delivered. The result is indexed to match `holdings`.
-    ///
-    /// Rarest-first is the right default for a partial-seeder swarm (it avoids
-    /// piece starvation), but it is *not* ideal for streaming; keeping the choice
-    /// to this one ordering makes a future deadline-aware policy a local change.
     pub fn assign(&mut self, holdings: &[&Holdings], cap: usize) -> Vec<Vec<Hash>> {
         let mut assignment = vec![Vec::new(); holdings.len()];
         let mut load = vec![0usize; holdings.len()];

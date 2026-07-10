@@ -72,6 +72,10 @@ crates/
               birthday spray/open-sockets punch, chosen by the resolved strategy
             + reflexive discovery: both dialer and target probe a reflector to
               advertise their data socket's external address (NATed peers punchable)
+            + optional port mapping (PunchTuning::port_mapping, off by default):
+              both sides race a UPnP-IGD mapping against the reflexive probe and
+              advertise the explicit forward when the gateway supports it, falling
+              back to the reflexive address otherwise — so it only adds reachability
             + keep_announced: a background loop that re-announces a (rotating)
               topic set on an interval until its handle drops, so a provider stays
               discoverable across DHT churn and epoch rotation
@@ -129,9 +133,9 @@ crates/
             data layer finally rides the transport over a real, multi-peer
             connection.
 
-  next: wire port mapping into connect's address discovery (alongside the
-        reflexive probe), PCP-then-UPnP fallback in one call, automatic mapping
-        renewal before lease expiry, ...
+  next: automatic mapping renewal before lease expiry (so a mapping outlives one
+        connect), PCP-then-UPnP fallback in one call (PCP needs gateway discovery),
+        advertising multiple candidate addresses (ICE-style) rather than one, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

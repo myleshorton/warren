@@ -63,14 +63,21 @@ impl Default for BirthdayParams {
     }
 }
 
-/// All timing/parameter tuning for the hole punch a connect performs once the
-/// DHT has brokered reachability.
+/// How a connect establishes reachability: whether it tries to open a direct
+/// external port during discovery, plus the timing/parameters of the punch it
+/// performs once the DHT has brokered reachability.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PunchTuning {
     /// Timing knobs (deadline, probe interval) for every punch primitive.
     pub config: PunchConfig,
     /// Birthday-punch parameters for the symmetric-NAT (`Punched`) path.
     pub birthday: BirthdayParams,
+    /// Attempt a UPnP-IGD port mapping while discovering the data socket's
+    /// external address, advertising the explicit forward when the gateway
+    /// supports it (falling back to the reflexive observation otherwise).
+    /// Off by default: it fires an SSDP multicast per connect and waits out the
+    /// discovery window on networks with no UPnP gateway.
+    pub port_mapping: bool,
 }
 
 /// A live, bidirectional data channel to a peer, established by a hole punch —
@@ -275,6 +282,9 @@ pub struct Node {
     id: NodeId,
     local_addr: SocketAddr,
     cmd_tx: mpsc::Sender<Command>,
+    /// Whether [`Node::connect`] attempts a port mapping during discovery
+    /// (from [`PunchTuning::port_mapping`]).
+    port_mapping: bool,
     /// Channels punched in response to inbound connects, delivered by the actor.
     /// Shared behind a mutex so cloned handles share the single stream (accept is
     /// naturally one consumer); [`Node::next_incoming`] drains it.
@@ -335,6 +345,7 @@ impl Node {
             id,
             local_addr,
             cmd_tx,
+            port_mapping: tuning.port_mapping,
             incoming: Arc::new(Mutex::new(incoming_rx)),
         })
     }
@@ -457,10 +468,13 @@ impl Node {
             .await
             .map_err(ConnectError::Bind)?;
         let local = data_sock.local_addr().map_err(ConnectError::Bind)?;
-        // Learn the data socket's external mapping from a reflector; falls back to
-        // `local` if none answers (correct on an unNATed host).
+        // Learn the data socket's external address to advertise as the punch
+        // target: a reflexive probe, optionally upgraded to an explicit UPnP port
+        // mapping. Falls back to `local` if neither yields anything (correct on an
+        // unNATed host).
         let reflectors = self.reflectors().await.map_err(|_| ConnectError::Closed)?;
-        let advertised = reflexive_addr(&data_sock, self.id, local, &reflectors).await;
+        let advertised =
+            discover_external(&data_sock, self.id, local, &reflectors, self.port_mapping).await;
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Connect(target, data_sock, advertised, tx))
@@ -516,6 +530,8 @@ async fn run(
     // Timing + birthday parameters for the punch once the DHT brokers reachability.
     let punch_cfg = tuning.config;
     let birthday = tuning.birthday;
+    // Whether accept-side discovery also attempts a port mapping.
+    let port_mapping = tuning.port_mapping;
 
     // Bootstrap waiters are keyed by the query id so a stray QueryFinished can't
     // resolve them and concurrent bootstraps don't clobber each other. Announce
@@ -612,6 +628,7 @@ async fn run(
                                     peer_host: initiator_data_addr.ip(),
                                     strategy,
                                     seed: local.port() as u64,
+                                    port_mapping,
                                     done: reflexive_tx.clone(),
                                 });
                             }
@@ -765,6 +782,8 @@ struct ReflexiveProbe {
     peer_host: IpAddr,
     strategy: Strategy,
     seed: u64,
+    /// Whether to also attempt a port mapping when discovering the address.
+    port_mapping: bool,
     done: mpsc::Sender<ReflexiveDone>,
 }
 
@@ -785,7 +804,8 @@ struct ReflexiveDone {
 /// own task because the probe awaits a reflector round-trip.
 fn spawn_reflexive_probe(p: ReflexiveProbe) {
     tokio::spawn(async move {
-        let external_addr = reflexive_addr(&p.data_sock, p.id, p.local, &p.reflectors).await;
+        let external_addr =
+            discover_external(&p.data_sock, p.id, p.local, &p.reflectors, p.port_mapping).await;
         let _ = p
             .done
             .send(ReflexiveDone {
@@ -880,6 +900,101 @@ fn spawn_accept_punch(job: AcceptJob) {
             let _ = incoming_tx.try_send(channel);
         }
     });
+}
+
+/// Lifetime requested for a connect's port mapping. Kept short deliberately: the
+/// mapping only has to survive until the punch completes — once punched, the
+/// channel rides the hole our own outbound packets keep open, so the forward is
+/// no longer needed. A short lease means a forward auto-expires soon after the
+/// connect instead of lingering on the gateway (we hold no handle to delete it,
+/// and don't renew — both are future work), so many connects can't pile up
+/// long-lived forwards.
+const MAP_LIFETIME: Duration = Duration::from_secs(120);
+/// Label the mapping carries in the router's UI.
+const MAP_DESCRIPTION: &str = "warren";
+/// Overall bound on the port-mapping attempt, so a slow or half-speaking gateway
+/// can't stall a connect past this even though the reflexive probe has answered.
+const MAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The address to advertise as this data socket's punch target. Always runs the
+/// reflexive probe; when `port_mapping` is set, concurrently attempts a UPnP-IGD
+/// mapping and prefers that explicit forward when the gateway supports it. Any
+/// mapping failure (no gateway, timeout, rejection) falls back to the reflexive
+/// result, so enabling it can only add reachability, never remove it.
+async fn discover_external(
+    sock: &UdpSocket,
+    id: NodeId,
+    local: SocketAddr,
+    reflectors: &[SocketAddr],
+    port_mapping: bool,
+) -> SocketAddr {
+    // UPnP-IGD is IPv4-only (SSDP is an IPv4 multicast and the mapping yields an
+    // IPv4 external address), so it can't produce a target for an IPv6 data
+    // socket — skip it and advertise the reflexive address, which is derived from
+    // the socket itself and so is correct for either family.
+    if !port_mapping || local.is_ipv6() {
+        return reflexive_addr(sock, id, local, reflectors).await;
+    }
+    // Run both concurrently: the mapping touches its own sockets (SSDP/HTTP), so
+    // it doesn't contend with the reflexive probe on `sock`.
+    let reflexive = reflexive_addr(sock, id, local, reflectors);
+    let mapped = timeout(
+        MAP_TIMEOUT,
+        portmap::map_port_upnp(local.port(), MAP_LIFETIME, MAP_DESCRIPTION),
+    );
+    let (reflexive, mapped) = tokio::join!(reflexive, mapped);
+    // `mapped` is Ok(Ok(_)) only when the mapping fully succeeded within the
+    // timeout; a timeout (outer Err) or a UPnP error (inner Err) both fall back.
+    let external = match mapped {
+        Ok(Ok(m)) => Some(m.external),
+        _ => None,
+    };
+    prefer_mapped(external, reflexive)
+}
+
+/// Choose the address to advertise: the explicit mapping, but only when its IP is
+/// publicly routable — otherwise the reflexive observation. Under double-NAT /
+/// CGNAT, a UPnP `GetExternalIPAddress` returns the *first* NAT's address, which
+/// can itself be private or carrier-grade (`100.64/10`); advertising that as a
+/// punch target would be worse than the reflexive address a public reflector saw.
+fn prefer_mapped(mapped: Option<SocketAddr>, reflexive: SocketAddr) -> SocketAddr {
+    match mapped {
+        Some(m) if is_publicly_routable(m.ip()) => m,
+        _ => reflexive,
+    }
+}
+
+/// A conservative "safe to advertise to a peer" check, using only stable std
+/// predicates: reject the ranges that clearly can't be reached from off-network.
+/// The precise predicates for CGNAT (`100.64.0.0/10`), benchmarking
+/// (`198.18.0.0/15`), reserved (`240.0.0.0/4`) — and `is_global` itself — are all
+/// still unstable (`feature(ip)`, rust#27709, unstable even on 1.93), so those
+/// ranges are matched by hand. CGNAT is the common double-NAT case UPnP surfaces.
+fn is_publicly_routable(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            let is_cgnat = a == 100 && (64..=127).contains(&b); // 100.64.0.0/10
+            let is_benchmarking = a == 198 && (18..=19).contains(&b); // 198.18.0.0/15
+            let is_reserved = a >= 240; // 240.0.0.0/4, reserved/experimental
+            !v4.is_private()
+                && !v4.is_loopback()
+                && !v4.is_link_local()
+                && !v4.is_broadcast()
+                && !v4.is_multicast() // 224.0.0.0/4
+                && !v4.is_documentation()
+                && !v4.is_unspecified()
+                && !is_cgnat
+                && !is_benchmarking
+                && !is_reserved
+        }
+        // UPnP-IGD yields IPv4 only, so a v6 mapped address can't legitimately
+        // occur here. Rather than partially re-implement v6 global-routability
+        // with hand-rolled range checks (the stable std predicates don't cover
+        // link-local / ULA), refuse to advertise a v6 mapped address at all —
+        // maximally conservative, and the branch is unreachable in practice.
+        IpAddr::V6(_) => false,
+    }
 }
 
 /// Discover `sock`'s externally-observed address by asking reflectors to echo
@@ -1023,6 +1138,75 @@ mod tests {
         let sock = UdpSocket::bind(lo()).await.unwrap();
         let local = sock.local_addr().unwrap();
         let observed = reflexive_addr(&sock, NodeId::from_bytes([1u8; 32]), local, &[]).await;
+        assert_eq!(observed, local);
+    }
+
+    #[test]
+    fn prefer_mapped_uses_a_routable_forward_but_not_a_private_one() {
+        // Globally-routable addresses (not TEST-NET / private / CGNAT).
+        let reflexive: SocketAddr = "93.184.216.34:41000".parse().unwrap();
+        let mapped: SocketAddr = "8.8.8.8:5000".parse().unwrap();
+        // A routable explicit mapping wins when present.
+        assert_eq!(prefer_mapped(Some(mapped), reflexive), mapped);
+        // With no mapping, the reflexive observation is advertised.
+        assert_eq!(prefer_mapped(None, reflexive), reflexive);
+        // A non-routable mapping (double-NAT/CGNAT) must NOT override a routable
+        // reflexive address — it would only reduce reachability.
+        let private: SocketAddr = "192.168.1.50:5000".parse().unwrap();
+        let cgnat: SocketAddr = "100.64.5.5:5000".parse().unwrap();
+        assert_eq!(prefer_mapped(Some(private), reflexive), reflexive);
+        assert_eq!(prefer_mapped(Some(cgnat), reflexive), reflexive);
+    }
+
+    #[test]
+    fn public_routability_rejects_unreachable_ranges() {
+        let pub_ip: IpAddr = "8.8.8.8".parse().unwrap();
+        assert!(is_publicly_routable(pub_ip));
+        for bad in [
+            "10.0.0.1",             // private
+            "192.168.1.1",          // private
+            "172.16.0.1",           // private
+            "127.0.0.1",            // loopback
+            "169.254.1.1",          // link-local
+            "100.64.0.1",           // CGNAT
+            "203.0.113.1",          // TEST-NET-3 (documentation)
+            "224.0.0.1",            // multicast
+            "198.18.0.1",           // benchmarking
+            "240.0.0.1",            // reserved
+            "255.255.255.255",      // broadcast
+            "0.0.0.0",              // unspecified
+            "::1",                  // v6 loopback
+            "2606:4700:4700::1111", // a global v6 — still refused (UPnP is v4-only)
+        ] {
+            let ip: IpAddr = bad.parse().unwrap();
+            assert!(!is_publicly_routable(ip), "{bad} must not be advertisable");
+        }
+    }
+
+    #[tokio::test]
+    async fn discover_external_delegates_to_reflexive_when_mapping_off() {
+        // With port mapping off, discovery is exactly the reflexive probe — here,
+        // no reflector, so it falls back to `local`. (The mapping-enabled path
+        // fires real SSDP, so its mechanics are exercised by portmap's fake-IGD
+        // integration test rather than a live multicast here.)
+        let sock = UdpSocket::bind(lo()).await.unwrap();
+        let local = sock.local_addr().unwrap();
+        let observed =
+            discover_external(&sock, NodeId::from_bytes([1u8; 32]), local, &[], false).await;
+        assert_eq!(observed, local);
+    }
+
+    #[tokio::test]
+    async fn discover_external_skips_ipv4_only_mapping_for_ipv6_sockets() {
+        // UPnP is IPv4-only, so even with mapping enabled a v6 socket must not
+        // attempt it (which could advertise an unreachable IPv4 address); it
+        // stays reflexive-only, falling back to `local` with no reflector.
+        let Ok(sock) = UdpSocket::bind("[::1]:0").await else {
+            return; // no IPv6 loopback in this environment — nothing to check
+        };
+        let local = sock.local_addr().unwrap();
+        let observed =
+            discover_external(&sock, NodeId::from_bytes([1u8; 32]), local, &[], true).await;
         assert_eq!(observed, local);
     }
 }

@@ -368,9 +368,15 @@ impl Dht {
     /// Connect to `target` by id: discover it on the DHT, then coordinate a hole
     /// punch through a node that holds its announce record. `data_addrs` are our
     /// own data-socket candidate addresses (preference order), sent to the target
-    /// so it knows where to punch back. Completion is reported as an
-    /// [`Event::Connected`] carrying the target's candidate addresses to punch to.
+    /// so it knows where to punch back; it must be non-empty (an empty set offers
+    /// the target nowhere to punch, so the connect could only time out).
+    /// Completion is reported as an [`Event::Connected`] carrying the target's
+    /// candidate addresses to punch to.
     pub fn connect(&mut self, target: NodeId, data_addrs: Vec<SocketAddr>, now: Millis) -> QueryId {
+        debug_assert!(
+            !data_addrs.is_empty(),
+            "connect needs at least one candidate address to advertise"
+        );
         self.connecting.insert(
             target,
             ConnectState {
@@ -384,10 +390,21 @@ impl Dht {
 
     /// Accept an incoming connect surfaced by [`Event::IncomingConnect`]: reply
     /// to `initiator` (through the coordinator that relayed the request) with our
-    /// `data_addrs`, so it can punch a channel to us. A no-op if the request is no
-    /// longer pending — already accepted, or past its deadline (the initiator has
-    /// itself timed out, so a reply would be ignored).
+    /// `data_addrs`, so it can punch a channel to us. `data_addrs` must be
+    /// non-empty — replying with no candidate would hand the initiator a
+    /// `Connected` outcome it can't punch to. A no-op if the request is no longer
+    /// pending — already accepted, or past its deadline (the initiator has itself
+    /// timed out, so a reply would be ignored). An empty set is also treated as a
+    /// no-op, leaving the request pending so a later call with a real candidate
+    /// can still accept it.
     pub fn accept_connect(&mut self, initiator: NodeId, data_addrs: Vec<SocketAddr>, now: Millis) {
+        debug_assert!(
+            !data_addrs.is_empty(),
+            "accept_connect needs at least one candidate address to advertise"
+        );
+        if data_addrs.is_empty() {
+            return; // nothing to offer; keep the request pending for a real accept
+        }
         if let Some(inc) = self.pending_incoming.remove(&initiator) {
             if inc.deadline <= now {
                 return; // expired before we accepted; the initiator has given up

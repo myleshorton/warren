@@ -860,6 +860,15 @@ impl Dht {
         is_reply: bool,
         now: Millis,
     ) {
+        // `data_addrs` is untrusted wire input. A Signal with no candidate can
+        // never lead to a punch, and a well-behaved peer never sends one (our
+        // `connect`/`accept_connect` both require >= 1). Drop it as malformed on
+        // every path: enqueuing it as an incoming connect would burn a
+        // `MAX_PENDING_INCOMING` slot on an unpunchable request, and resolving it
+        // as an initiator would report a peer-less `Connected`.
+        if data_addrs.is_empty() {
+            return;
+        }
         if !is_reply {
             if target == self.id {
                 // We are the target. We can't reply yet: the reply must carry our
@@ -1054,6 +1063,46 @@ mod tests {
         assert!(
             !reply_dests.contains(&coord_b),
             "a replay must not redirect the reply to its coordinator"
+        );
+    }
+
+    /// An incoming connect request that advertises no candidate address (untrusted
+    /// wire input) must be dropped: no `IncomingConnect` event, and no
+    /// `pending_incoming` slot consumed — otherwise a peer could burn the pending
+    /// table on unpunchable requests.
+    #[test]
+    fn incoming_request_with_no_candidates_is_dropped() {
+        let me = id(1);
+        let initiator = id(2);
+        let mut dht = Dht::new(me);
+        let request = Packet {
+            sender: id(9),
+            rid: 1,
+            msg: Message::Signal {
+                target: me,
+                initiator,
+                initiator_addr: addr("10.0.0.2:100"),
+                data_addrs: vec![], // empty candidate set
+                nat: Firewall::Consistent,
+                is_reply: false,
+            },
+        }
+        .encode();
+        dht.handle_input(addr("10.0.0.9:900"), &request, 0);
+
+        let incoming = std::iter::from_fn(|| dht.poll_event())
+            .filter(|e| matches!(e, Event::IncomingConnect { .. }))
+            .count();
+        assert_eq!(incoming, 0, "an empty-candidate request must not surface");
+        // The slot must be free: a real request for the same initiator still works.
+        let real = signal_request(initiator, me, addr("10.0.0.2:200"));
+        dht.handle_input(addr("10.0.0.9:900"), &real, 0);
+        let incoming = std::iter::from_fn(|| dht.poll_event())
+            .filter(|e| matches!(e, Event::IncomingConnect { .. }))
+            .count();
+        assert_eq!(
+            incoming, 1,
+            "a subsequent real request must still be accepted"
         );
     }
 

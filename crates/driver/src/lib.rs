@@ -577,17 +577,20 @@ async fn run(
                 Event::Connected {
                     target,
                     outcome,
-                    peer_data_addr,
+                    peer_data_addrs,
                     strategy,
                 } => {
                     if let Some((data_sock, tx)) = pending_connect.remove(&target) {
                         // Seed the birthday RNG from the pre-bound socket's port so
                         // concurrent connects don't spray identical port sequences.
                         let seed = data_sock.local_addr().map(|a| a.port()).unwrap_or(0) as u64;
+                        // PR-A wires the candidate set through the protocol but the
+                        // punch still uses the first candidate; trying the whole set
+                        // is the driver/puncher change in the follow-up.
                         spawn_connect_punch(PunchJob {
                             data_sock,
                             own_host: data_ip,
-                            peer: peer_data_addr,
+                            peer: peer_data_addrs.first().copied(),
                             strategy,
                             outcome,
                             cfg: punch_cfg,
@@ -599,7 +602,7 @@ async fn run(
                 }
                 Event::IncomingConnect {
                     initiator,
-                    initiator_data_addr,
+                    initiator_data_addrs,
                     strategy,
                 } => {
                     // Stand up a data socket and discover its external address via
@@ -609,8 +612,14 @@ async fn run(
                     // Decline if the node is bound to an unspecified address: the
                     // data socket's address would be unspecified too, unpunchable
                     // by the peer (mirrors the outbound `UnspecifiedLocalAddr`
-                    // check); the initiator times out.
-                    if !data_ip.is_unspecified() {
+                    // check); the initiator times out. Decline too if the initiator
+                    // offered no candidate — there's nowhere to punch to.
+                    // PR-A punches toward the first candidate; the follow-up tries
+                    // the whole set.
+                    if let (false, Some(peer_addr)) =
+                        (data_ip.is_unspecified(), initiator_data_addrs.first())
+                    {
+                        let peer_host = peer_addr.ip();
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
                             if let Ok(local) = data_sock.local_addr() {
                                 let id = dht.id();
@@ -625,7 +634,7 @@ async fn run(
                                     local,
                                     reflectors,
                                     initiator,
-                                    peer_host: initiator_data_addr.ip(),
+                                    peer_host,
                                     strategy,
                                     seed: local.port() as u64,
                                     port_mapping,
@@ -684,7 +693,9 @@ async fn run(
                             }
                             Entry::Vacant(slot) => {
                                 slot.insert((data_sock, tx));
-                                dht.connect(target, data_addr, now());
+                                // PR-A: advertise a single-element candidate set;
+                                // gathering multiple candidates is the follow-up.
+                                dht.connect(target, vec![data_addr], now());
                             }
                         }
                     }
@@ -715,7 +726,7 @@ async fn run(
                     // The accept-side reflexive probe finished: reply to the
                     // initiator with the discovered external address, then run the
                     // punch on the data socket per the planned strategy.
-                    dht.accept_connect(done.initiator, done.external_addr, now());
+                    dht.accept_connect(done.initiator, vec![done.external_addr], now());
                     spawn_accept_punch(AcceptJob {
                         data_sock: done.data_sock,
                         own_host: data_ip,

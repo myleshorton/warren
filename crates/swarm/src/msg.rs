@@ -73,13 +73,17 @@ pub enum Message {
         /// The initiator's *control* address, as observed and filled in by the
         /// coordinator (which sees the control socket, not the data socket).
         initiator_addr: SocketAddr,
-        /// The sender's *data-socket* address, where the actual channel is
-        /// punched (initiator's on a request, target's on a reply). Unlike
-        /// `initiator_addr` the coordinator can't observe this — a data socket is
-        /// a different port with its own NAT mapping — so the sender fills it in.
-        /// On loopback that's the local address; a real NAT's external mapping
-        /// needs reflexive discovery (a separate layer).
-        data_addr: SocketAddr,
+        /// The sender's *data-socket* candidate addresses, in preference order —
+        /// where the actual channel is punched (initiator's on a request,
+        /// target's on a reply). ICE-style: the sender offers every address it
+        /// might be reachable at (its local address, its reflexive/STUN-observed
+        /// mapping, an explicit port-mapped forward, …) and the peer tries them,
+        /// so one wrong guess (a per-destination NAT mapping, a CGNAT external
+        /// IP, a multi-homed host) no longer sinks the connect. Unlike
+        /// `initiator_addr` the coordinator can't observe these — a data socket is
+        /// a different port with its own NAT mapping — so the sender fills them
+        /// in. The coordinator relays them opaquely.
+        data_addrs: Vec<SocketAddr>,
         /// The sender's firewall type (initiator's on a request, target's on a reply).
         nat: Firewall,
         /// False for an initiator→target request, true for a target→initiator reply.
@@ -136,7 +140,7 @@ impl Packet {
                 target,
                 initiator,
                 initiator_addr,
-                data_addr,
+                data_addrs,
                 nat,
                 is_reply,
             } => {
@@ -144,7 +148,7 @@ impl Packet {
                 enc.raw(target.as_bytes());
                 enc.raw(initiator.as_bytes());
                 encode_addr(&mut enc, initiator_addr);
-                encode_addr(&mut enc, data_addr);
+                encode_addrs(&mut enc, data_addrs);
                 enc.u8(nat.as_u8());
                 enc.u8(u8::from(*is_reply));
             }
@@ -184,7 +188,7 @@ impl Packet {
                 let target = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 let initiator = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 let initiator_addr = decode_addr(&mut dec)?;
-                let data_addr = decode_addr(&mut dec)?;
+                let data_addrs = decode_addrs(&mut dec)?;
                 let nat = Firewall::from_u8(dec.u8()?)
                     .ok_or(MsgError::Malformed("unknown firewall tag"))?;
                 let is_reply = dec.u8()? != 0;
@@ -192,7 +196,7 @@ impl Packet {
                     target,
                     initiator,
                     initiator_addr,
-                    data_addr,
+                    data_addrs,
                     nat,
                     is_reply,
                 }
@@ -228,6 +232,29 @@ fn decode_contacts<'a>(dec: &mut Decoder<'a>) -> Result<Vec<Contact>, MsgError> 
         contacts.push(Contact::new(id, addr));
     }
     Ok(contacts)
+}
+
+fn encode_addrs(enc: &mut Encoder, addrs: &[SocketAddr]) {
+    enc.uint(addrs.len() as u64);
+    for a in addrs {
+        encode_addr(enc, a);
+    }
+}
+
+fn decode_addrs<'a>(dec: &mut Decoder<'a>) -> Result<Vec<SocketAddr>, MsgError> {
+    // Smallest address is a family tag + a v4 address: 1 + 4 + 2 bytes. Bound the
+    // count by that (not by a fixed cap) so a crafted length can't force an
+    // allocation far larger than the buffer — same guard as `decode_contacts`.
+    const MIN_ADDR_BYTES: u64 = 1 + 4 + 2;
+    let n = dec.uint()?;
+    if n > dec.remaining() as u64 / MIN_ADDR_BYTES {
+        return Err(MsgError::Malformed("address count exceeds buffer"));
+    }
+    let mut addrs = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        addrs.push(decode_addr(dec)?);
+    }
+    Ok(addrs)
 }
 
 fn encode_addr(enc: &mut Encoder, addr: &SocketAddr) {
@@ -358,23 +385,33 @@ mod tests {
 
     #[test]
     fn signal_roundtrip() {
+        let v6 = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 9002, 0, 0));
+        // A mix of candidate-set shapes: several addresses across both families,
+        // a single address, and none.
+        let candidate_sets = [
+            vec![addr4(9001), addr4(9002), v6],
+            vec![addr4(9001)],
+            vec![],
+        ];
         for (nat, is_reply) in [
             (Firewall::Open, false),
             (Firewall::Consistent, true),
             (Firewall::Random, false),
         ] {
-            roundtrip(&Packet {
-                sender: id(6),
-                rid: 3,
-                msg: Message::Signal {
-                    target: id(20),
-                    initiator: id(21),
-                    initiator_addr: addr4(9000),
-                    data_addr: addr4(9001),
-                    nat,
-                    is_reply,
-                },
-            });
+            for data_addrs in &candidate_sets {
+                roundtrip(&Packet {
+                    sender: id(6),
+                    rid: 3,
+                    msg: Message::Signal {
+                        target: id(20),
+                        initiator: id(21),
+                        initiator_addr: addr4(9000),
+                        data_addrs: data_addrs.clone(),
+                        nat,
+                        is_reply,
+                    },
+                });
+            }
         }
     }
 
@@ -403,5 +440,24 @@ mod tests {
             Packet::decode(&bytes),
             Err(MsgError::Wire(WireError::TrailingBytes(1)))
         ));
+    }
+
+    #[test]
+    fn absurd_candidate_count_is_rejected_not_allocated() {
+        // A crafted Signal whose data-address count is enormous but whose buffer
+        // is tiny must be rejected, not trigger a huge allocation. Build the
+        // packet up to the count, then write a giant varint and stop.
+        let mut enc = Encoder::new();
+        enc.raw(id(1).as_bytes());
+        enc.uint(1);
+        enc.u8(KIND_SIGNAL);
+        enc.raw(id(20).as_bytes());
+        enc.raw(id(21).as_bytes());
+        encode_addr(&mut enc, &addr4(9000)); // initiator_addr
+        enc.uint(u64::MAX); // data_addrs count — far more than the buffer can hold
+        assert_eq!(
+            Packet::decode(&enc.into_vec()),
+            Err(MsgError::Malformed("address count exceeds buffer"))
+        );
     }
 }

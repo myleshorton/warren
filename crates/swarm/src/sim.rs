@@ -210,7 +210,7 @@ impl Sim {
     pub fn connect(&mut self, i: usize, target: NodeId) -> QueryId {
         let now = self.now;
         let data_addr = self.nodes[i].addr;
-        self.nodes[i].dht.connect(target, data_addr, now)
+        self.nodes[i].dht.connect(target, vec![data_addr], now)
     }
 
     /// The NAT a node sits behind.
@@ -336,7 +336,9 @@ impl Sim {
                     let initiator = *initiator;
                     let data_addr = self.nodes[i].addr;
                     let now = self.now;
-                    self.nodes[i].dht.accept_connect(initiator, data_addr, now);
+                    self.nodes[i]
+                        .dht
+                        .accept_connect(initiator, vec![data_addr], now);
                 }
                 self.events.push((i, e));
             }

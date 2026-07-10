@@ -109,25 +109,26 @@ pub enum Event {
         target: NodeId,
         /// How the connection was established.
         outcome: ConnectOutcome,
-        /// The target's data-socket address to punch the channel to, if the
-        /// target accepted (`None` for `NotFound`/`TimedOut`, where there is no
-        /// peer to punch to).
-        peer_data_addr: Option<SocketAddr>,
+        /// The target's data-socket candidate addresses to punch the channel to,
+        /// in preference order, if the target accepted. Empty for
+        /// `NotFound`/`TimedOut`, where there is no peer to punch to.
+        peer_data_addrs: Vec<SocketAddr>,
         /// Our punch role toward the peer (from the two firewalls): dial, spray,
         /// or open birthday sockets. `None` when there is no peer to punch to
         /// (`NotFound`/`TimedOut`).
         strategy: Option<Strategy>,
     },
     /// A peer wants to connect to us (we are the target). The caller stands up a
-    /// data socket, calls [`Dht::accept_connect`] with its address to complete
-    /// the signaling, and runs the punch primitive `strategy` indicates —
-    /// dial-accept, spray, or open birthday sockets — toward `initiator_data_addr`.
-    /// Ignore the event to decline.
+    /// data socket, calls [`Dht::accept_connect`] with its candidate address(es)
+    /// to complete the signaling, and runs the punch primitive `strategy`
+    /// indicates — dial-accept, spray, or open birthday sockets — toward
+    /// `initiator_data_addrs`. Ignore the event to decline.
     IncomingConnect {
         /// The peer initiating the connection.
         initiator: NodeId,
-        /// The initiator's data-socket address — the host to accept a punch from.
-        initiator_data_addr: SocketAddr,
+        /// The initiator's data-socket candidate addresses, in preference order —
+        /// the hosts to accept a punch from / punch toward.
+        initiator_data_addrs: Vec<SocketAddr>,
         /// Our punch role toward the initiator (from the two firewalls).
         strategy: Strategy,
     },
@@ -206,9 +207,9 @@ struct ConnectState {
     /// The coordinator we sent the request to; a reply is accepted only from it,
     /// so another host can't spoof a reply and force a wrong outcome.
     coordinator: Option<SocketAddr>,
-    /// Our own data-socket address, sent in the request so the target learns
-    /// where to punch back.
-    data_addr: SocketAddr,
+    /// Our own data-socket candidate addresses, sent in the request so the target
+    /// learns where to punch back.
+    data_addrs: Vec<SocketAddr>,
 }
 
 /// The target side of an in-flight connect: a request arrived for us, and we
@@ -365,17 +366,23 @@ impl Dht {
     }
 
     /// Connect to `target` by id: discover it on the DHT, then coordinate a hole
-    /// punch through a node that holds its announce record. `data_addr` is our
-    /// own data socket, sent to the target so it knows where to punch back.
+    /// punch through a node that holds its announce record. `data_addrs` are our
+    /// own data-socket candidate addresses (preference order), sent to the target
+    /// so it knows where to punch back; it must be non-empty (an empty set offers
+    /// the target nowhere to punch, so the connect could only time out).
     /// Completion is reported as an [`Event::Connected`] carrying the target's
-    /// data address to punch to.
-    pub fn connect(&mut self, target: NodeId, data_addr: SocketAddr, now: Millis) -> QueryId {
+    /// candidate addresses to punch to.
+    pub fn connect(&mut self, target: NodeId, data_addrs: Vec<SocketAddr>, now: Millis) -> QueryId {
+        debug_assert!(
+            !data_addrs.is_empty(),
+            "connect needs at least one candidate address to advertise"
+        );
         self.connecting.insert(
             target,
             ConnectState {
                 deadline: now + CONNECT_TIMEOUT_MS,
                 coordinator: None,
-                data_addr,
+                data_addrs,
             },
         );
         self.start_query(target, QueryKind::Connect, now)
@@ -383,10 +390,21 @@ impl Dht {
 
     /// Accept an incoming connect surfaced by [`Event::IncomingConnect`]: reply
     /// to `initiator` (through the coordinator that relayed the request) with our
-    /// `data_addr`, so it can punch a channel to us. A no-op if the request is no
-    /// longer pending — already accepted, or past its deadline (the initiator has
-    /// itself timed out, so a reply would be ignored).
-    pub fn accept_connect(&mut self, initiator: NodeId, data_addr: SocketAddr, now: Millis) {
+    /// `data_addrs`, so it can punch a channel to us. `data_addrs` must be
+    /// non-empty — replying with no candidate would hand the initiator a
+    /// `Connected` outcome it can't punch to. A no-op if the request is no longer
+    /// pending — already accepted, or past its deadline (the initiator has itself
+    /// timed out, so a reply would be ignored). An empty set is also treated as a
+    /// no-op, leaving the request pending so a later call with a real candidate
+    /// can still accept it.
+    pub fn accept_connect(&mut self, initiator: NodeId, data_addrs: Vec<SocketAddr>, now: Millis) {
+        debug_assert!(
+            !data_addrs.is_empty(),
+            "accept_connect needs at least one candidate address to advertise"
+        );
+        if data_addrs.is_empty() {
+            return; // nothing to offer; keep the request pending for a real accept
+        }
         if let Some(inc) = self.pending_incoming.remove(&initiator) {
             if inc.deadline <= now {
                 return; // expired before we accepted; the initiator has given up
@@ -400,7 +418,7 @@ impl Dht {
                     target: self.id,
                     initiator,
                     initiator_addr: inc.initiator_addr,
-                    data_addr,
+                    data_addrs,
                     nat: fw,
                     is_reply: true,
                 },
@@ -481,7 +499,7 @@ impl Dht {
                 target,
                 initiator,
                 initiator_addr,
-                data_addr,
+                data_addrs,
                 nat,
                 is_reply,
             } => {
@@ -490,7 +508,7 @@ impl Dht {
                     target,
                     initiator,
                     initiator_addr,
-                    data_addr,
+                    data_addrs,
                     nat,
                     is_reply,
                     now,
@@ -537,7 +555,7 @@ impl Dht {
             self.events.push_back(Event::Connected {
                 target,
                 outcome: ConnectOutcome::TimedOut,
-                peer_data_addr: None,
+                peer_data_addrs: Vec::new(),
                 strategy: None,
             });
         }
@@ -795,10 +813,10 @@ impl Dht {
                     // our signal. It overwrites initiator_addr with the address it
                     // observes, so we needn't know our own external address.
                     // Record the coordinator so we accept the reply only from it.
-                    let data_addr = match self.connecting.get_mut(&target) {
+                    let data_addrs = match self.connecting.get_mut(&target) {
                         Some(cs) => {
                             cs.coordinator = Some(coord.addr);
-                            cs.data_addr
+                            cs.data_addrs.clone()
                         }
                         None => return, // connect already resolved/expired
                     };
@@ -811,7 +829,7 @@ impl Dht {
                             target,
                             initiator: self.id,
                             initiator_addr: coord.addr, // placeholder; coordinator overwrites
-                            data_addr,
+                            data_addrs,
                             nat: fw,
                             is_reply: false,
                         },
@@ -822,7 +840,7 @@ impl Dht {
                     self.events.push_back(Event::Connected {
                         target,
                         outcome: ConnectOutcome::NotFound,
-                        peer_data_addr: None,
+                        peer_data_addrs: Vec::new(),
                         strategy: None,
                     });
                 }
@@ -837,18 +855,27 @@ impl Dht {
         target: NodeId,
         initiator: NodeId,
         initiator_addr: SocketAddr,
-        data_addr: SocketAddr,
+        data_addrs: Vec<SocketAddr>,
         nat: Firewall,
         is_reply: bool,
         now: Millis,
     ) {
+        // `data_addrs` is untrusted wire input. A Signal with no candidate can
+        // never lead to a punch, and a well-behaved peer never sends one (our
+        // `connect`/`accept_connect` both require >= 1). Drop it as malformed on
+        // every path: enqueuing it as an incoming connect would burn a
+        // `MAX_PENDING_INCOMING` slot on an unpunchable request, and resolving it
+        // as an initiator would report a peer-less `Connected`.
+        if data_addrs.is_empty() {
+            return;
+        }
         if !is_reply {
             if target == self.id {
                 // We are the target. We can't reply yet: the reply must carry our
                 // data-socket address, which the caller supplies once it stands up
                 // the socket. Record the request and surface it; `accept_connect`
-                // sends the reply. `data_addr` here is the initiator's data socket
-                // — the host we'll accept a punch from.
+                // sends the reply. `data_addrs` here are the initiator's data-socket
+                // candidates — the hosts we'll accept a punch from.
                 //
                 // Emit `IncomingConnect` only the *first* time an initiator becomes
                 // pending: each event makes the caller bind a socket and start a
@@ -873,7 +900,7 @@ impl Dht {
                     let strategy = plan(self.signaling_firewall(), nat);
                     self.events.push_back(Event::IncomingConnect {
                         initiator,
-                        initiator_data_addr: data_addr,
+                        initiator_data_addrs: data_addrs,
                         strategy,
                     });
                 }
@@ -886,7 +913,7 @@ impl Dht {
                 // We are a coordinator: forward to the target's own record (the
                 // announcer whose id is the target), over the mapping it opened
                 // by announcing to us, filling in the observed initiator addr. The
-                // initiator's `data_addr` passes through unchanged — we can't
+                // initiator's `data_addrs` pass through unchanged — we can't
                 // observe its data socket, only its control source `from`.
                 // Remember the initiator so we'll only relay the reply back to an
                 // address that actually initiated.
@@ -899,7 +926,7 @@ impl Dht {
                         target,
                         initiator,
                         initiator_addr: from,
-                        data_addr,
+                        data_addrs,
                         nat,
                         is_reply: false,
                     },
@@ -920,7 +947,7 @@ impl Dht {
                 self.events.push_back(Event::Connected {
                     target,
                     outcome: outcome_for(strategy),
-                    peer_data_addr: Some(data_addr),
+                    peer_data_addrs: data_addrs,
                     strategy: Some(strategy),
                 });
             }
@@ -933,8 +960,8 @@ impl Dht {
             // We are the coordinator relaying the reply — but only to an address
             // that actually initiated (so the target can't redirect it to a
             // victim), and only if the reply truly came from the target's own
-            // record (id == target, at that address). The target's `data_addr`
-            // passes through unchanged.
+            // record (id == target, at that address). The target's `data_addrs`
+            // pass through unchanged.
             // Otherwise an arbitrary announcer under the same topic could spoof a
             // reply to use us as a reflector or feed the initiator a bogus
             // firewall type. (Full authentication — a Noise handshake and
@@ -948,7 +975,7 @@ impl Dht {
                     target,
                     initiator,
                     initiator_addr,
-                    data_addr,
+                    data_addrs,
                     nat,
                     is_reply: true,
                 },
@@ -989,7 +1016,7 @@ mod tests {
                 target,
                 initiator,
                 initiator_addr: addr("10.0.0.2:100"),
-                data_addr,
+                data_addrs: vec![data_addr],
                 nat: Firewall::Consistent,
                 is_reply: false,
             },
@@ -1025,7 +1052,7 @@ mod tests {
 
         // Accepting sends the reply back through the *first* coordinator, never
         // the replay's — the replay can't redirect it.
-        dht.accept_connect(initiator, addr("10.0.0.1:50"), 1);
+        dht.accept_connect(initiator, vec![addr("10.0.0.1:50")], 1);
         let reply_dests: Vec<SocketAddr> = std::iter::from_fn(|| dht.poll_transmit())
             .map(|t| t.to)
             .collect();
@@ -1036,6 +1063,46 @@ mod tests {
         assert!(
             !reply_dests.contains(&coord_b),
             "a replay must not redirect the reply to its coordinator"
+        );
+    }
+
+    /// An incoming connect request that advertises no candidate address (untrusted
+    /// wire input) must be dropped: no `IncomingConnect` event, and no
+    /// `pending_incoming` slot consumed — otherwise a peer could burn the pending
+    /// table on unpunchable requests.
+    #[test]
+    fn incoming_request_with_no_candidates_is_dropped() {
+        let me = id(1);
+        let initiator = id(2);
+        let mut dht = Dht::new(me);
+        let request = Packet {
+            sender: id(9),
+            rid: 1,
+            msg: Message::Signal {
+                target: me,
+                initiator,
+                initiator_addr: addr("10.0.0.2:100"),
+                data_addrs: vec![], // empty candidate set
+                nat: Firewall::Consistent,
+                is_reply: false,
+            },
+        }
+        .encode();
+        dht.handle_input(addr("10.0.0.9:900"), &request, 0);
+
+        let incoming = std::iter::from_fn(|| dht.poll_event())
+            .filter(|e| matches!(e, Event::IncomingConnect { .. }))
+            .count();
+        assert_eq!(incoming, 0, "an empty-candidate request must not surface");
+        // The slot must be free: a real request for the same initiator still works.
+        let real = signal_request(initiator, me, addr("10.0.0.2:200"));
+        dht.handle_input(addr("10.0.0.9:900"), &real, 0);
+        let incoming = std::iter::from_fn(|| dht.poll_event())
+            .filter(|e| matches!(e, Event::IncomingConnect { .. }))
+            .count();
+        assert_eq!(
+            incoming, 1,
+            "a subsequent real request must still be accepted"
         );
     }
 

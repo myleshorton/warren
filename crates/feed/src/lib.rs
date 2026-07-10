@@ -74,16 +74,18 @@ pub struct Proof {
 /// # Cost
 ///
 /// [`Log::append`] is O(1) (it stores the block and its leaf hash), but
-/// [`Log::root`], [`Log::head`], and [`Log::proof`] recompute Merkle roots from
-/// the leaves on each call — O(n) in the number of blocks. That is fine for
-/// moderate logs and keeps this first version simple and obviously correct; a
-/// large log that commits/serves proofs frequently would want an incremental
-/// Merkle accumulator that caches subtree roots (making `head`/`proof`
-/// O(log n)). That optimization is deferred.
+/// [`Log::root`] and [`Log::head`] are **O(log n)**: the root is maintained by an
+/// incremental Merkle accumulator that keeps only the right-spine subtree roots,
+/// so a commit doesn't rescan the whole log. Per-block
+/// inclusion proofs ([`Log::proof`]) still recompute their audit path from the
+/// leaves and are O(n); making those O(log n) would mean retaining every internal
+/// node, which is deferred.
 pub struct Log {
     keypair: Keypair,
     blocks: Vec<Vec<u8>>,
     leaves: Vec<Hash>,
+    /// Incrementally-maintained subtree roots, so [`Log::root`] is O(log n).
+    roots: tree::Accumulator,
 }
 
 impl Log {
@@ -93,6 +95,7 @@ impl Log {
             keypair,
             blocks: Vec::new(),
             leaves: Vec::new(),
+            roots: tree::Accumulator::new(),
         }
     }
 
@@ -114,7 +117,9 @@ impl Log {
     /// Append a block, returning its index.
     pub fn append(&mut self, block: impl Into<Vec<u8>>) -> usize {
         let block = block.into();
-        self.leaves.push(tree::leaf_hash(&block));
+        let leaf = tree::leaf_hash(&block);
+        self.leaves.push(leaf); // kept for O(n) inclusion proofs
+        self.roots.push(leaf); // O(log n) root maintenance
         self.blocks.push(block);
         self.blocks.len() - 1
     }
@@ -124,9 +129,9 @@ impl Log {
         self.blocks.get(index).map(Vec::as_slice)
     }
 
-    /// The current Merkle root over all blocks.
+    /// The current Merkle root over all blocks — O(log n) from the accumulator.
     pub fn root(&self) -> Hash {
-        tree::merkle_root(&self.leaves)
+        self.roots.root()
     }
 
     /// A signed [`Head`] committing to the log's current length and root.

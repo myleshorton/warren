@@ -105,12 +105,94 @@ pub fn root_from_path(leaf: Hash, index: usize, len: usize, path: &[Hash]) -> Op
     }
 }
 
+/// An incremental Merkle accumulator: the right-spine subtree roots ("peaks") of
+/// an append-only RFC 6962 tree, so the [`root`](Accumulator::root) is maintained
+/// as leaves are pushed instead of recomputed from scratch. `peaks[h]`, if set, is
+/// the root of a pending perfect subtree of height `h` (i.e. `2^h` leaves); the
+/// set peaks are exactly the ones at the set bits of the leaf count, and there are
+/// at most `log2(n)` of them — so `push` and `root` are O(log n), not O(n).
+#[derive(Clone, Default)]
+pub struct Accumulator {
+    peaks: Vec<Option<Hash>>,
+}
+
+impl Accumulator {
+    /// An accumulator over zero leaves.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Append one leaf hash. Carries equal-height peaks upward like a binary
+    /// counter: a new leaf is a height-0 peak; whenever a peak already occupies a
+    /// height, the two combine (older on the left, as in the tree) into one peak a
+    /// height up, and the carry continues.
+    pub fn push(&mut self, leaf: Hash) {
+        let mut carry = leaf;
+        let mut height = 0;
+        loop {
+            match self.peaks.get_mut(height) {
+                None => {
+                    self.peaks.push(Some(carry));
+                    break;
+                }
+                Some(slot) => match slot.take() {
+                    None => {
+                        *slot = Some(carry);
+                        break;
+                    }
+                    // `existing` covers earlier leaves than `carry`, so it's the left.
+                    Some(existing) => {
+                        carry = node_hash(&existing, &carry);
+                        height += 1;
+                    }
+                },
+            }
+        }
+    }
+
+    /// The Merkle root over all pushed leaves — identical to [`merkle_root`] of the
+    /// same leaves (`H("")` for none). Folds the peaks largest-first, matching
+    /// RFC 6962's `node(largest_subtree, node(next, …))` shape.
+    pub fn root(&self) -> Hash {
+        let mut acc: Option<Hash> = None;
+        // `peaks` is smallest-height first; each present peak is larger than the
+        // ones already folded, so it becomes the left of the combined node.
+        for peak in self.peaks.iter().flatten() {
+            acc = Some(match acc {
+                None => *peak,
+                Some(smaller) => node_hash(peak, &smaller),
+            });
+        }
+        acc.unwrap_or_else(|| hash(&[]))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn leaves(n: usize) -> Vec<Hash> {
         (0..n).map(|i| leaf_hash(&[i as u8])).collect()
+    }
+
+    #[test]
+    fn accumulator_root_matches_from_scratch_at_every_size() {
+        // The incrementally-maintained root must equal the recursive oracle for
+        // every leaf count, including 0 (empty) and non-powers-of-two.
+        let mut acc = Accumulator::new();
+        let mut ls: Vec<Hash> = Vec::new();
+        assert_eq!(acc.root(), merkle_root(&ls));
+        for i in 0..100u32 {
+            let leaf = leaf_hash(&i.to_le_bytes());
+            acc.push(leaf);
+            ls.push(leaf);
+            assert_eq!(
+                acc.root(),
+                merkle_root(&ls),
+                "mismatch at {} leaves",
+                ls.len()
+            );
+        }
     }
 
     #[test]

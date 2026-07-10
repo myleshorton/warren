@@ -12,10 +12,27 @@
 //! tracks progress, so the assignment/re-assignment logic is unit-tested on its
 //! own.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use blob::{Manifest, Store};
 use crypto::Hash;
+
+/// How [`Plan::assign`] orders the pending chunks it hands out.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum Selection {
+    /// Fewest-known-holders first — maximizes piece availability across the
+    /// swarm. The right default for a bulk download.
+    #[default]
+    RarestFirst,
+    /// For streaming playback: fetch the chunks nearest the playback frontier (the
+    /// `window` lowest playback positions) *in playback order*, so a player can
+    /// start and keep going; beyond the window, fall back to rarest-first for
+    /// swarm health.
+    Streaming {
+        /// How many chunks ahead of the playback frontier to fetch in order.
+        window: usize,
+    },
+}
 
 /// What a provider can serve, as far as the scheduler knows — the input to
 /// [`Plan::assign`].
@@ -81,29 +98,45 @@ impl Holdings {
 pub struct Plan {
     manifest: Manifest,
     /// Distinct chunk hashes not yet handed to a provider. A set, not a queue:
-    /// assignment order is decided per round by rarity, not first-seen.
+    /// assignment order is decided per round by the [`Selection`] policy.
     pending: HashSet<Hash>,
     /// The distinct chunks the blob is made of — for membership (a provider can't
     /// slip us a chunk that isn't part of this blob) and for completion.
     wanted: HashSet<Hash>,
+    /// Earliest manifest index each distinct chunk appears at — its playback
+    /// position, for the streaming selection policy.
+    positions: HashMap<Hash, usize>,
     /// Chunks received and verified, keyed by hash (dedup'd — identical chunks
     /// share a hash and are fetched once).
     have: Store,
+    /// How pending chunks are ordered when handed out.
+    selection: Selection,
 }
 
 impl Plan {
     /// Begin from a verified manifest. Chunks already present would be skipped,
     /// but a fresh plan starts with an empty store, so every distinct chunk is
-    /// pending.
+    /// pending. Defaults to [`Selection::RarestFirst`].
     pub fn new(manifest: Manifest) -> Self {
         let pending = manifest.chunks.iter().copied().collect();
         let wanted = manifest.chunks.iter().copied().collect();
+        let mut positions = HashMap::new();
+        for (i, hash) in manifest.chunks.iter().enumerate() {
+            positions.entry(*hash).or_insert(i); // earliest index = playback position
+        }
         Self {
             manifest,
             pending,
             wanted,
+            positions,
             have: Store::new(),
+            selection: Selection::default(),
         }
+    }
+
+    /// Choose how [`assign`](Self::assign) orders the pending chunks it hands out.
+    pub fn set_selection(&mut self, selection: Selection) {
+        self.selection = selection;
     }
 
     /// Assign pending chunks to providers for one round, **rarest-first** and
@@ -124,14 +157,7 @@ impl Plan {
         let mut assignment = vec![Vec::new(); holdings.len()];
         let mut load = vec![0usize; holdings.len()];
 
-        // Rarity counts only *known* holders — a speculative Unknown provider
-        // doesn't make a chunk look less scarce. Rarest first; ties by hash so the
-        // schedule is deterministic. `sort_by_cached_key` computes each key once.
-        let known_holders = |h: &Hash| holdings.iter().filter(|hd| hd.is_known_holder(h)).count();
-        let mut order: Vec<Hash> = self.pending.iter().copied().collect();
-        order.sort_by_cached_key(|h| (known_holders(h), *h));
-
-        for hash in order {
+        for hash in self.ordered_pending(holdings) {
             // Prefer a known holder over a speculative Unknown (`is_unknown`:
             // false sorts first), then least-loaded, then lowest index.
             let pick = (0..holdings.len())
@@ -144,6 +170,38 @@ impl Plan {
             }
         }
         assignment
+    }
+
+    /// The pending chunks in the order [`assign`](Self::assign) should hand them
+    /// out, per the current [`Selection`]. Rarity counts only *known* holders — a
+    /// speculative Unknown provider doesn't make a chunk look less scarce.
+    /// `sort_by_cached_key` computes each key once.
+    fn ordered_pending(&self, holdings: &[&Holdings]) -> Vec<Hash> {
+        let known_holders = |h: &Hash| holdings.iter().filter(|hd| hd.is_known_holder(h)).count();
+        let mut order: Vec<Hash> = self.pending.iter().copied().collect();
+        match self.selection {
+            // Rarest first; ties by hash so the schedule is deterministic.
+            Selection::RarestFirst => order.sort_by_cached_key(|h| (known_holders(h), *h)),
+            // The playback window first (in playback order), then rarest-first. The
+            // window is the `window` pending chunks with the smallest playback
+            // position — i.e. those whose position is below the (window+1)-th
+            // smallest.
+            Selection::Streaming { window } => {
+                let mut positions_sorted: Vec<usize> =
+                    order.iter().map(|h| self.positions[h]).collect();
+                positions_sorted.sort_unstable();
+                let threshold = positions_sorted.get(window).copied().unwrap_or(usize::MAX);
+                order.sort_by_cached_key(|h| {
+                    let pos = self.positions[h];
+                    if pos < threshold {
+                        (0usize, pos, 0usize) // in the window: strict playback order
+                    } else {
+                        (1usize, known_holders(h), pos) // beyond it: rarest-first
+                    }
+                });
+            }
+        }
+        order
     }
 
     /// Fold in a chunk a provider delivered. The bytes must hash to `hash` and
@@ -185,6 +243,17 @@ impl Plan {
     /// Reassemble the blob, or `None` if not yet complete.
     pub fn reassemble(&self) -> Option<Vec<u8>> {
         self.have.reassemble(&self.manifest)
+    }
+
+    /// How many chunks the blob has, in playback order (counting repeats).
+    pub fn chunk_count(&self) -> usize {
+        self.manifest.chunks.len()
+    }
+
+    /// The verified bytes of the chunk at playback `index`, if it has been stored
+    /// yet — for delivering a blob to a streaming consumer in order.
+    pub fn chunk_at(&self, index: usize) -> Option<&[u8]> {
+        self.have.get(self.manifest.chunks.get(index)?)
     }
 }
 
@@ -333,6 +402,27 @@ mod tests {
 
         let assignment = plan.assign(&[&unknown], usize::MAX);
         assert_eq!(assignment[0], vec![only]);
+    }
+
+    #[test]
+    fn streaming_selection_prioritizes_the_playback_window() {
+        // Ten chunks. A holds 0..8, B holds all ten — so chunk 9 is the *rarest*
+        // (one holder). Rarest-first would hand out chunk 9 first; the streaming
+        // policy must instead lead with the playback window (chunks 0,1,2 in
+        // order), then fall back to rarest-first (chunk 9) beyond it.
+        let data: Vec<u8> = (0..1000u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100); // 10 distinct chunks
+        let a = subset(&chunks, &[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        let b = full(&chunks);
+        let mut plan = Plan::new(manifest);
+        plan.set_selection(Selection::Streaming { window: 3 });
+
+        let order = plan.ordered_pending(&[&a, &b]);
+        let expected: Vec<Hash> = [0, 1, 2, 9, 3, 4, 5, 6, 7, 8]
+            .iter()
+            .map(|&i| chunks[i].0)
+            .collect();
+        assert_eq!(order, expected);
     }
 
     #[test]

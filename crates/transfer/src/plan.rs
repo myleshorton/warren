@@ -44,6 +44,12 @@ impl Holdings {
     fn is_unknown(&self) -> bool {
         matches!(self, Holdings::Unknown)
     }
+
+    /// Whether this is a *known* holder of `hash`. An `Unknown` provider is not a
+    /// known holder — it doesn't count toward a chunk's rarity.
+    fn is_known_holder(&self, hash: &Hash) -> bool {
+        matches!(self, Holdings::Known(set) if set.contains(hash))
+    }
 }
 
 /// Tracks which of a blob's chunks are still needed, hands them out to providers,
@@ -97,12 +103,7 @@ impl Plan {
         // Rarity counts only *known* holders — a speculative Unknown provider
         // doesn't make a chunk look less scarce. Rarest first; ties by hash so the
         // schedule is deterministic. `sort_by_cached_key` computes each key once.
-        let known_holders = |h: &Hash| {
-            holdings
-                .iter()
-                .filter(|hd| matches!(hd, Holdings::Known(set) if set.contains(h)))
-                .count()
-        };
+        let known_holders = |h: &Hash| holdings.iter().filter(|hd| hd.is_known_holder(h)).count();
         let mut order: Vec<Hash> = self.pending.iter().copied().collect();
         order.sort_by_cached_key(|h| (known_holders(h), *h));
 

@@ -20,7 +20,7 @@
 //! fixed-layout protocol that is cleanly verifiable.
 
 use std::io;
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -231,7 +231,9 @@ fn random_nonce() -> [u8; NONCE_LEN] {
 }
 
 /// Ask `gateway` (a PCP server, typically the default gateway at [`PCP_PORT`]) to
-/// map an external UDP port to `local`, for up to `lifetime`. Returns the assigned
+/// map an external UDP port to `internal_port` on this host, for up to `lifetime`.
+/// The client address in the request is derived by routing to the gateway (see
+/// below), so the caller only supplies the port to map. Returns the assigned
 /// external address on success.
 ///
 /// The request is retransmitted with exponential backoff (it's a lone datagram),
@@ -240,20 +242,34 @@ fn random_nonce() -> [u8; NONCE_LEN] {
 /// [`PcpError::Rejected`].
 pub async fn map_port(
     gateway: SocketAddr,
-    local: SocketAddr,
+    internal_port: u16,
     lifetime: Duration,
 ) -> Result<Mapping, PcpError> {
-    let sock = UdpSocket::bind(SocketAddr::new(local.ip(), 0)).await?;
+    // Bind to the unspecified address of the gateway's family and `connect`, so
+    // the OS picks the source IP of the interface that actually routes to the
+    // gateway. That source IP is the client address PCP wants in the request — a
+    // caller's own `local.ip()` might be a wildcard (`0.0.0.0`/`[::]`, which a
+    // gateway rejects) or the wrong interface on a multi-homed host. Connecting
+    // also filters received datagrams to the gateway for us.
+    let unspecified = if gateway.is_ipv4() {
+        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+    } else {
+        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+    };
+    let sock = UdpSocket::bind(SocketAddr::new(unspecified, 0)).await?;
+    sock.connect(gateway).await?;
+    let client_ip = as_v6(sock.local_addr()?.ip());
+
     let nonce = random_nonce();
     let secs = lifetime.as_secs().min(u32::MAX as u64) as u32;
-    let request = MapRequest::map_udp(nonce, local.port(), secs, as_v6(local.ip())).encode();
+    let request = MapRequest::map_udp(nonce, internal_port, secs, client_ip).encode();
 
     let mut buf = [0u8; 1100];
     for attempt in 0..ATTEMPTS {
-        sock.send_to(&request, gateway).await?;
+        sock.send(&request).await?;
         // Backoff 250ms, 500ms, 1s, ... between retransmits.
         let wait = Duration::from_millis(250u64 << attempt);
-        match timeout(wait, recv_matching(&sock, &mut buf, gateway, &nonce)).await {
+        match timeout(wait, recv_matching(&sock, &mut buf, &nonce)).await {
             Ok(Ok(resp)) => {
                 if resp.result_code != RESULT_SUCCESS {
                     return Err(PcpError::Rejected(resp.result_code));
@@ -275,19 +291,15 @@ pub async fn map_port(
     Err(PcpError::Timeout)
 }
 
-/// Receive datagrams until one is a PCP MAP response from `gateway` carrying
-/// `nonce`, ignoring anything else (a stray or spoofed packet).
+/// Receive datagrams (from the connected gateway) until one is a PCP MAP response
+/// carrying `nonce`, ignoring anything else (a stray or replayed packet).
 async fn recv_matching(
     sock: &UdpSocket,
     buf: &mut [u8],
-    gateway: SocketAddr,
     nonce: &[u8; NONCE_LEN],
 ) -> Result<MapResponse, PcpError> {
     loop {
-        let (n, from) = sock.recv_from(buf).await?;
-        if from != gateway {
-            continue;
-        }
+        let n = sock.recv(buf).await?; // connected: only the gateway's datagrams
         if let Ok(resp) = MapResponse::decode(&buf[..n]) {
             if resp.nonce == *nonce {
                 return Ok(resp);
@@ -300,7 +312,6 @@ async fn recv_matching(
 mod tests {
     use super::*;
     use proptest::prelude::*;
-    use std::net::Ipv4Addr;
 
     fn sample_request() -> MapRequest {
         MapRequest::map_udp(
@@ -405,8 +416,7 @@ mod tests {
             gw.send_to(&resp.encode(), from).await.unwrap();
         });
 
-        let local: SocketAddr = "127.0.0.1:40002".parse().unwrap();
-        let mapping = map_port(gw_addr, local, Duration::from_secs(3600))
+        let mapping = map_port(gw_addr, 40002, Duration::from_secs(3600))
             .await
             .expect("mapping should succeed");
         assert_eq!(mapping.external, external);
@@ -436,8 +446,7 @@ mod tests {
             gw.send_to(&resp.encode(), from).await.unwrap();
         });
 
-        let local: SocketAddr = "127.0.0.1:40003".parse().unwrap();
-        let err = map_port(gw_addr, local, Duration::from_secs(60))
+        let err = map_port(gw_addr, 40003, Duration::from_secs(60))
             .await
             .unwrap_err();
         assert!(matches!(err, PcpError::Rejected(8)));

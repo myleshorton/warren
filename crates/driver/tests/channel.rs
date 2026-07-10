@@ -134,6 +134,7 @@ async fn connect_punches_a_channel_for_symmetric_nat() {
             sockets: 256,
             probes: 5_000,
         },
+        port_mapping: false,
     };
     let lo = LO.parse().unwrap();
     let mut rng = Rng::new(0xB1D7A);
@@ -191,6 +192,7 @@ async fn bind_with_rejects_an_invalid_birthday_range() {
             sockets: 256,
             probes: 1750,
         },
+        port_mapping: false,
     };
     let err = match Node::bind_with(LO.parse().unwrap(), Rng::new(1).node_id(), tuning).await {
         Ok(_) => panic!("an invalid range must be rejected"),

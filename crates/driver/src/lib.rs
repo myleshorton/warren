@@ -63,14 +63,21 @@ impl Default for BirthdayParams {
     }
 }
 
-/// All timing/parameter tuning for the hole punch a connect performs once the
-/// DHT has brokered reachability.
+/// How a connect establishes reachability: whether it tries to open a direct
+/// external port during discovery, plus the timing/parameters of the punch it
+/// performs once the DHT has brokered reachability.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct PunchTuning {
     /// Timing knobs (deadline, probe interval) for every punch primitive.
     pub config: PunchConfig,
     /// Birthday-punch parameters for the symmetric-NAT (`Punched`) path.
     pub birthday: BirthdayParams,
+    /// Attempt a UPnP-IGD port mapping while discovering the data socket's
+    /// external address, advertising the explicit forward when the gateway
+    /// supports it (falling back to the reflexive observation otherwise).
+    /// Off by default: it fires an SSDP multicast per connect and waits out the
+    /// discovery window on networks with no UPnP gateway.
+    pub port_mapping: bool,
 }
 
 /// A live, bidirectional data channel to a peer, established by a hole punch —
@@ -275,6 +282,9 @@ pub struct Node {
     id: NodeId,
     local_addr: SocketAddr,
     cmd_tx: mpsc::Sender<Command>,
+    /// Whether [`Node::connect`] attempts a port mapping during discovery
+    /// (from [`PunchTuning::port_mapping`]).
+    port_mapping: bool,
     /// Channels punched in response to inbound connects, delivered by the actor.
     /// Shared behind a mutex so cloned handles share the single stream (accept is
     /// naturally one consumer); [`Node::next_incoming`] drains it.
@@ -335,6 +345,7 @@ impl Node {
             id,
             local_addr,
             cmd_tx,
+            port_mapping: tuning.port_mapping,
             incoming: Arc::new(Mutex::new(incoming_rx)),
         })
     }
@@ -457,10 +468,13 @@ impl Node {
             .await
             .map_err(ConnectError::Bind)?;
         let local = data_sock.local_addr().map_err(ConnectError::Bind)?;
-        // Learn the data socket's external mapping from a reflector; falls back to
-        // `local` if none answers (correct on an unNATed host).
+        // Learn the data socket's external address to advertise as the punch
+        // target: a reflexive probe, optionally upgraded to an explicit UPnP port
+        // mapping. Falls back to `local` if neither yields anything (correct on an
+        // unNATed host).
         let reflectors = self.reflectors().await.map_err(|_| ConnectError::Closed)?;
-        let advertised = reflexive_addr(&data_sock, self.id, local, &reflectors).await;
+        let advertised =
+            discover_external(&data_sock, self.id, local, &reflectors, self.port_mapping).await;
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
             .send(Command::Connect(target, data_sock, advertised, tx))
@@ -516,6 +530,8 @@ async fn run(
     // Timing + birthday parameters for the punch once the DHT brokers reachability.
     let punch_cfg = tuning.config;
     let birthday = tuning.birthday;
+    // Whether accept-side discovery also attempts a port mapping.
+    let port_mapping = tuning.port_mapping;
 
     // Bootstrap waiters are keyed by the query id so a stray QueryFinished can't
     // resolve them and concurrent bootstraps don't clobber each other. Announce
@@ -612,6 +628,7 @@ async fn run(
                                     peer_host: initiator_data_addr.ip(),
                                     strategy,
                                     seed: local.port() as u64,
+                                    port_mapping,
                                     done: reflexive_tx.clone(),
                                 });
                             }
@@ -765,6 +782,8 @@ struct ReflexiveProbe {
     peer_host: IpAddr,
     strategy: Strategy,
     seed: u64,
+    /// Whether to also attempt a port mapping when discovering the address.
+    port_mapping: bool,
     done: mpsc::Sender<ReflexiveDone>,
 }
 
@@ -785,7 +804,8 @@ struct ReflexiveDone {
 /// own task because the probe awaits a reflector round-trip.
 fn spawn_reflexive_probe(p: ReflexiveProbe) {
     tokio::spawn(async move {
-        let external_addr = reflexive_addr(&p.data_sock, p.id, p.local, &p.reflectors).await;
+        let external_addr =
+            discover_external(&p.data_sock, p.id, p.local, &p.reflectors, p.port_mapping).await;
         let _ = p
             .done
             .send(ReflexiveDone {
@@ -880,6 +900,54 @@ fn spawn_accept_punch(job: AcceptJob) {
             let _ = incoming_tx.try_send(channel);
         }
     });
+}
+
+/// Lifetime requested for a connect's port mapping — comfortably outlasts the
+/// connect and its punch. (Renewal for long-lived reachability is future work;
+/// each connect maps afresh.)
+const MAP_LIFETIME: Duration = Duration::from_secs(3600);
+/// Label the mapping carries in the router's UI.
+const MAP_DESCRIPTION: &str = "warren";
+/// Overall bound on the port-mapping attempt, so a slow or half-speaking gateway
+/// can't stall a connect past this even though the reflexive probe has answered.
+const MAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The address to advertise as this data socket's punch target. Always runs the
+/// reflexive probe; when `port_mapping` is set, concurrently attempts a UPnP-IGD
+/// mapping and prefers that explicit forward when the gateway supports it. Any
+/// mapping failure (no gateway, timeout, rejection) falls back to the reflexive
+/// result, so enabling it can only add reachability, never remove it.
+async fn discover_external(
+    sock: &UdpSocket,
+    id: NodeId,
+    local: SocketAddr,
+    reflectors: &[SocketAddr],
+    port_mapping: bool,
+) -> SocketAddr {
+    if !port_mapping {
+        return reflexive_addr(sock, id, local, reflectors).await;
+    }
+    // Run both concurrently: the mapping touches its own sockets (SSDP/HTTP), so
+    // it doesn't contend with the reflexive probe on `sock`.
+    let reflexive = reflexive_addr(sock, id, local, reflectors);
+    let mapped = timeout(
+        MAP_TIMEOUT,
+        portmap::map_port_upnp(local.port(), MAP_LIFETIME, MAP_DESCRIPTION),
+    );
+    let (reflexive, mapped) = tokio::join!(reflexive, mapped);
+    // `mapped` is Ok(Ok(_)) only when the mapping fully succeeded within the
+    // timeout; a timeout (outer Err) or a UPnP error (inner Err) both fall back.
+    let external = match mapped {
+        Ok(Ok(m)) => Some(m.external),
+        _ => None,
+    };
+    prefer_mapped(external, reflexive)
+}
+
+/// Choose the address to advertise: the explicit mapping when present, else the
+/// reflexive observation.
+fn prefer_mapped(mapped: Option<SocketAddr>, reflexive: SocketAddr) -> SocketAddr {
+    mapped.unwrap_or(reflexive)
 }
 
 /// Discover `sock`'s externally-observed address by asking reflectors to echo
@@ -1023,6 +1091,29 @@ mod tests {
         let sock = UdpSocket::bind(lo()).await.unwrap();
         let local = sock.local_addr().unwrap();
         let observed = reflexive_addr(&sock, NodeId::from_bytes([1u8; 32]), local, &[]).await;
+        assert_eq!(observed, local);
+    }
+
+    #[test]
+    fn prefer_mapped_uses_the_explicit_forward_when_present() {
+        let reflexive: SocketAddr = "203.0.113.7:41000".parse().unwrap();
+        let mapped: SocketAddr = "198.51.100.9:5000".parse().unwrap();
+        // The explicit port mapping wins when it exists.
+        assert_eq!(prefer_mapped(Some(mapped), reflexive), mapped);
+        // With no mapping, the reflexive observation is advertised.
+        assert_eq!(prefer_mapped(None, reflexive), reflexive);
+    }
+
+    #[tokio::test]
+    async fn discover_external_delegates_to_reflexive_when_mapping_off() {
+        // With port mapping off, discovery is exactly the reflexive probe — here,
+        // no reflector, so it falls back to `local`. (The mapping-enabled path
+        // fires real SSDP, so its mechanics are exercised by portmap's fake-IGD
+        // integration test rather than a live multicast here.)
+        let sock = UdpSocket::bind(lo()).await.unwrap();
+        let local = sock.local_addr().unwrap();
+        let observed =
+            discover_external(&sock, NodeId::from_bytes([1u8; 32]), local, &[], false).await;
         assert_eq!(observed, local);
     }
 }

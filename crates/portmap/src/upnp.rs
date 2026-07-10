@@ -43,6 +43,11 @@ const WAN_SERVICES: [&str; 2] = [
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long a single HTTP request to the gateway may take.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Largest complete HTTP response accepted from a gateway. Device descriptions
+/// and SOAP replies are normally only a few KiB; this leaves ample compatibility
+/// margin while preventing an untrusted LAN responder from growing memory without
+/// bound by streaming until the timeout.
+const MAX_HTTP_RESPONSE: usize = 1 << 20;
 
 /// Errors from UPnP port mapping.
 #[derive(Debug, Error)]
@@ -65,6 +70,12 @@ pub enum UpnpError {
     /// A response was missing an expected field.
     #[error("malformed gateway response")]
     Malformed,
+    /// A gateway response exceeded the fixed memory budget.
+    #[error("gateway HTTP response exceeds the {MAX_HTTP_RESPONSE}-byte limit")]
+    ResponseTooLarge,
+    /// The device description tried to send SOAP requests to another origin.
+    #[error("gateway advertised a control URL on a different HTTP origin")]
+    UntrustedControlUrl,
 }
 
 /// Map an external UDP port to `internal_port` on this host via UPnP, discovering
@@ -124,6 +135,9 @@ pub(crate) async fn map_via_location(
     let service = parse_igd_service(&xml).ok_or(UpnpError::BadDescription)?;
     let control_url =
         resolve_url(location, &service.control_url).ok_or(UpnpError::BadDescription)?;
+    if !same_http_origin(location, &control_url) {
+        return Err(UpnpError::UntrustedControlUrl);
+    }
 
     // Our LAN address on the interface toward the gateway — the internal client
     // the mapping forwards to.
@@ -242,16 +256,39 @@ fn extract_tag<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
 
 /// Split an `http://host[:port]/path` URL into (host, port, path).
 pub(crate) fn parse_url(url: &str) -> Option<(String, u16, String)> {
+    // The parsed values are interpolated directly into an HTTP request line and
+    // Host header. Reject raw whitespace/control bytes (including CR/LF request
+    // injection) and userinfo, which this deliberately small client does not need.
+    if url.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return None;
+    }
     let rest = url.strip_prefix("http://")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], rest[i..].to_string()),
         None => (rest, "/".to_string()),
     };
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
     let (host, port) = match authority.rsplit_once(':') {
         Some((h, p)) => (h.to_string(), p.parse().ok()?),
         None => (authority.to_string(), 80),
     };
+    if host.is_empty() {
+        return None;
+    }
     Some((host, port, path))
+}
+
+/// Whether two supported HTTP URLs name the same origin. A device description is
+/// allowed to choose any control path on its gateway, but not redirect our SOAP
+/// POST (which opens a firewall mapping) to another host or port.
+fn same_http_origin(a: &str, b: &str) -> bool {
+    let (Some((a_host, a_port, _)), Some((b_host, b_port, _))) = (parse_url(a), parse_url(b))
+    else {
+        return false;
+    };
+    a_port == b_port && a_host.eq_ignore_ascii_case(&b_host)
 }
 
 /// Resolve a (possibly relative) control URL against the device-description URL,
@@ -355,7 +392,7 @@ async fn soap_call(
 }
 
 /// A minimal HTTP/1.1 request over TCP: `Connection: close`, read the response to
-/// EOF, split off the body. Returns (status, body).
+/// EOF within [`MAX_HTTP_RESPONSE`], then split off the body. Returns (status, body).
 async fn http_request(
     method: &str,
     url: &str,
@@ -377,8 +414,18 @@ async fn http_request(
         req.push_str(body);
         stream.write_all(req.as_bytes()).await?;
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await?;
-        Ok::<_, io::Error>(raw)
+        let mut chunk = [0u8; 8192];
+        loop {
+            let n = stream.read(&mut chunk).await?;
+            if n == 0 {
+                break;
+            }
+            if raw.len().saturating_add(n) > MAX_HTTP_RESPONSE {
+                return Err(UpnpError::ResponseTooLarge);
+            }
+            raw.extend_from_slice(&chunk[..n]);
+        }
+        Ok::<_, UpnpError>(raw)
     };
     let raw = timeout(HTTP_TIMEOUT, request()).await.map_err(|_| {
         UpnpError::Io(io::Error::new(
@@ -490,6 +537,20 @@ mod tests {
     }
 
     #[test]
+    fn control_url_must_stay_on_the_description_origin() {
+        let base = "http://192.168.1.1:5000/rootDesc.xml";
+        assert!(same_http_origin(base, "http://192.168.1.1:5000/ctl/IPConn"));
+        assert!(!same_http_origin(
+            base,
+            "http://192.168.1.2:5000/ctl/IPConn"
+        ));
+        assert!(!same_http_origin(
+            base,
+            "http://192.168.1.1:5001/ctl/IPConn"
+        ));
+    }
+
+    #[test]
     fn ssdp_location_is_validated_against_the_responder() {
         let gw: IpAddr = "192.168.1.1".parse().unwrap();
         // IP-literal LOCATION that matches the sender — trusted.
@@ -534,6 +595,9 @@ mod tests {
             Some(("host".to_string(), 80, "/x".to_string()))
         );
         assert_eq!(parse_url("ftp://nope"), None);
+        assert_eq!(parse_url("http://host/path\r\nX-Evil: yes"), None);
+        assert_eq!(parse_url("http://user@host/path"), None);
+        assert_eq!(parse_url("http:///path"), None);
     }
 
     #[test]
@@ -635,5 +699,26 @@ mod tests {
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)), 40000)
         );
         assert_eq!(mapping.lifetime, Duration::from_secs(3600));
+    }
+
+    #[tokio::test]
+    async fn rejects_an_oversized_gateway_response() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = sock.read(&mut request).await;
+            let response = vec![b'x'; MAX_HTTP_RESPONSE + 1];
+            let _ = sock.write_all(&response).await;
+        });
+
+        let url = format!("http://{addr}/too-large");
+        assert!(matches!(
+            http_request("GET", &url, &[], "").await,
+            Err(UpnpError::ResponseTooLarge)
+        ));
     }
 }

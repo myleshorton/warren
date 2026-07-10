@@ -241,7 +241,7 @@ fn encode_addrs(enc: &mut Encoder, addrs: &[SocketAddr]) {
     }
 }
 
-fn decode_addrs(dec: &mut Decoder) -> Result<Vec<SocketAddr>, MsgError> {
+fn decode_addrs<'a>(dec: &mut Decoder<'a>) -> Result<Vec<SocketAddr>, MsgError> {
     // Smallest address is a family tag + a v4 address: 1 + 4 + 2 bytes. Bound the
     // count by that (not by a fixed cap) so a crafted length can't force an
     // allocation far larger than the buffer — same guard as `decode_contacts`.

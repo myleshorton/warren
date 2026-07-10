@@ -77,7 +77,9 @@ runs unchanged over real sockets.
   verified by hash, with a dropped provider's chunks re-assigned to the rest. It
   is *holdings-aware*: providers advertise which chunks they hold, so *partial
   seeders* — none holding the whole blob — collectively assemble it, scheduled
-  *rarest-first*.
+  *rarest-first*. Fetching is *work-stealing*: a provider that finishes its batch
+  is re-dispatched immediately, so a slow one never stalls the others at a round
+  barrier.
 
 **6. Collateral-freedom by lineage.**
 The DHT is Kademlia — the same family as BitTorrent's Mainline DHT (millions of
@@ -232,11 +234,11 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | DHT discovery, hole punching (incl. birthday punch) | built |
 | Signed feeds, content-addressed blobs, verified sync | built |
 | Reliable transport: fragmentation, selective repeat, AIMD + RTT pacing | built |
-| Multi-peer swarming (round-based) | built |
+| Multi-peer swarming (work-stealing, no round barrier) | built |
 | Decoupled node id (random id + topic-based discovery) | built |
 | Blinded, rotating topics (key-blinded + PSK-blinded, epoch overlap) | built |
 | Automatic per-epoch re-announce loop in the driver (`Node::keep_announced`) | built |
 | Ephemeral/query-only client mode | planned |
 | Obfuscated transport, cover-DHT rendezvous | planned |
 | Holdings-aware (partial-seeder) swarming, rarest-first | built |
-| Work-stealing within a round; deadline-aware selection for streaming | planned |
+| Deadline-aware chunk selection for streaming (vs rarest-first) | planned |

@@ -23,26 +23,49 @@ use crypto::Hash;
 pub enum Holdings {
     /// The provider reported holding exactly these chunks (a `Have` bitfield).
     Known(HashSet<Hash>),
-    /// The provider couldn't report its holdings, so it might hold anything.
-    /// Used only as a *last resort* — after known holders — so a speculative
-    /// provider can never be handed the last copy of a chunk while a provider
-    /// known to have it sits idle.
-    Unknown,
+    /// The provider couldn't report its holdings, so it might hold anything —
+    /// except the chunks it has since *refused* (answered `Absent` to). Used only
+    /// as a *last resort*, after known holders, so a speculative provider can
+    /// never be handed the last copy of a chunk while a provider known to have it
+    /// sits idle.
+    Unknown(HashSet<Hash>),
 }
 
 impl Holdings {
-    /// Whether this provider might serve `hash`: a known holder that has it, or
-    /// any `Unknown` provider (which might have anything).
+    /// An `Unknown` provider that has refused nothing yet.
+    pub fn unknown() -> Self {
+        Holdings::Unknown(HashSet::new())
+    }
+
+    /// Record that this provider does *not* have `hash` after all — it was asked
+    /// and answered `Absent`. A known holder drops it from its set (a stale or
+    /// dishonest bitfield); an unknown provider remembers the refusal. Either way
+    /// [`Plan::assign`] won't offer this provider that chunk again, which is what
+    /// keeps a work-stealing loop from re-handing a chunk to a provider that
+    /// already refused it.
+    pub fn refuse(&mut self, hash: &Hash) {
+        match self {
+            Holdings::Known(set) => {
+                set.remove(hash);
+            }
+            Holdings::Unknown(refused) => {
+                refused.insert(*hash);
+            }
+        }
+    }
+
+    /// Whether this provider might serve `hash`: a known holder that has it, or an
+    /// `Unknown` provider that hasn't refused it.
     fn can_serve(&self, hash: &Hash) -> bool {
         match self {
             Holdings::Known(set) => set.contains(hash),
-            Holdings::Unknown => true,
+            Holdings::Unknown(refused) => !refused.contains(hash),
         }
     }
 
     /// Whether this provider is a speculative (unknown-holdings) source.
     fn is_unknown(&self) -> bool {
-        matches!(self, Holdings::Unknown)
+        matches!(self, Holdings::Unknown(_))
     }
 
     /// Whether this is a *known* holder of `hash`. An `Unknown` provider is not a
@@ -285,7 +308,7 @@ mod tests {
         let data: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
         let (manifest, chunks) = blob(&data, 100); // 1 chunk
         let only = chunks[0].0;
-        let unknown = Holdings::Unknown;
+        let unknown = Holdings::unknown();
         let holder = subset(&chunks, &[0]);
         let mut plan = Plan::new(manifest);
 
@@ -304,11 +327,36 @@ mod tests {
         let data: Vec<u8> = (0..100u32).map(|i| i as u8).collect();
         let (manifest, chunks) = blob(&data, 100);
         let only = chunks[0].0;
-        let unknown = Holdings::Unknown;
+        let unknown = Holdings::unknown();
         let mut plan = Plan::new(manifest);
 
         let assignment = plan.assign(&[&unknown], usize::MAX);
         assert_eq!(assignment[0], vec![only]);
+    }
+
+    #[test]
+    fn a_refused_chunk_is_not_offered_to_that_provider_again() {
+        // The livelock guard for work-stealing: once a provider refuses a chunk
+        // (answered Absent), assign must never offer it that chunk again.
+        let data: Vec<u8> = (0..200u32).map(|i| i as u8).collect();
+        let (manifest, chunks) = blob(&data, 100); // 2 chunks
+        let (c0, c1) = (chunks[0].0, chunks[1].0);
+
+        // A known holder of both and an unknown provider — both refuse chunk 0.
+        let mut known = full(&chunks);
+        known.refuse(&c0);
+        let mut unknown = Holdings::unknown();
+        unknown.refuse(&c0);
+        let mut plan = Plan::new(manifest);
+
+        let assignment = plan.assign(&[&known, &unknown], usize::MAX);
+        // No one is offered chunk 0, so it stays pending...
+        assert!(plan.pending_contains(c0));
+        for a in &assignment {
+            assert!(!a.contains(&c0), "a refused chunk must not be re-offered");
+        }
+        // ...while chunk 1 (refused by no one) goes to the known holder.
+        assert_eq!(assignment[0], vec![c1]);
     }
 
     #[test]

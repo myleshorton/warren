@@ -107,14 +107,15 @@ crates/
             interchangeable. It is holdings-aware: each provider advertises (via
             GetHave) which chunks it has, so partial seeders — no one holding the
             whole blob — collectively assemble it, and chunks are scheduled
-            rarest-first (scarcest data pulled while its few holders are around).
-            A dropped provider's chunks are re-assigned to the rest. The seam where
-            the data layer finally rides the transport over a real, multi-peer
-            connection.
+            rarest-first (scarcest data pulled while its few holders are around),
+            and fetching is work-stealing — a provider that finishes its batch is
+            re-dispatched immediately, so a slow one never stalls the others at a
+            round barrier. A dropped provider's chunks are re-assigned to the rest.
+            The seam where the data layer finally rides the transport over a real,
+            multi-peer connection.
 
-  next: work-stealing within a round (a slow provider can still hold up its
-        round), a deadline-aware selection policy for streaming (rarest-first is
-        the wrong order for playback), port mapping, an incremental Merkle
+  next: a deadline-aware selection policy for streaming (rarest-first is the
+        wrong order for playback), port mapping, an incremental Merkle
         accumulator for feed, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying

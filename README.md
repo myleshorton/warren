@@ -45,7 +45,7 @@ accept weaker guarantees.
 | **Oracle checks** | Lookup results verified against a brute-force ground truth | `swarm` |
 | **Statistical guardrails** | Probabilistic behavior (birthday punch) measured against its analytic bound; fails if constants weaken | `swarm` |
 | **Loopback integration** | Real `tokio` UDP sockets on one host: bootstrap, announce, lookup, a one-call `connect(id)` that punches a live channel, and a feed/blob downloaded + verified over a punched channel | `driver`, `transfer` |
-| **Real-socket punching** | Actual UDP hole punching on one host — direct, dial, and a real birthday port-collision | `puncher` |
+| **Real-socket punching** | Actual UDP hole punching on one host — direct, dial, a real birthday port-collision, and a multi-candidate dial that locks onto the reachable address | `puncher` |
 | **Fault injection** (planned) | Drops, reorders, corruption, partitions | `swarm`, `feed` |
 | **Corpus / golden files** (planned) | Wire format stays stable across versions | `wire`, `feed` |
 | **Live demo** | A human can watch the whole stack work: DHT forms, a viewer discovers a publisher by looking up a *blinded, rotating topic* (conceptually `H(feed key ‖ epoch)`; concretely a per-epoch keyed-BLAKE3 hash — so the feed key itself is never announced: it is neither the publisher's node id nor the announced topic), punches a connection, streams a signed feed, verifies every frame | `transfer` |
@@ -70,16 +70,20 @@ crates/
               coordinate + punch in one call; inbound channels surfaced via
               Node::next_incoming; symmetric-NAT (Punched) connects run the
               birthday spray/open-sockets punch, chosen by the resolved strategy
-            + reflexive discovery: both dialer and target probe a reflector to
-              advertise their data socket's external address (NATed peers punchable)
-            + optional port mapping (PunchTuning::port_mapping, off by default):
-              both sides race a UPnP-IGD mapping against the reflexive probe and
-              advertise the explicit forward when the gateway supports it, falling
-              back to the reflexive address otherwise — so it only adds reachability
+            + candidate-set discovery (ICE-style): both sides gather several
+              data-socket addresses — local, reflexive/STUN-observed, and an
+              optional UPnP-IGD port mapping (PunchTuning::port_mapping, off by
+              default) — advertise the whole set, and the punch tries them all
+              (Direct probes every candidate on one socket; the birthday punch
+              sprays toward / accepts from each distinct candidate IP). One wrong
+              guess (a per-destination NAT mapping, a CGNAT external IP, a
+              multi-homed host) no longer sinks the connect
             + keep_announced: a background loop that re-announces a (rotating)
               topic set on an interval until its handle drops, so a provider stays
               discoverable across DHT churn and epoch rotation
-  puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
+  puncher   real-UDP hole punching: simultaneous open / dial + birthday spray,
+            each able to try a set of candidate addresses (connect_to_any /
+            accept_any / spray_any / open_birthday_sockets_any)
   portmap   port mapping: ask the gateway to forward an external UDP port to us
             — a complement to punching that makes a peer directly reachable. Two
             protocols behind one Mapping type: PCP (RFC 6887), a compact binary
@@ -135,7 +139,8 @@ crates/
 
   next: automatic mapping renewal before lease expiry (so a mapping outlives one
         connect), PCP-then-UPnP fallback in one call (PCP needs gateway discovery),
-        advertising multiple candidate addresses (ICE-style) rather than one, ...
+        candidate prioritization/pruning (e.g. drop a private candidate when a
+        routable one exists), ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

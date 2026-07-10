@@ -12,6 +12,11 @@
 //!   unpredictable, as a symmetric NAT's would be); the predictable peer sprays
 //!   the port space until a probe collides.
 //!
+//! Each primitive has an `_any` form ([`connect_to_any`], [`accept_any`],
+//! [`spray_any`], [`open_birthday_sockets_any`]) that tries a *set* of candidate
+//! addresses/hosts at once (ICE-style) and locks onto whichever answers; the
+//! single-address forms are thin wrappers over them.
+//!
 //! Establishment uses a tiny probe handshake: a [`PROBE`] byte, answered by an
 //! [`ACK`]. Receiving either from the peer means that socket has a working path.
 //!
@@ -20,6 +25,7 @@
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
@@ -105,12 +111,41 @@ pub async fn connect_to(
     peer: SocketAddr,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    connect_to_any(socket, &[peer], cfg).await
+}
+
+/// Dial toward several candidate addresses at once (ICE-style), locking onto
+/// whichever answers first. Each probe round sends a `PROBE` to *every*
+/// candidate; the returned [`Established`] points at the responder. This is how a
+/// peer tries all of another's advertised data-socket candidates — a wrong guess
+/// (a stale reflexive mapping, a CGNAT external IP) costs nothing because the
+/// others are probed in the same round.
+pub async fn connect_to_any(
+    socket: UdpSocket,
+    peers: &[SocketAddr],
+    cfg: &Config,
+) -> io::Result<Option<Established>> {
+    if peers.is_empty() {
+        return Ok(None); // nothing to dial — fail fast rather than spin to the deadline
+    }
     let deadline = Instant::now() + cfg.overall;
     let mut buf = [0u8; 64];
     while Instant::now() < deadline {
         let sent_at = Instant::now();
-        socket.send_to(&[PROBE], peer).await?;
-        // Read until this probe's window elapses, so stray datagrams that return
+        // A peer-supplied candidate may be unreachable or the wrong address family
+        // for this socket; a send error just skips that candidate, so one bad entry
+        // can't abort a dial that has good candidates. Only give up if *none* of
+        // them could be sent (retrying wouldn't help).
+        let mut any_sent = false;
+        for peer in peers {
+            if socket.send_to(&[PROBE], peer).await.is_ok() {
+                any_sent = true;
+            }
+        }
+        if !any_sent {
+            return Ok(None);
+        }
+        // Read until this round's window elapses, so stray datagrams that return
         // early don't make us re-probe faster than `probe_interval`.
         loop {
             // Wait out this probe's window, but never past the overall deadline.
@@ -122,15 +157,16 @@ pub async fn connect_to(
                 break; // window over (or deadline reached): send next / give up
             }
             match timeout(remaining, socket.recv_from(&mut buf)).await {
-                Ok(Ok((n, from))) if from == peer && is_control_msg(&buf[..n]) => {
+                // Establish on a control reply from any candidate we probed.
+                Ok(Ok((n, from))) if peers.contains(&from) && is_control_msg(&buf[..n]) => {
                     if buf[0] == PROBE {
                         socket.send_to(&[ACK], from).await?;
                     }
-                    return Ok(Some(Established { socket, peer }));
+                    return Ok(Some(Established { socket, peer: from }));
                 }
                 Ok(Ok(_)) => {} // stray/spurious: keep reading this window
                 Ok(Err(e)) => return Err(e),
-                Err(_) => break, // window elapsed: send the next probe
+                Err(_) => break, // window elapsed: send the next round
             }
         }
     }
@@ -152,6 +188,20 @@ pub async fn accept(
     peer_host: IpAddr,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    accept_any(socket, &[peer_host], cfg).await
+}
+
+/// Like [`accept`], but establishes on a `PROBE` from *any* of `peer_hosts` — the
+/// distinct hosts among a peer's advertised data-socket candidates, since the
+/// punch may arrive from whichever candidate the peer's socket egresses on.
+pub async fn accept_any(
+    socket: UdpSocket,
+    peer_hosts: &[IpAddr],
+    cfg: &Config,
+) -> io::Result<Option<Established>> {
+    if peer_hosts.is_empty() {
+        return Ok(None); // no host to accept from — fail fast
+    }
     let deadline = Instant::now() + cfg.overall;
     let mut buf = [0u8; 64];
     loop {
@@ -162,10 +212,12 @@ pub async fn accept(
         match timeout(remaining, socket.recv_from(&mut buf)).await {
             // The reachable side of a dial only ever leads with a PROBE: we never
             // sent one, so no honest peer would answer us with an ACK. Requiring a
-            // PROBE from the expected host (and replying ACK) means neither a lone
+            // PROBE from an expected host (and replying ACK) means neither a lone
             // `[ACK]` byte nor a probe from an unrelated host can spoof or race an
             // inbound channel — matching the discipline of `open_birthday_sockets`.
-            Ok(Ok((n, from))) if from.ip() == peer_host && matches!(&buf[..n], [PROBE]) => {
+            Ok(Ok((n, from)))
+                if peer_hosts.contains(&from.ip()) && matches!(&buf[..n], [PROBE]) =>
+            {
                 socket.send_to(&[ACK], from).await?;
                 return Ok(Some(Established { socket, peer: from }));
             }
@@ -195,6 +247,22 @@ pub async fn open_birthday_sockets(
     seed: u64,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    open_birthday_sockets_any(host, &[peer_host], range, count, seed, cfg).await
+}
+
+/// Like [`open_birthday_sockets`], but honors a probe from *any* of `peer_hosts`
+/// — the distinct hosts among the peer's advertised candidates.
+pub async fn open_birthday_sockets_any(
+    host: IpAddr,
+    peer_hosts: &[IpAddr],
+    range: (u16, u16),
+    count: usize,
+    seed: u64,
+    cfg: &Config,
+) -> io::Result<Option<Established>> {
+    if peer_hosts.is_empty() {
+        return Ok(None); // no host to accept a probe from — fail fast
+    }
     assert!(
         range.0 >= 1 && range.0 < range.1,
         "invalid port range {range:?}: need 1 <= start < end"
@@ -206,6 +274,9 @@ pub async fn open_birthday_sockets(
     let mut opened = 0;
     let mut attempts = 0;
     let max_attempts = count.saturating_mul(20);
+    // The accepted hosts are shared across all listener tasks (each is 'static) via
+    // a cheap Arc clone rather than a fresh Vec per socket.
+    let hosts: Arc<[IpAddr]> = Arc::from(peer_hosts);
     while opened < count && attempts < max_attempts {
         if Instant::now() >= deadline {
             break; // binding also counts against the overall deadline
@@ -214,11 +285,14 @@ pub async fn open_birthday_sockets(
         let port = range.0 + (rng.next_u64() % span) as u16;
         if let Ok(socket) = UdpSocket::bind((host, port)).await {
             opened += 1;
+            let hosts = Arc::clone(&hosts);
             set.spawn(async move {
                 let mut buf = [0u8; 64];
                 loop {
                     match socket.recv_from(&mut buf).await {
-                        Ok((n, from)) if from.ip() == peer_host && matches!(&buf[..n], [PROBE]) => {
+                        Ok((n, from))
+                            if hosts.contains(&from.ip()) && matches!(&buf[..n], [PROBE]) =>
+                        {
                             return Some((socket, from));
                         }
                         Ok(_) => {} // stray/foreign datagram: keep listening
@@ -269,6 +343,24 @@ pub async fn spray(
     seed: u64,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
+    spray_any(bind, &[peer_host], range, probes, seed, cfg).await
+}
+
+/// Like [`spray`], but sprays each random port at *every* candidate host and
+/// establishes on a control reply from any of them — covering a peer that
+/// advertised several data-socket candidate IPs. The host set is tiny, so the
+/// extra sends per probe are negligible.
+pub async fn spray_any(
+    bind: SocketAddr,
+    peer_hosts: &[IpAddr],
+    range: (u16, u16),
+    probes: usize,
+    seed: u64,
+    cfg: &Config,
+) -> io::Result<Option<Established>> {
+    if peer_hosts.is_empty() {
+        return Ok(None); // no host to spray toward — fail fast
+    }
     assert!(
         range.0 >= 1 && range.0 < range.1,
         "invalid port range {range:?}: need 1 <= start < end"
@@ -288,17 +380,28 @@ pub async fn spray(
         if port == own_port {
             continue; // never spray our own socket (would self-hit)
         }
-        socket.send_to(&[PROBE], (peer_host, port)).await?;
+        // Skip a host whose send errors (unreachable / wrong family), so one bad
+        // peer-supplied IP can't abort the spray; if none sent for this port, skip
+        // the reply wait entirely.
+        let mut any_sent = false;
+        for host in peer_hosts {
+            if socket.send_to(&[PROBE], (*host, port)).await.is_ok() {
+                any_sent = true;
+            }
+        }
+        if !any_sent {
+            continue;
+        }
         // Spraying is intentionally fast: `probe_interval` here is the per-probe
         // reply wait, not a send-rate cap — racing a NAT's mappings wants many
-        // probes in flight. Only a single-byte control reply from the targeted
-        // host counts; timeouts, strays, and transient recv errors all just move
-        // on to the next port. The wait is capped by the overall deadline.
+        // probes in flight. Only a single-byte control reply from a targeted host
+        // counts; timeouts, strays, and transient recv errors all just move on to
+        // the next port. The wait is capped by the overall deadline.
         let wait = cfg
             .probe_interval
             .min(deadline.saturating_duration_since(Instant::now()));
         match timeout(wait, socket.recv_from(&mut buf)).await {
-            Ok(Ok((n, from))) if from.ip() == peer_host && is_control_msg(&buf[..n]) => {
+            Ok(Ok((n, from))) if peer_hosts.contains(&from.ip()) && is_control_msg(&buf[..n]) => {
                 // Normally the reply is an ACK; if it's a PROBE, answer it so the
                 // peer establishes too.
                 if buf[0] == PROBE {

@@ -946,12 +946,12 @@ const MAP_TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_CANDIDATES: usize = 4;
 
 /// Gather this data socket's candidate addresses to advertise, most-preferred
-/// first and deduplicated. Sources, in order: an explicit UPnP-IGD port mapping
-/// (when `port_mapping` is set, the socket is IPv4, and the mapped IP is publicly
-/// routable), the reflexive/STUN-observed mapping, and the local address. Always
-/// non-empty — the local address is the floor — and capped at [`MAX_CANDIDATES`].
-/// The peer tries them in order, so a wrong guess (a stale reflexive mapping, a
-/// CGNAT external IP, a multi-homed host) costs nothing.
+/// first and deduplicated. Sources, in order: an explicit port mapping (PCP-first
+/// with a UPnP-IGD fallback, when `port_mapping` is set, the socket is IPv4, and
+/// the mapped IP is publicly routable), the reflexive/STUN-observed mapping, and
+/// the local address. Always non-empty — the local address is the floor — and
+/// capped at [`MAX_CANDIDATES`]. The peer tries them in order, so a wrong guess (a
+/// stale reflexive mapping, a CGNAT external IP, a multi-homed host) costs nothing.
 async fn gather_candidates(
     sock: &UdpSocket,
     id: NodeId,

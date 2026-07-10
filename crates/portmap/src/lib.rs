@@ -44,8 +44,10 @@ pub enum MapError {
     /// No port-mapping gateway was found on the network (SSDP got no response).
     #[error("no port-mapping gateway found on the network")]
     NoGateway,
-    /// A gateway was found and PCP was tried, but the UPnP fallback failed.
-    #[error("PCP unavailable and UPnP fallback failed: {0}")]
+    /// The UPnP path failed — either SSDP discovery itself errored, or (after PCP
+    /// was tried and declined) the UPnP mapping did. The wrapped [`UpnpError`]
+    /// says which.
+    #[error("UPnP port mapping failed: {0}")]
     Upnp(UpnpError),
 }
 

@@ -282,11 +282,13 @@ where
 /// Fetching is **work-stealing**, not round-based: each provider pulls a small
 /// batch and, the moment it finishes, is re-dispatched onto whatever's still
 /// pending, so a slow provider only delays its own current batch (no round
-/// barrier). As chunks arrive, `emit(index, bytes)` is called for each in
-/// contiguous playback order — index `k` only once `0..=k` are all stored — exactly
-/// once per chunk, the seam through which both a bulk collector and a streaming
-/// consumer receive the data. Returns the (possibly incomplete) [`Plan`]; the
-/// caller checks [`Plan::is_complete`].
+/// barrier). As chunks arrive, `emit(index, bytes)` is called in contiguous
+/// playback order — index `k` only once `0..=k` are all stored — exactly once per
+/// playback index (`0..N`; a chunk shared by several indices, from dedup, is
+/// delivered at each of them, since a player needs every position). It's the seam
+/// through which both a bulk collector and a streaming consumer receive the data.
+/// Returns the (possibly incomplete) [`Plan`]; the caller checks
+/// [`Plan::is_complete`].
 async fn run_swarm(
     channels: Vec<Channel>,
     id: Hash,

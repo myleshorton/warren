@@ -111,16 +111,17 @@ crates/
             and fetching is work-stealing — a provider that finishes its batch is
             re-dispatched immediately, so a slow one never stalls the others at a
             round barrier. A dropped provider's chunks are re-assigned to the rest.
-            For video, download_blob_stream instead fetches a playback-order
-            priority window first (rarest-first beyond it) and hands the player
-            each chunk in playback order as the contiguous prefix fills in (a chunk
-            that arrives early is held until the ones before it are in), so
-            playback can start before the whole blob does. The seam where the data
-            layer finally rides the transport over a real, multi-peer connection.
+            For video, download_blob_stream instead fetches within a bounded
+            window ahead of the playback frontier, hands the player each chunk in
+            playback order as the contiguous prefix fills in (a chunk that arrives
+            early waits for the ones before it), and frees each chunk once
+            delivered — so playback starts before the whole blob does and memory
+            stays bounded to ~the window, not the whole file. The seam where the
+            data layer finally rides the transport over a real, multi-peer
+            connection.
 
   next: port mapping (UPnP/PCP) to raise direct-connect success, an incremental
-        Merkle accumulator for feed, memory-bounded streaming (drop chunks after
-        delivery), ...
+        Merkle accumulator for feed, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

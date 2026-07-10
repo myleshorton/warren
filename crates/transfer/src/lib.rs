@@ -260,8 +260,13 @@ pub async fn download_blob_stream<F>(
 where
     F: FnMut(usize, &[u8]),
 {
+    // A zero window could never fetch even the frontier chunk (nothing would be
+    // in range), so it would stall immediately; treat it as at least one.
+    let window = window.max(1);
     let plan = run_swarm(channels, id, cfg, Selection::Streaming { window }, on_chunk).await?;
-    if plan.is_complete() {
+    // Streaming drops chunks as it delivers them, so completion is "everything
+    // delivered", not "everything still stored".
+    if plan.all_delivered() {
         Ok(())
     } else {
         Err(TransferError::Incomplete)
@@ -359,9 +364,9 @@ async fn run_swarm(
     }
     let mut plan = Plan::new(manifest);
     plan.set_selection(selection);
-    // The next chunk index to hand to `emit`; advances as the contiguous prefix
-    // from the front fills in, so chunks are delivered strictly in playback order.
-    let mut next_emit = 0usize;
+    // Streaming frees each chunk once delivered (bounded memory); a bulk download
+    // retains all of them to reassemble at the end.
+    let drop_delivered = matches!(selection, Selection::Streaming { .. });
 
     // Work-stealing: instead of assigning a whole round and waiting for every
     // provider at a barrier (where one slow provider stalls the fast ones), each
@@ -396,13 +401,17 @@ async fn run_swarm(
                     plan.store(hash, data);
                 }
                 // Deliver any chunks now contiguously available from the front, in
-                // playback order (index k only once every earlier chunk is stored).
-                while next_emit < plan.chunk_count() {
-                    let Some(bytes) = plan.chunk_at(next_emit) else {
-                        break;
-                    };
-                    emit(next_emit, bytes);
-                    next_emit += 1;
+                // playback order (the chunk at index k only once every earlier one
+                // is stored), freeing each afterward when streaming.
+                loop {
+                    let index = plan.frontier();
+                    match plan.chunk_at(index) {
+                        // The borrow of `plan` ends with this statement, so
+                        // `advance_delivery` can take `&mut plan` right after.
+                        Some(bytes) => emit(index, bytes),
+                        None => break,
+                    }
+                    plan.advance_delivery(drop_delivered);
                 }
                 // Chunks this provider was assigned but didn't deliver (an `Absent`,
                 // an unexpected reply, or a hash mismatch). If it's still alive,
@@ -431,7 +440,9 @@ async fn run_swarm(
                 }
             }
         }
-        if plan.is_complete() {
+        // Done when every index has been delivered — not when every chunk is
+        // *stored*, since streaming drops chunks as it delivers them.
+        if plan.all_delivered() {
             break;
         }
         dispatch(

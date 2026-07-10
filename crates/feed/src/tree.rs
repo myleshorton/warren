@@ -151,7 +151,8 @@ impl Accumulator {
     }
 
     /// The Merkle root over all pushed leaves — identical to [`merkle_root`] of the
-    /// same leaves (`H("")` for none). Folds the peaks largest-first, matching
+    /// same leaves (`H("")` for none). Iterating the peaks smallest-height first
+    /// and making each (larger) peak the left child of the running node yields
     /// RFC 6962's `node(largest_subtree, node(next, …))` shape.
     pub fn root(&self) -> Hash {
         let mut acc: Option<Hash> = None;

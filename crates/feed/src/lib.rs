@@ -73,10 +73,11 @@ pub struct Proof {
 ///
 /// # Cost
 ///
-/// [`Log::append`] is O(1) (it stores the block and its leaf hash), but
-/// [`Log::root`] and [`Log::head`] are **O(log n)**: the root is maintained by an
-/// incremental Merkle accumulator that keeps only the right-spine subtree roots,
-/// so a commit doesn't rescan the whole log. Per-block
+/// [`Log::append`] is O(1) amortized (O(log n) worst case, when the accumulator
+/// carries a run of equal-height peaks), and [`Log::root`] / [`Log::head`] are
+/// **O(log n)**: the root is maintained by an incremental Merkle accumulator that
+/// keeps only the right-spine subtree roots, so a commit doesn't rescan the whole
+/// log. Per-block
 /// inclusion proofs ([`Log::proof`]) still recompute their audit path from the
 /// leaves and are O(n); making those O(log n) would mean retaining every internal
 /// node, which is deferred.

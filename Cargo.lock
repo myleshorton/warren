@@ -377,6 +377,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "portmap"
+version = "0.0.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "proptest",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"

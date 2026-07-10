@@ -76,8 +76,14 @@ crates/
               topic set on an interval until its handle drops, so a provider stays
               discoverable across DHT churn and epoch rotation
   puncher   real-UDP hole punching: simultaneous open / dial + birthday spray
+  portmap   PCP (RFC 6887) port mapping: ask the gateway to forward an external
+            UDP port to us — a complement to punching that makes a peer directly
+            reachable. Sans-IO MAP request/response codec (round-trip + KAT tested)
+            + map_port over UDP with retransmit and a nonce that rejects spoofed
+            replies (loopback-tested against a fake gateway)
   feed      signed append-only log (the "log"/hypercore role): BLAKE3 Merkle tree
-            over blocks, a signed (len, root) head, and per-block inclusion proofs
+            over blocks (root maintained by an incremental O(log n) accumulator),
+            a signed (len, root) head, and per-block inclusion proofs
             a peer verifies with only the owner's public key — the basis for
             sparse random-access sync. (Named `feed`, not `log`, to avoid the
             crates.io logging-facade collision.)
@@ -120,8 +126,9 @@ crates/
             data layer finally rides the transport over a real, multi-peer
             connection.
 
-  next: port mapping (UPnP/PCP) to raise direct-connect success, an incremental
-        Merkle accumulator for feed, ...
+  next: wire port mapping into connect's address discovery (alongside the
+        reflexive probe), automatic mapping renewal, UPnP-IGD fallback for
+        gateways that don't speak PCP, ...
 
   not planned: a relay data path for symmetric↔symmetric NAT pairs — relaying
         peer data would load relays too heavily for the serverless model, so

@@ -212,6 +212,46 @@ where
     }
 }
 
+/// Live-replicate a feed into a shared [`feed::Replica`]: tail `public_key`'s feed
+/// and, as blocks arrive, **advance** `into` and fire `appended` — so this node
+/// keeps an always-current, verified copy it can serve on the author's behalf
+/// (pair with [`serve_feed_tail`] over the same `Replica`). This is a blind
+/// mirror's store-and-forward. `into` must already hold a (possibly empty) prefix
+/// of the feed — bootstrap it with a one-shot [`download_feed`] + [`feed::Replica::new`]
+/// first; replication resumes from its current length. Runs until the channel breaks.
+pub async fn replicate_feed<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    into: &std::sync::Mutex<feed::Replica>,
+    appended: &tokio::sync::Notify,
+    cfg: &Config,
+) -> Result<(), TransferError> {
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
+    loop {
+        let from = into.lock().expect("replica").len() as u64;
+        let head_msg = exchange(&mut wire, &Message::Tail { have: from }, cfg).await?;
+        let mut dl = FeedDownload::resume(public_key, from);
+        dl.handle_response(&head_msg)?;
+        while let Some(request) = dl.poll_request() {
+            let response = exchange(&mut wire, &request, cfg).await?;
+            dl.handle_response(&response)?;
+        }
+        let head = dl.head().cloned();
+        let new_blocks = dl.into_blocks();
+        if !new_blocks.is_empty() {
+            if let Some(head) = head {
+                into.lock().expect("replica").advance(head, new_blocks);
+                appended.notify_waiters(); // wake subscribers tailing *this* mirror
+            }
+        }
+    }
+}
+
 /// Download and verify a whole blob over `channel`, returning its bytes. Trust
 /// is anchored in the content address `id`.
 pub async fn download_blob<L: Link>(
@@ -1313,5 +1353,69 @@ mod tests {
 
         server_task.abort();
         client_task.abort();
+    }
+
+    #[tokio::test]
+    async fn replicate_maintains_a_live_replica() {
+        use feed::Source as _;
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio::sync::Notify;
+
+        let kp = Keypair::from_seed(&[0x3Bu8; 32]);
+        let pk = kp.public();
+        let author = Arc::new(StdMutex::new(Log::new(kp)));
+        author.lock().unwrap().append(vec![0u8; 60]);
+        let author_appended = Arc::new(Notify::new());
+
+        // The mirror bootstraps a Replica of the author's current feed (1 block),
+        // then keeps it current by replicating.
+        let (head0, block0) = {
+            let a = author.lock().unwrap();
+            (a.head(), a.get(0).unwrap().to_vec())
+        };
+        let mirror = Arc::new(StdMutex::new(
+            feed::Replica::new(pk, head0, vec![block0]).expect("faithful replica"),
+        ));
+
+        let (mut mirror_client, mut author_server) = lossy_pair(&[], &[]);
+        let cfg = fast_cfg();
+
+        let a_log = author.clone();
+        let a_app = author_appended.clone();
+        let author_task = tokio::spawn(async move {
+            let _ = serve_feed_tail(&mut author_server, &a_log, &a_app, &cfg).await;
+        });
+        let m_rep = mirror.clone();
+        let mirror_appended = Arc::new(Notify::new());
+        let m_app = mirror_appended.clone();
+        let mirror_task = tokio::spawn(async move {
+            let _ = replicate_feed(&mut mirror_client, pk, &m_rep, &m_app, &cfg).await;
+        });
+
+        // The author appends a second block; the mirror's replica catches up on its
+        // own — no manual advance, straight off the live tail.
+        author.lock().unwrap().append(vec![1u8; 60]);
+        author_appended.notify_waiters();
+        for _ in 0..100 {
+            if mirror.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let r = mirror.lock().unwrap();
+        assert_eq!(r.len(), 2, "the mirror replicated the new block");
+        // The replicated block verifies against the author's signed head.
+        let head = r.head();
+        assert!(feed::verify_block(
+            &pk,
+            &head,
+            1,
+            r.get(1).unwrap(),
+            &r.proof(1).unwrap()
+        ));
+        drop(r);
+
+        author_task.abort();
+        mirror_task.abort();
     }
 }

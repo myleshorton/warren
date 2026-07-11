@@ -333,8 +333,8 @@
         <a href="https://murmur-3yy.pages.dev">see Murmur →</a>
       </div>
       <div class="build">
-        <div class="bh"><h3>Group chat / messaging</h3><span class="state now">live-tail built</span></div>
-        <p>Rooms map onto merged member feeds (text as records, media as blobs). <b>Live-tail replication is built</b> — subscribe and get pushed new blocks in real time, each verified against the signed head, no polling. A full room additionally needs deterministic multi-writer ordering (Autobase-style) — the remaining piece.</p>
+        <div class="bh"><h3>Group chat / messaging</h3><span class="state now">live-tail + mirrors built</span></div>
+        <p>Rooms map onto merged member feeds (text as records, media as blobs). <b>Live-tail replication is built</b> — subscribe and get pushed new blocks in real time, each verified against the signed head, no polling. <b>Swarm-failover subscription and blind-mirror store-and-forward are built too</b>: a feed is found by topic and tailed from <em>any</em> provider, and a mirror keeps a verified replica serving so the feed stays live even after its author goes offline — the mirror is never trusted, since every block still verifies against the author's key. A full room additionally needs deterministic multi-writer ordering (Autobase-style) — the remaining piece.</p>
         <a href="https://github.com/myleshorton/warren/blob/main/docs/live-tail.md">read the design note →</a>
       </div>
       <div class="build">
@@ -428,7 +428,7 @@
     <div class="head reveal">
       <span class="kicker">status</span>
       <h2>What's built, what's designed</h2>
-      <p>Warren is a research prototype under active development. The core connectivity, data, and sync layers are built; the real-time and transport-hardening layers are designed or planned.</p>
+      <p>Warren is a research prototype under active development. The connectivity, data, sync, and real-time layers are built — including live-tail replication with swarm failover and blind-mirror store-and-forward; multi-writer causal merge and transport hardening are designed or planned.</p>
     </div>
     <div class="status reveal">
       <div class="cap">DHT discovery + NAT hole-punching (birthday punch, ICE-style candidates)</div><div class="st built">built</div>
@@ -440,6 +440,7 @@
       <div class="cap">Content encryption: seekable per-item seal, ciphertext addressing</div><div class="st built">built</div>
       <div class="cap">Blinded rotating topics + decoupled node id + per-epoch re-announce</div><div class="st built">built</div>
       <div class="cap">Live-tail feed replication (the real-time / chat unlock)</div><div class="st built">built</div>
+      <div class="cap">Swarm-failover subscription + blind-mirror store-and-forward (verified replicas)</div><div class="st built">built</div>
       <div class="cap">Blind push notifier (iOS background wake without breaking serverless)</div><div class="st design">design</div>
       <div class="cap">Obfuscated / pluggable transport, cover-DHT rendezvous</div><div class="st planned">planned</div>
     </div>
@@ -474,7 +475,7 @@
     </div>
     <div class="limits reveal">
       <div class="limit"><span class="tag">nat</span><p><b>Two symmetric-NAT peers may not punch.</b> With no relay in the path, a pair behind carrier-grade symmetric NAT can fail to connect directly. Warren leaves that pair unconnected by design rather than routing data through infrastructure; a reachable peer or a volunteer blind peer bridges availability.</p></div>
-      <div class="limit"><span class="tag">real-time</span><p><b>Sync is pull, not push.</b> The transfer layer downloads a feed to its head and returns; there's no live subscription yet. Fine for on-demand content, insufficient for real-time apps until live-tail lands.</p></div>
+      <div class="limit"><span class="tag">real-time</span><p><b>No multi-writer ordering yet.</b> Live-tail push, swarm-failover subscription, and blind-mirror store-and-forward are built — real-time single-author feeds work. A shared room where many members write concurrently still needs deterministic causal ordering (Autobase-style) to converge; that merge layer is the remaining piece.</p></div>
       <div class="limit"><span class="tag">transport</span><p><b>No obfuscated transport yet.</b> Discovery is blinded and identities decoupled, but deep packet inspection can still see <em>that</em> a peer speaks a P2P protocol — just not what, or with whom. A pluggable obfuscated transport is planned.</p></div>
     </div>
   </div>

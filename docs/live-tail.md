@@ -1,8 +1,9 @@
 # Warren — live-tail feed replication
 
-**Status: Layer 1 built (2026-07-11).** Server-push, resumable, per-block-verified
-live replication ships across `sync` → `transfer` → `warren::session`. A companion
-to [`design.md`](design.md).
+**Status: Layers 1 + 2 built (2026-07-11).** Server-push, resumable,
+per-block-verified live replication ships across `sync` → `transfer` →
+`warren::session`, now with swarm-failover subscription and blind-mirror
+store-and-forward on top. A companion to [`design.md`](design.md).
 
 **What shipped (Layer 1 — the primitive):**
 - `sync`: a `Tail { have }` message + `FeedDownload::resume(pubkey, have)` — request,
@@ -13,13 +14,25 @@ to [`design.md`](design.md).
   the session, so a subscriber can't block appends) + `subscribe_feed` (the client
   loop). Tested end-to-end over a lossy link: a subscriber gets pre-existing blocks
   and each live append, no reconnect, no re-fetch.
-- `warren::session`: `Session::subscribe(member, from, on_block)`; the feed log is a
-  sync `Mutex` + an `appended` `Notify` fired on publish; the accept loop serves via
-  `serve_feed_tail` (batch-compatible, so a normal refresh is unaffected).
 
-**Still ahead:** Layer 2 (swarm-aware tailing + blind-mirror store-and-forward) and
-Layer 3 (deterministic multi-writer merge, Autobase-style, for chat rooms) — see the
-scope notes at the end.
+**What shipped (Layer 2 — swarm-aware tailing + blind mirrors):**
+- `feed`: a `Source` trait (implemented by both `Log` and a new read-only `Replica`)
+  so the tail-serve path is generic over "a feed I own" vs "a verified copy I hold."
+  `Replica::new` rejects a wrong-key, doctored, or truncated feed by construction, so
+  a mirror is never trusted — every block still verifies against the author's key.
+- `transfer`: `replicate_feed` (keep a `Replica` live from a provider) +
+  `download_feed_full` (a one-shot download that also returns the signed head, what
+  `Replica::new` needs to bootstrap).
+- `warren`: a feed-discovery topic (`channel::feed_topic`) the author and every mirror
+  announce under; `subscribe(feed_key, from, on_block)` is now *feed-centric* — it
+  finds every provider and tails from one, **failing over** to another when a provider
+  drops. `serve_by_key` serves our own log or a mirrored `Replica`; `mirror_feed` +
+  `run_mirror` bootstrap and maintain a mirror. A DHT-backbone integration test proves
+  the whole loop: author publishes → mirror replicates → author goes offline →
+  subscriber fails over to the mirror and tails the full, verified feed.
+
+**Still ahead:** Layer 3 — deterministic multi-writer merge (Autobase-style, for chat
+rooms where many members write concurrently); see the scope notes at the end.
 
 The original design follows, for the rationale.
 

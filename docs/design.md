@@ -252,4 +252,6 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Holdings-aware (partial-seeder) swarming, rarest-first | built |
 | Streaming download: bounded-window fetch, in-order delivery, drop-after-deliver | built |
 | Live-tail feed replication (subscribe to appends; the real-time / chat unlock) | built (Layer 1) — [`live-tail.md`](live-tail.md) |
+| Swarm-failover subscription + blind-mirror store-and-forward (verified replicas) | built (Layer 2) — [`live-tail.md`](live-tail.md) |
+| Multi-writer causal merge (Autobase-style; concurrent-writer chat rooms) | planned (Layer 3) |
 | Blind push notifier (iOS/Android background wake without breaking serverless) | design — [`blind-notifier.md`](blind-notifier.md) |

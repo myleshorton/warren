@@ -50,7 +50,11 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_HTTP_RESPONSE: usize = 1 << 20;
 
 /// Errors from UPnP port mapping.
+///
+/// `#[non_exhaustive]` so adding a variant isn't a breaking change for downstream
+/// exhaustive matches — callers must include a wildcard arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum UpnpError {
     /// A socket/HTTP transport error.
     #[error("UPnP I/O error: {0}")]
@@ -257,9 +261,14 @@ fn extract_tag<'a>(s: &'a str, tag: &str) -> Option<&'a str> {
 /// Split an `http://host[:port]/path` URL into (host, port, path).
 pub(crate) fn parse_url(url: &str) -> Option<(String, u16, String)> {
     // The parsed values are interpolated directly into an HTTP request line and
-    // Host header. Reject raw whitespace/control bytes (including CR/LF request
-    // injection) and userinfo, which this deliberately small client does not need.
-    if url.bytes().any(|b| b <= b' ' || b == 0x7f) {
+    // Host header, so allow only printable ASCII (0x21..=0x7e): reject raw
+    // whitespace/control bytes (including CR/LF request injection), DEL, and
+    // non-ASCII (>= 0x80). RFC 3986 URLs are ASCII — non-ASCII must be
+    // percent-encoded/punycoded — and letting a high byte through risks a malformed
+    // or ambiguously-parsed request (some parsers treat Unicode separators as
+    // whitespace/newlines). Userinfo is rejected below; this small client doesn't
+    // need it.
+    if url.bytes().any(|b| b <= b' ' || b >= 0x7f) {
         return None;
     }
     let rest = url.strip_prefix("http://")?;
@@ -598,6 +607,14 @@ mod tests {
         assert_eq!(parse_url("http://host/path\r\nX-Evil: yes"), None);
         assert_eq!(parse_url("http://user@host/path"), None);
         assert_eq!(parse_url("http:///path"), None);
+        // Non-ASCII must be percent-encoded/punycoded, not passed through: a raw
+        // high byte or a Unicode separator (here U+2028 LINE SEPARATOR) is rejected.
+        assert_eq!(
+            parse_url("http://xn--hst-nope/path"),
+            Some(("xn--hst-nope".to_string(), 80, "/path".to_string()))
+        );
+        assert_eq!(parse_url("http://höst/path"), None);
+        assert_eq!(parse_url("http://host/a\u{2028}b"), None);
     }
 
     #[test]

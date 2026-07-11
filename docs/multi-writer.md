@@ -75,19 +75,53 @@ deterministically into one linear view.
 - Tests: two-writer merge, contiguous-only frontier, a stamped message sorting after
   all it observed, reply-before-cause held pending then resolved, idempotent observe.
 
-## Follow-on (the live glue)
+## First application: comments on videos (Murmur)
 
-- **Wire it to the network path.** A chat app: subscribe to each room member's feed
-  (Layer 2), `Room::observe` every delivered block (its feed index is the block's
-  position), render `view().ordered`, and on send stamp the record with
-  `Room::next_message_clock()` before `Session::publish`. No substrate changes — this
-  is app wiring on top of what's built.
-- **Writer-set management.** First cut: the writer set is the room's discovered
-  members (the PSK channel). Explicit add/remove-writer records (membership as data,
+The natural first consumer of the merge substrate isn't a standalone chat app — it's
+**comments on a video in Murmur**. A video's comment thread *is* the multi-writer
+merge, scoped to one blob id: many authors write, everyone must see the same ordered
+thread, replies must follow what they answer. It reuses Layer 2 (subscribe) and Layer
+3 (`Room` + `merge`) almost as-is, and it makes the whole live-tail→merge stack visible
+in the reference app without a new client.
+
+**Shape.** A comment is a **body-only feed record** in its author's own signed log:
+`content_type: "comment"`, `body: <text>`, `meta.reply_to: <video blob id>` (and, for a
+nested reply, `meta.parent: <comment id>`), carrying the merge `clock` + `lamport`
+scoped to *that video's* thread. Comments live in the same per-author feed as that
+author's videos — one identity, one log — so no new feed type is needed.
+
+**Read path.** To show video V's comments: from the feeds we already discover (channel
+members), take records where `content_type=="comment" && meta.reply_to==V`, `observe`
+them into a `Room` scoped to V, and render `view().ordered`. Live updates arrive for
+free over `subscribe` — a new comment is pushed and re-linearized. Nested replies fall
+out of the ordering: a reply's `clock` depends on its parent comment, so the linearizer
+places it after; the UI draws the indentation from `meta.parent`.
+
+**Write path.** On send: `Room::next_message_clock()` for the thread → stamp a
+comment record → publish it to our own feed. This needs the one substrate addition
+below; discovery reuses the existing content/channel announce.
+
+**Two increments.**
+1. *v1 — comments over channel membership.* Add a **body-only publish** path (today
+   `Session::publish` always creates a blob; a comment carries only a `body`), a
+   comment record shape, a per-video `Room` fed from discovered members' comment
+   records, and a comments UI (the TikTok comment drawer). Flat threads first.
+2. *v2 — reach + nesting.* A per-video `comment_topic(blob_id)` (a sibling of
+   `content_topic`) so commenters are discoverable beyond the channel members you
+   already aggregate, and nested reply threads via `meta.parent` + the parent in the
+   comment's clock.
+
+## Other follow-on (the live glue)
+
+- **General rooms / group chat** are the same wiring without the video scope: subscribe
+  to each member's feed, `Room::observe`, render, publish with `next_message_clock()`.
+  Comments prove the path; a standalone chat room is a generalization.
+- **Writer-set management.** First cut: the writer set is the room's discovered members
+  (the PSK channel). Explicit add/remove-writer records (membership as data,
   Autobase-style) are a later refinement.
 - **Presence / typing** stays *out* of the signed log — ephemeral signals ride as
   plain datagrams on the open channel, never appended (see the live-tail note).
 
 The point, as with sync: the hard part is a **pure, deterministic, convergent**
 algorithm proven on the bench; the substrate is complete, and the network layer
-already carries the records it needs.
+already carries the records it needs. The first app that spends it is video comments.

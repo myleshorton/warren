@@ -323,8 +323,8 @@
   <div class="wrap">
     <div class="head reveal">
       <span class="kicker">what you can build</span>
-      <h2>Not video-only — a substrate for any content</h2>
-      <p>A feed of signed records plus content-addressed blobs is a general shape. The same core carries very different applications; only the real-time ones need a primitive Warren doesn't ship yet.</p>
+      <h2>A substrate for any content</h2>
+      <p>A feed of signed records plus content-addressed blobs is a general shape — the same core carries very different applications, from on-demand video to real-time chat.</p>
     </div>
     <div class="builds reveal">
       <div class="build">
@@ -333,7 +333,7 @@
         <a href="https://murmur-3yy.pages.dev">see Murmur →</a>
       </div>
       <div class="build">
-        <div class="bh"><h3>Group chat / messaging</h3><span class="state now">merge substrate built</span></div>
+        <div class="bh"><h3>Group chat / messaging</h3><span class="state now">merge built</span></div>
         <p>Rooms map onto merged member feeds (text as records, media as blobs). <b>Live-tail replication is built</b> — subscribe and get pushed new blocks in real time, each verified against the signed head, no polling. <b>Swarm-failover subscription and blind-mirror store-and-forward are built too</b>: a feed is found by topic and tailed from <em>any</em> provider, and a mirror keeps a verified replica serving so the feed stays live even after its author goes offline — the mirror is never trusted, since every block still verifies against the author's key. And the <b>multi-writer causal merge is built</b> (Autobase-style): each message carries a version-vector clock, and a deterministic linearizer merges many writers' feeds into the one causal order every participant computes identically — proven to converge over a real DHT. What's left is the app wiring — a chat client driving the room view.</p>
         <a href="https://github.com/myleshorton/warren/blob/main/docs/live-tail.md">read the design note →</a>
       </div>

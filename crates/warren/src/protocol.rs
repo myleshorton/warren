@@ -89,7 +89,14 @@ where
     ch.send(&[req]).await.map_err(|e| format!("send: {e}"))?;
 
     let mut buf = [0u8; 64];
-    let n = ch.recv(&mut buf).await.map_err(|e| format!("recv: {e}"))?;
+    // Bound the handshake reply: a provider we reached but that never answers (a
+    // dead-but-reachable peer) must not stall the caller — in a failover loop it
+    // would otherwise wedge the whole subscription on one silent provider.
+    let n = match tokio::time::timeout(cfg.request_timeout * 2, ch.recv(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(format!("recv: {e}")),
+        Err(_) => return Err("handshake timed out".to_string()),
+    };
     if n < 32 {
         return Err("no feed key in handshake".to_string());
     }
@@ -130,7 +137,14 @@ where
 
     // The provider echoes the feed key it's about to serve; it must be ours.
     let mut buf = [0u8; 64];
-    let n = ch.recv(&mut buf).await.map_err(|e| format!("recv: {e}"))?;
+    // Bound the handshake reply: a provider we reached but that never answers (a
+    // dead-but-reachable peer) must not stall the caller — in a failover loop it
+    // would otherwise wedge the whole subscription on one silent provider.
+    let n = match tokio::time::timeout(cfg.request_timeout * 2, ch.recv(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(format!("recv: {e}")),
+        Err(_) => return Err("handshake timed out".to_string()),
+    };
     if n < 32 || buf[..32] != key_bytes[..] {
         return Err("provider does not serve the requested feed".to_string());
     }
@@ -164,7 +178,14 @@ pub async fn replicate_feed_by_key(
     ch.send(&req).await.map_err(|e| format!("send: {e}"))?;
 
     let mut buf = [0u8; 64];
-    let n = ch.recv(&mut buf).await.map_err(|e| format!("recv: {e}"))?;
+    // Bound the handshake reply: a provider we reached but that never answers (a
+    // dead-but-reachable peer) must not stall the caller — in a failover loop it
+    // would otherwise wedge the whole subscription on one silent provider.
+    let n = match tokio::time::timeout(cfg.request_timeout * 2, ch.recv(&mut buf)).await {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => return Err(format!("recv: {e}")),
+        Err(_) => return Err("handshake timed out".to_string()),
+    };
     if n < 32 || buf[..32] != key_bytes[..] {
         return Err("provider does not serve the requested feed".to_string());
     }
@@ -194,7 +215,10 @@ pub async fn fetch_replica(
     ch.send(&req).await.ok()?;
 
     let mut buf = [0u8; 64];
-    let n = ch.recv(&mut buf).await.ok()?;
+    let n = tokio::time::timeout(cfg.request_timeout * 2, ch.recv(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
     if n < 32 || buf[..32] != key_bytes[..] {
         return None;
     }

@@ -142,17 +142,15 @@ pub(crate) async fn map_via_location(
     // A control URL we can't even parse (non-`http` scheme, malformed) is a bad
     // description, not a cross-origin attack — classify it as such, and reserve
     // `UntrustedControlUrl` for a well-formed URL that genuinely points at a
-    // different origin.
-    if parse_url(&control_url).is_none() {
-        return Err(UpnpError::BadDescription);
-    }
+    // different origin. Parse it once here: the host is reused below for
+    // local_ip_towards, and a parse failure is the BadDescription case.
+    let (host, _, _) = parse_url(&control_url).ok_or(UpnpError::BadDescription)?;
     if !same_http_origin(location, &control_url) {
         return Err(UpnpError::UntrustedControlUrl);
     }
 
     // Our LAN address on the interface toward the gateway — the internal client
     // the mapping forwards to.
-    let (host, _, _) = parse_url(&control_url).ok_or(UpnpError::Malformed)?;
     let internal_client = local_ip_towards(&host).await?;
 
     // IGDv1 lease is a u32 of seconds. Clamp to at least 1s: a gateway reads 0 as

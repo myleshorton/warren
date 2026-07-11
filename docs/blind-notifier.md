@@ -3,6 +3,13 @@
 **Status:** design only, not built (2026-07-11). A companion to [`design.md`](design.md)
 and [`live-tail.md`](live-tail.md).
 
+> **Scope note.** This addresses *waking* a suspended peer to receive a message.
+> For the *seeding* role — keeping a phone continuously available as a background
+> peer — [`ios-vpn-extension-seeder.md`](ios-vpn-extension-seeder.md) is the
+> stronger mechanism (a node hosted in the VPN Network Extension never sleeps),
+> and it largely replaces the notifier there. The two are complementary: the NE
+> keeps VPN-app peers available; the notifier wakes non-VPN clients.
+
 ## The problem
 
 A Warren peer on a mobile OS is **suspended** when backgrounded: it stops

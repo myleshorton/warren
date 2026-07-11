@@ -255,3 +255,4 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Swarm-failover subscription + blind-mirror store-and-forward (verified replicas) | built (Layer 2) — [`live-tail.md`](live-tail.md) |
 | Multi-writer causal merge (Autobase-style; concurrent-writer chat rooms) | planned (Layer 3) |
 | Blind push notifier (iOS/Android background wake without breaking serverless) | design — [`blind-notifier.md`](blind-notifier.md) |
+| Background seeder inside the VPN Network Extension (sustained iOS availability) | design — [`ios-vpn-extension-seeder.md`](ios-vpn-extension-seeder.md) |

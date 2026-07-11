@@ -230,6 +230,32 @@ impl Replica {
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
+
+    /// Advance to a newer signed `head` by appending `new_blocks` — the blocks from
+    /// the current length up to `head.len`, in order. Returns `false` and leaves the
+    /// replica **unchanged** unless the result is provably faithful: `head` verifies
+    /// under the owner's key, `new_blocks` exactly fills `len()..head.len`, and the
+    /// combined blocks reproduce `head.root`. A live mirror calls this as it tails
+    /// the author, growing the replica it serves. Advancing to the same head with no
+    /// new blocks is an accepted no-op.
+    pub fn advance(&mut self, head: Head, new_blocks: Vec<Vec<u8>>) -> bool {
+        if !verify_head(&self.public_key, &head)
+            || self.blocks.len() as u64 + new_blocks.len() as u64 != head.len
+        {
+            return false;
+        }
+        // Compute the combined leaves and check the root *before* mutating, so a
+        // bad advance can't leave a torn replica.
+        let mut leaves = self.leaves.clone();
+        leaves.extend(new_blocks.iter().map(|b| tree::leaf_hash(b)));
+        if tree::merkle_root(&leaves) != head.root {
+            return false;
+        }
+        self.blocks.extend(new_blocks);
+        self.leaves = leaves;
+        self.head = head;
+        true
+    }
 }
 
 impl Source for Replica {
@@ -559,6 +585,39 @@ mod tests {
         let replica = Replica::new(log.public_key(), log.head(), vec![]).expect("empty replica");
         assert!(replica.is_empty());
         assert_eq!(replica.head(), log.head());
+    }
+
+    #[test]
+    fn replica_advance_grows_and_stays_faithful() {
+        let mut log = log_with(3);
+        let pk = log.public_key();
+        let blocks: Vec<Vec<u8>> = (0..3).map(|i| log.get(i).unwrap().to_vec()).collect();
+        let mut replica = Replica::new(pk, log.head(), blocks).unwrap();
+        assert_eq!(replica.len(), 3);
+
+        // The author appends two blocks; the mirror advances its replica to match.
+        log.append(vec![3u8; 4]);
+        log.append(vec![4u8; 5]);
+        let new = vec![log.get(3).unwrap().to_vec(), log.get(4).unwrap().to_vec()];
+        assert!(replica.advance(log.head(), new));
+        assert_eq!(replica.len(), 5);
+
+        // Every block, old and new, still verifies against the advanced head.
+        let head = log.head();
+        for i in 0..replica.len() {
+            let proof = replica.proof(i).unwrap();
+            assert!(verify_block(
+                &pk,
+                &head,
+                i as u64,
+                replica.get(i).unwrap(),
+                &proof
+            ));
+        }
+
+        // A non-contiguous advance (wrong new-block count) is rejected, unchanged.
+        assert!(!replica.advance(log.head(), vec![b"extra".to_vec()]));
+        assert_eq!(replica.len(), 5);
     }
 
     #[test]

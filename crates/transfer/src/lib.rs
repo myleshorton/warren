@@ -661,14 +661,14 @@ pub async fn serve_feed<L: Link>(
 /// the (unbounded) session — otherwise a live subscriber would hold the lock
 /// forever and block every append. Each `serve_feed` answer is a pure, non-async
 /// computation, so no lock is held across an `.await`.
-pub async fn serve_feed_tail<L: Link>(
+pub async fn serve_feed_tail<L: Link, S: feed::Source>(
     channel: &mut L,
-    log: &std::sync::Mutex<feed::Log>,
+    source: &std::sync::Mutex<S>,
     appended: &tokio::sync::Notify,
     cfg: &Config,
 ) -> Result<(), TransferError> {
     serve(channel, cfg, Some(appended), |request| {
-        sync::serve_feed(request, &*log.lock().expect("feed log"))
+        sync::serve_feed(request, &*source.lock().expect("feed source"))
     })
     .await
 }
@@ -1259,6 +1259,57 @@ mod tests {
         }
         appended.notify_waiters();
         assert_eq!(rx.recv().await.unwrap(), (3, vec![3u8; 100]));
+
+        server_task.abort();
+        client_task.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribe_tails_a_growing_replica() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio::sync::Notify;
+
+        let kp = Keypair::from_seed(&[0x2Au8; 32]);
+        let pk = kp.public();
+        // An author log, used here only to mint signed heads + blocks; the *mirror*
+        // holds a Replica of it and serves that — the author isn't in this exchange.
+        let mut author = Log::new(kp);
+        author.append(vec![0u8; 80]);
+        author.append(vec![1u8; 80]);
+        let seed: Vec<Vec<u8>> = (0..author.len())
+            .map(|i| author.get(i).unwrap().to_vec())
+            .collect();
+        let replica = Arc::new(StdMutex::new(
+            feed::Replica::new(pk, author.head(), seed).expect("faithful replica"),
+        ));
+        let appended = Arc::new(Notify::new());
+        let (mut client, mut server) = lossy_pair(&[], &[]);
+        let cfg = fast_cfg();
+
+        let srv_replica = replica.clone();
+        let srv_appended = appended.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = serve_feed_tail(&mut server, &srv_replica, &srv_appended, &cfg).await;
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client_task = tokio::spawn(async move {
+            let _ = subscribe_feed(&mut client, pk, 0, &cfg, move |index, block| {
+                let _ = tx.send((index, block));
+            })
+            .await;
+        });
+
+        // The mirror serves the two blocks it already holds.
+        assert_eq!(rx.recv().await.unwrap(), (0, vec![0u8; 80]));
+        assert_eq!(rx.recv().await.unwrap(), (1, vec![1u8; 80]));
+
+        // The author appends; the mirror advances its replica + signals — the
+        // subscriber is pushed the new block straight from the mirror, verified.
+        author.append(vec![2u8; 80]);
+        let new = vec![author.get(2).unwrap().to_vec()];
+        assert!(replica.lock().unwrap().advance(author.head(), new));
+        appended.notify_waiters();
+        assert_eq!(rx.recv().await.unwrap(), (2, vec![2u8; 80]));
 
         server_task.abort();
         client_task.abort();

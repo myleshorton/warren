@@ -862,6 +862,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "warren"
+version = "0.0.0"
+dependencies = [
+ "crypto",
+ "swarm",
+]
+
+[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

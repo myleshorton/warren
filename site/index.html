@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Warren — a censorship-resistant peer-to-peer stack</title>
+<meta name="description" content="Warren is a serverless peer-to-peer stack: blinded discovery, hole-punched direct connections, signed append-only feeds, content-addressed blobs, verified swarm sync. Move any content between peers with no center — video, chat, files, data." />
+<meta name="color-scheme" content="dark light" />
+<meta property="og:title" content="Warren — a peer-to-peer stack with no center" />
+<meta property="og:description" content="A serverless P2P substrate: opaque discovery, hole-punched connections, signed feeds, content-addressed blobs, verified swarm sync. Any content, no infrastructure in the data path." />
+<meta property="og:type" content="website" />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='13' y='13' width='6' height='6' fill='%234d9fff'/%3E%3Cg stroke='%234d9fff' stroke-width='1.3' fill='none'%3E%3Cline x1='16' y1='4' x2='16' y2='13'/%3E%3Cline x1='16' y1='19' x2='16' y2='28'/%3E%3Cline x1='4' y1='16' x2='13' y2='16'/%3E%3Cline x1='19' y1='16' x2='28' y2='16'/%3E%3C/g%3E%3Cg fill='%2338e0e8'%3E%3Crect x='14.5' y='2.5' width='3' height='3'/%3E%3Crect x='14.5' y='26.5' width='3' height='3'/%3E%3Crect x='2.5' y='14.5' width='3' height='3'/%3E%3Crect x='26.5' y='14.5' width='3' height='3'/%3E%3C/g%3E%3C/svg%3E" />
+<style>
+  /* ── Typefaces: IBM Plex — the engineering register (self-hosted) ──────── */
+  @font-face { font-family:"PlexMono"; src:url("assets/fonts/plex-mono-500.woff2") format("woff2"); font-weight:500; font-display:swap; }
+  @font-face { font-family:"PlexMono"; src:url("assets/fonts/plex-mono-600.woff2") format("woff2"); font-weight:600; font-display:swap; }
+  @font-face { font-family:"PlexMono"; src:url("assets/fonts/plex-mono-700.woff2") format("woff2"); font-weight:700; font-display:swap; }
+  @font-face { font-family:"PlexSans"; src:url("assets/fonts/plex-sans-400.woff2") format("woff2"); font-weight:400; font-display:swap; }
+  @font-face { font-family:"PlexSans"; src:url("assets/fonts/plex-sans-600.woff2") format("woff2"); font-weight:600; font-display:swap; }
+
+  /* ── Tokens: a blueprint. Dark = the drawing; light = the paper. ───────── */
+  :root{
+    --void:#070a12; --void-2:#0a0e18; --raise:#0e1322;
+    --panel:rgba(120,170,255,.035); --panel-2:rgba(120,170,255,.06);
+    --line:rgba(140,180,255,.12); --line-2:rgba(140,180,255,.24);
+    --grid:rgba(90,140,220,.055);
+    --ink:#e0e7f5; --faint:#828fb0; --dim:#5c688a;
+    --blue:#4d9fff; --cyan:#38e0e8; --warn:#ffb454; --no:#ff6b6b;
+    --glow:rgba(77,159,255,.30);
+    --maxw:1140px;
+    --f-display:"PlexMono",ui-monospace,monospace;
+    --f-body:"PlexSans",-apple-system,BlinkMacSystemFont,sans-serif;
+    --f-mono:"PlexMono",ui-monospace,"SF Mono",Menlo,monospace;
+  }
+  @media (prefers-color-scheme: light){
+    :root{
+      --void:#e9eef8; --void-2:#e1e8f4; --raise:#ffffff;
+      --panel:rgba(20,50,110,.03); --panel-2:rgba(20,50,110,.055);
+      --line:rgba(28,60,120,.16); --line-2:rgba(28,60,120,.30);
+      --grid:rgba(40,80,150,.07);
+      --ink:#0f1830; --faint:#4a5674; --dim:#6a7796;
+      --blue:#1f6fe0; --cyan:#0a93b8; --warn:#b9741a; --no:#d63a3a;
+      --glow:rgba(31,111,224,.16);
+    }
+  }
+  :root[data-theme="dark"]{
+    --void:#070a12; --void-2:#0a0e18; --raise:#0e1322;
+    --panel:rgba(120,170,255,.035); --panel-2:rgba(120,170,255,.06);
+    --line:rgba(140,180,255,.12); --line-2:rgba(140,180,255,.24);
+    --grid:rgba(90,140,220,.055);
+    --ink:#e0e7f5; --faint:#828fb0; --dim:#5c688a;
+    --blue:#4d9fff; --cyan:#38e0e8; --warn:#ffb454; --no:#ff6b6b;
+    --glow:rgba(77,159,255,.30);
+  }
+  :root[data-theme="light"]{
+    --void:#e9eef8; --void-2:#e1e8f4; --raise:#ffffff;
+    --panel:rgba(20,50,110,.03); --panel-2:rgba(20,50,110,.055);
+    --line:rgba(28,60,120,.16); --line-2:rgba(28,60,120,.30);
+    --grid:rgba(40,80,150,.07);
+    --ink:#0f1830; --faint:#4a5674; --dim:#6a7796;
+    --blue:#1f6fe0; --cyan:#0a93b8; --warn:#b9741a; --no:#d63a3a;
+    --glow:rgba(31,111,224,.16);
+  }
+
+  *,*::before,*::after{ box-sizing:border-box; }
+  html{ scroll-behavior:smooth; }
+  @media (prefers-reduced-motion: reduce){ html{ scroll-behavior:auto; } }
+  body{
+    margin:0; color:var(--ink);
+    font-family:var(--f-body); font-size:16.5px; line-height:1.62;
+    -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
+    overflow-x:hidden;
+    /* the blueprint grid */
+    background:
+      linear-gradient(var(--grid) 1px, transparent 1px),
+      linear-gradient(90deg, var(--grid) 1px, transparent 1px),
+      var(--void);
+    background-size:34px 34px, 34px 34px, auto;
+  }
+  ::selection{ background:var(--blue); color:#fff; }
+  a{ color:inherit; }
+  h1,h2,h3{ font-family:var(--f-display); font-weight:600; line-height:1.08; letter-spacing:-.015em; text-wrap:balance; margin:0; }
+
+  .wrap{ width:100%; max-width:var(--maxw); margin-inline:auto; padding-inline:clamp(20px,5vw,44px); }
+  .eyebrow{ font-family:var(--f-mono); font-weight:600; font-size:11.5px; letter-spacing:.24em; text-transform:uppercase; color:var(--blue); }
+  .mono{ font-family:var(--f-mono); }
+
+  /* ── Theme toggle ─────────────────────────────────────────────────────── */
+  .toggle{
+    position:fixed; top:16px; right:16px; z-index:50;
+    display:inline-flex; align-items:center; gap:8px;
+    font-family:var(--f-mono); font-weight:500; font-size:11px; letter-spacing:.14em; text-transform:uppercase;
+    color:var(--faint); background:var(--void-2); border:1px solid var(--line);
+    border-radius:4px; padding:8px 12px; cursor:pointer; transition:color .2s, border-color .2s;
+  }
+  .toggle:hover{ color:var(--ink); border-color:var(--line-2); }
+  .toggle:focus-visible{ outline:2px solid var(--blue); outline-offset:3px; }
+  .toggle .box{ width:9px; height:9px; border:1.5px solid var(--blue); box-shadow:0 0 8px var(--glow); }
+
+  /* ── Hero ─────────────────────────────────────────────────────────────── */
+  .hero{ position:relative; min-height:96svh; display:flex; align-items:center; overflow:hidden; border-bottom:1px solid var(--line); }
+  #mesh{ position:absolute; inset:0; width:100%; height:100%; z-index:0; }
+  .hero::after{ content:""; position:absolute; inset:0; z-index:1; pointer-events:none;
+    background:radial-gradient(115% 85% at 30% 38%, transparent 46%, var(--void) 100%); }
+  .hero .wrap{ position:relative; z-index:2; padding-block:118px 84px; }
+  .tag-row{ display:flex; align-items:center; gap:14px; margin-bottom:26px; flex-wrap:wrap; }
+  .tag-row .rule{ height:1px; flex:1 1 60px; background:var(--line-2); min-width:40px; }
+  .wordmark{ font-family:var(--f-display); font-weight:700; letter-spacing:-.04em;
+    font-size:clamp(58px,15vw,168px); line-height:.9; color:var(--ink); margin:0 0 .1em -.02em; }
+  .wordmark .cursor, .foot .sig .cursor{
+    display:inline-block; width:.42em; height:.54em; margin-left:.06em;
+    background:var(--blue); vertical-align:baseline; box-shadow:0 0 18px var(--glow);
+    animation:blink 1.15s steps(2,jump-none) infinite;
+  }
+  @keyframes blink{ 50%{ opacity:.12; } }
+  @media (prefers-reduced-motion: reduce){ .wordmark .cursor, .foot .sig .cursor{ animation:none; } }
+  .hero h1{ font-size:clamp(24px,3.9vw,44px); max-width:20ch; margin-bottom:24px; font-weight:600; }
+  .hero h1 .b{ color:var(--blue); }
+  .lede{ font-size:clamp(16px,2vw,20px); color:var(--faint); max-width:60ch; margin:0 0 32px; }
+  .lede b{ color:var(--ink); font-weight:600; }
+  .chips{ display:flex; flex-wrap:wrap; gap:10px; }
+  .chip{ font-family:var(--f-mono); font-size:12px; letter-spacing:.02em; color:var(--ink);
+    background:var(--void-2); border:1px solid var(--line); border-radius:4px; padding:8px 14px; }
+  .chip .mk{ color:var(--blue); }
+
+  /* ── Section scaffolding ──────────────────────────────────────────────── */
+  section{ position:relative; padding-block:clamp(70px,9vw,116px); border-bottom:1px solid var(--line); }
+  .head{ display:flex; flex-direction:column; gap:15px; max-width:66ch; margin-bottom:50px; }
+  .head h2{ font-size:clamp(27px,4.4vw,44px); }
+  .head p{ font-size:clamp(15.5px,1.9vw,18.5px); color:var(--faint); margin:0; max-width:62ch; }
+  .kicker{ font-family:var(--f-mono); font-weight:600; font-size:11.5px; letter-spacing:.2em; text-transform:uppercase; color:var(--blue); display:flex; align-items:center; gap:10px; }
+  .kicker::before{ content:""; width:18px; height:1px; background:var(--blue); }
+
+  /* ── "What Warren is" — three tenets ──────────────────────────────────── */
+  .tenets{ display:grid; grid-template-columns:repeat(3,1fr); gap:1px; background:var(--line); border:1px solid var(--line); }
+  .tenet{ background:var(--void); padding:26px 24px; }
+  .tenet .n{ font-family:var(--f-mono); font-size:11px; color:var(--dim); letter-spacing:.1em; }
+  .tenet h3{ font-family:var(--f-body); font-weight:600; font-size:18px; letter-spacing:0; margin:10px 0 8px; }
+  .tenet p{ margin:0; color:var(--faint); font-size:15px; }
+  .tenet p b{ color:var(--ink); font-weight:600; }
+  @media (max-width:800px){ .tenets{ grid-template-columns:1fr; } }
+
+  /* ── Architecture: the layered stack diagram ──────────────────────────── */
+  .stackdiag{ border:1px solid var(--line-2); background:var(--void-2); margin-bottom:44px; }
+  .layer{ display:grid; grid-template-columns:150px 1fr auto; gap:18px; align-items:center;
+    padding:15px clamp(16px,2.5vw,26px); border-bottom:1px solid var(--line); }
+  .layer:last-child{ border-bottom:none; }
+  .layer .lname{ font-family:var(--f-mono); font-weight:600; font-size:14px; color:var(--blue); }
+  .layer .ldesc{ font-size:14.5px; color:var(--faint); }
+  .layer .ldesc b{ color:var(--ink); font-weight:600; }
+  .layer .ltag{ font-family:var(--f-mono); font-size:10px; letter-spacing:.12em; text-transform:uppercase; color:var(--dim); white-space:nowrap; }
+  .layer.app{ background:var(--panel-2); }
+  .layer.app .lname{ color:var(--cyan); }
+  .layer.base{ background:linear-gradient(90deg, color-mix(in oklab,var(--blue) 8%, transparent), transparent 60%); }
+  @media (max-width:640px){ .layer{ grid-template-columns:1fr; gap:5px; } .layer .ltag{ display:none; } }
+
+  /* ── Crate cards ──────────────────────────────────────────────────────── */
+  .cards{ display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); }
+  .card{ position:relative; background:var(--void); padding:22px 22px 24px; transition:background .2s; }
+  .card:hover{ background:var(--void-2); }
+  .card .top{ display:flex; align-items:baseline; justify-content:space-between; gap:10px; }
+  .card .name{ font-family:var(--f-mono); font-weight:600; font-size:14.5px; color:var(--blue); }
+  .card .role{ font-family:var(--f-mono); font-size:10px; letter-spacing:.12em; text-transform:uppercase; color:var(--dim); }
+  .card p{ margin:13px 0 0; font-size:14.5px; color:var(--faint); }
+  .card p b{ color:var(--ink); font-weight:600; }
+
+  /* ── What you can build ───────────────────────────────────────────────── */
+  .builds{ display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:16px; }
+  .build{ border:1px solid var(--line); background:var(--panel); padding:22px; display:flex; flex-direction:column; gap:12px; }
+  .build .bh{ display:flex; align-items:center; justify-content:space-between; gap:10px; }
+  .build h3{ font-family:var(--f-body); font-weight:600; font-size:17px; letter-spacing:0; }
+  .build p{ margin:0; color:var(--faint); font-size:14.5px; }
+  .state{ font-family:var(--f-mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; padding:3px 8px; border-radius:3px; white-space:nowrap; }
+  .state.now{ color:var(--cyan); border:1px solid color-mix(in oklab,var(--cyan) 45%, var(--line)); }
+  .state.soon{ color:var(--warn); border:1px solid color-mix(in oklab,var(--warn) 45%, var(--line)); }
+  .state.fit{ color:var(--blue); border:1px solid color-mix(in oklab,var(--blue) 45%, var(--line)); }
+  .build a{ color:var(--blue); text-decoration:none; font-family:var(--f-mono); font-size:12.5px; border-bottom:1px solid var(--line-2); align-self:flex-start; }
+  .build a:hover{ border-color:var(--blue); }
+
+  /* ── Posture claims ───────────────────────────────────────────────────── */
+  .posture{ display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); }
+  .claim{ background:var(--void); padding:26px 24px; }
+  .claim .t{ display:flex; align-items:center; gap:11px; margin-bottom:11px; }
+  .claim .glyph{ width:24px; height:24px; flex:0 0 auto; color:var(--blue); }
+  .claim h3{ font-family:var(--f-body); font-weight:600; font-size:17px; letter-spacing:0; }
+  .claim p{ margin:0; color:var(--faint); font-size:14.5px; }
+  .claim p b{ color:var(--ink); font-weight:600; }
+  .claim code{ font-family:var(--f-mono); font-size:12.5px; color:var(--cyan); background:var(--panel-2); padding:1px 5px; border-radius:3px; }
+
+  /* ── Comparison table ─────────────────────────────────────────────────── */
+  .tablewrap{ overflow-x:auto; border:1px solid var(--line); }
+  table{ border-collapse:collapse; width:100%; min-width:760px; font-size:14px; }
+  caption{ text-align:left; padding:0 0 16px; color:var(--faint); font-size:14px; }
+  th,td{ text-align:left; padding:15px 17px; border-bottom:1px solid var(--line); vertical-align:top; }
+  thead th{ font-family:var(--f-mono); font-weight:600; font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:var(--faint); background:var(--void-2); }
+  tbody th{ font-family:var(--f-body); font-weight:600; color:var(--ink); width:20%; }
+  td{ color:var(--faint); }
+  .col-us{ background:color-mix(in oklab,var(--blue) 9%, transparent); }
+  thead .col-us{ color:var(--ink); background:color-mix(in oklab,var(--blue) 18%, transparent); }
+  td.col-us{ color:var(--ink); }
+  .yes{ color:var(--cyan); font-weight:600; }
+  .nope{ color:var(--no); }
+  tr:last-child td, tr:last-child th{ border-bottom:none; }
+  .credit{ display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border:1px solid var(--line); border-top:none; }
+  .credit > div{ background:var(--void); padding:22px 24px; }
+  .credit h3{ font-family:var(--f-body); font-weight:600; font-size:15.5px; margin-bottom:9px; }
+  .credit h3.a{ color:var(--cyan); } .credit h3.b{ color:var(--blue); }
+  .credit p{ margin:0; color:var(--faint); font-size:14.5px; }
+  @media (max-width:700px){ .credit{ grid-template-columns:1fr; } }
+
+  /* ── Status / roadmap ─────────────────────────────────────────────────── */
+  .status{ display:grid; grid-template-columns:1fr auto; gap:1px 0; background:var(--line); border:1px solid var(--line); }
+  .status .cap{ padding:13px 18px; background:var(--void); font-size:14.5px; color:var(--ink); }
+  .status .st{ padding:13px 18px; background:var(--void); font-family:var(--f-mono); font-size:11px; letter-spacing:.08em; text-transform:uppercase; white-space:nowrap; }
+  .status .st.built{ color:var(--cyan); }
+  .status .st.design{ color:var(--warn); }
+  .status .st.planned{ color:var(--dim); }
+
+  /* ── Reference app: Murmur ────────────────────────────────────────────── */
+  .refapp{ display:grid; grid-template-columns:auto 1fr auto; gap:26px; align-items:center;
+    border:1px solid var(--line-2); background:var(--void-2); padding:30px clamp(22px,3vw,36px); }
+  .refapp .logo{ width:52px; height:52px; }
+  .refapp h3{ font-family:var(--f-display); font-weight:600; font-size:24px; letter-spacing:-.01em; }
+  .refapp p{ margin:6px 0 0; color:var(--faint); font-size:15px; max-width:56ch; }
+  .refapp .go{ font-family:var(--f-mono); font-size:13px; color:var(--void); background:var(--blue);
+    padding:11px 18px; border-radius:4px; text-decoration:none; white-space:nowrap; font-weight:600; }
+  .refapp .go:hover{ filter:brightness(1.1); }
+  @media (max-width:720px){ .refapp{ grid-template-columns:1fr; text-align:left; gap:18px; } }
+
+  /* ── Limitations ──────────────────────────────────────────────────────── */
+  .limits{ display:flex; flex-direction:column; gap:18px; max-width:76ch; }
+  .limit{ display:grid; grid-template-columns:auto 1fr; gap:16px; align-items:start; }
+  .limit .tag{ font-family:var(--f-mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:var(--warn); border:1px solid color-mix(in oklab,var(--warn) 40%, var(--line)); border-radius:3px; padding:4px 9px; white-space:nowrap; margin-top:2px; }
+  .limit p{ margin:0; color:var(--faint); font-size:15px; }
+  .limit p b{ color:var(--ink); font-weight:600; }
+
+  /* ── Footer ───────────────────────────────────────────────────────────── */
+  footer{ padding-block:52px 66px; }
+  .foot{ display:flex; justify-content:space-between; align-items:flex-end; gap:28px; flex-wrap:wrap; }
+  .foot .sig{ font-family:var(--f-display); font-weight:700; font-size:clamp(26px,4.5vw,42px); letter-spacing:-.03em; color:var(--ink); }
+  .foot .sig .cursor{ color:var(--blue); }
+  .foot .meta{ font-family:var(--f-mono); font-size:12px; color:var(--dim); line-height:1.95; }
+  .foot a{ color:var(--faint); text-decoration:none; border-bottom:1px solid var(--line-2); transition:color .2s; }
+  .foot a:hover{ color:var(--blue); }
+
+  /* ── Reveal ───────────────────────────────────────────────────────────── */
+  .reveal{ opacity:0; transform:translateY(16px); transition:opacity .65s ease, transform .65s ease; }
+  .reveal.in{ opacity:1; transform:none; }
+  @media (prefers-reduced-motion: reduce){ .reveal{ opacity:1; transform:none; transition:none; } }
+</style>
+</head>
+<body>
+<button class="toggle" id="themeToggle" aria-label="Toggle color theme"><span class="box" aria-hidden="true"></span><span id="themeLabel">theme</span></button>
+
+<!-- ── HERO ──────────────────────────────────────────────────────────── -->
+<header class="hero">
+  <canvas id="mesh" aria-hidden="true"></canvas>
+  <div class="wrap">
+    <div class="tag-row">
+      <span class="eyebrow">peer-to-peer stack</span><span class="rule"></span>
+      <span class="eyebrow">rust</span><span class="rule"></span>
+      <span class="eyebrow">censorship-resistant</span>
+    </div>
+    <div class="wordmark">warren<span class="cursor" aria-hidden="true"></span></div>
+    <h1>A network layer with <span class="b">no center</span> — move any content between peers, opaquely.</h1>
+    <p class="lede">Warren is a <b>serverless</b> P2P substrate: blinded discovery, hole-punched direct connections, signed append-only feeds, content-addressed blobs, and verified swarm sync. It moves <b>opaque, verifiable bytes</b> between peers with nothing in the middle — and it doesn't care what the bytes are.</p>
+    <div class="chips">
+      <span class="chip"><span class="mk">›</span> no infrastructure in the data path</span>
+      <span class="chip"><span class="mk">›</span> content-agnostic: video · chat · files · feeds</span>
+      <span class="chip"><span class="mk">›</span> discovery a censor can't enumerate</span>
+    </div>
+  </div>
+</header>
+
+<!-- ── WHAT WARREN IS ────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="kicker">the substrate</span>
+      <h2>A serverless data layer, not an app</h2>
+      <p>Warren gives you the hard parts of a peer-to-peer system as small, verifiable Rust crates. What you send over it — a video, a message, a file, a signed data feed — is your payload, not Warren's concern.</p>
+    </div>
+    <div class="tenets reveal">
+      <div class="tenet"><div class="n">01</div><h3>No center</h3><p>Peers connect <b>directly</b> — hole-punched over a single socket. The DHT is used only for rendezvous; bulk data never touches a server, gateway, or required relay.</p></div>
+      <div class="tenet"><div class="n">02</div><h3>Opaque by construction</h3><p>Discovery runs under <b>blinded, rotating topics</b>. Content is addressed by the hash of its <b>ciphertext</b>. There's nothing stable for a censor to enumerate or fingerprint.</p></div>
+      <div class="tenet"><div class="n">03</div><h3>Content-agnostic</h3><p>The core abstractions — a <b>signed append-only log</b> and a <b>content-addressed blob store</b> — are general. Video is one payload; chat, files, and data feeds are others.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── ARCHITECTURE ──────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="kicker">architecture</span>
+      <h2>Seven crates, one pipeline</h2>
+      <p>Each layer is independently verifiable and composes upward. `crypto` at the base; your app on top; `portmap` feeding reachability into the driver.</p>
+    </div>
+
+    <div class="stackdiag reveal" role="img" aria-label="Warren's layered architecture, from crypto at the base up to your app">
+      <div class="layer app"><div class="lname">your app</div><div class="ldesc">Murmur (video) · chat · file sync · data feeds — <b>the payload is yours</b></div><div class="ltag">consumer</div></div>
+      <div class="layer"><div class="lname">transfer</div><div class="ldesc">verified feed + blob sync · <b>multi-source swarm download</b></div><div class="ltag">sync</div></div>
+      <div class="layer"><div class="lname">feed · blob</div><div class="ldesc">signed append-only log · content-addressed chunk store</div><div class="ltag">data</div></div>
+      <div class="layer"><div class="lname">swarm</div><div class="ldesc">Kademlia announce / lookup under blinded topics</div><div class="ltag">discovery</div></div>
+      <div class="layer"><div class="lname">driver</div><div class="ldesc">DHT node · single-socket NAT hole-punch &nbsp;←&nbsp; portmap (reachability)</div><div class="ltag">connectivity</div></div>
+      <div class="layer base"><div class="lname">crypto</div><div class="ldesc">Ed25519 · BLAKE3 · XChaCha20 seal</div><div class="ltag">primitives</div></div>
+    </div>
+
+    <div class="cards reveal">
+      <div class="card"><div class="top"><span class="name">driver</span><span class="role">connectivity</span></div><p>A DHT node plus <b>single-socket NAT hole-punching</b>. Dials a peer by id, punches a direct path (incl. birthday-punch for symmetric NAT), and hands back a raw channel.</p></div>
+      <div class="card"><div class="top"><span class="name">swarm</span><span class="role">discovery</span></div><p>Kademlia routing: <b>announce</b> under a topic, <b>look up</b> who else did. Turns a shared key into a set of reachable peers.</p></div>
+      <div class="card"><div class="top"><span class="name">transfer</span><span class="role">sync</span></div><p>Verified feed + blob sync with <b>multi-source swarming</b> — rarest-first, work-stealing, resumable, streaming, every chunk checked as it lands.</p></div>
+      <div class="card"><div class="top"><span class="name">feed</span><span class="role">log</span></div><p>A <b>signed, append-only, per-block-verifiable log</b> (O(log n) incremental Merkle head). Content identity, decoupled from network identity.</p></div>
+      <div class="card"><div class="top"><span class="name">blob</span><span class="role">storage</span></div><p>A content-addressed chunk store. Split a payload, name each piece by its hash, reassemble anywhere from any source that holds the pieces.</p></div>
+      <div class="card"><div class="top"><span class="name">crypto</span><span class="role">primitives</span></div><p>Ed25519 signatures, BLAKE3 hashing, and an <b>XChaCha20 sealing envelope</b> — seekable per-item encryption that keeps streaming progressive while blobs stay opaque.</p></div>
+      <div class="card"><div class="top"><span class="name">portmap</span><span class="role">reachability</span></div><p>PCP (RFC 6887) + UPnP-IGD port mapping and reflexive address discovery, so a peer can advertise a path others can actually reach.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── WHAT YOU CAN BUILD ────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="kicker">what you can build</span>
+      <h2>A substrate for any content</h2>
+      <p>A feed of signed records plus content-addressed blobs is a general shape — the same core carries very different applications, from on-demand video to real-time chat.</p>
+    </div>
+    <div class="builds reveal">
+      <div class="build">
+        <div class="bh"><h3>Short-video feed</h3><span class="state now">works today</span></div>
+        <p>A TikTok-style vertical feed: clips as encrypted blobs, posts as feed records, swarmed between viewers. This is the reference app, Murmur.</p>
+        <a href="https://murmur-3yy.pages.dev">see Murmur →</a>
+      </div>
+      <div class="build">
+        <div class="bh"><h3>Group chat / messaging</h3><span class="state now">merge built</span></div>
+        <p>Rooms map onto merged member feeds (text as records, media as blobs). <b>Live-tail replication is built</b> — subscribe and get pushed new blocks in real time, each verified against the signed head, no polling. <b>Swarm-failover subscription and blind-mirror store-and-forward are built too</b>: a feed is found by topic and tailed from <em>any</em> provider, and a mirror keeps a verified replica serving so the feed stays live even after its author goes offline — the mirror is never trusted, since every block still verifies against the author's key. And the <b>multi-writer causal merge is built</b> (Autobase-style): each message carries a version-vector clock, and a deterministic linearizer merges many writers' feeds into the one causal order every participant computes identically — proven to converge over a real DHT. What's left is the app wiring — a chat client driving the room view.</p>
+        <a href="https://github.com/myleshorton/warren/blob/main/docs/live-tail.md">read the design note →</a>
+      </div>
+      <div class="build">
+        <div class="bh"><h3>File &amp; data sync</h3><span class="state fit">natural fit</span></div>
+        <p>Content-addressing plus verified multi-source download is exactly a P2P file transfer — big payloads, spread across whoever holds the chunks, resumable and integrity-checked.</p>
+      </div>
+      <div class="build">
+        <div class="bh"><h3>Signed activity feeds</h3><span class="state fit">natural fit</span></div>
+        <p>Any append-only, authored, tamper-evident stream — a microblog, an audit log, a sensor feed — is what <code style="font-family:var(--f-mono);font-size:.85em">feed</code> already is, minus the video.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── POSTURE ───────────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="kicker">threat posture</span>
+      <h2>What makes it hard to censor</h2>
+      <p>Warren treats opacity to a censor as the first requirement, not a feature bolted on later. Five properties do the work — and they hold whatever the payload is.</p>
+    </div>
+    <div class="posture reveal">
+      <div class="claim">
+        <div class="t"><svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M4 8h16M4 16h16M9 4c-2 5-2 11 0 16M15 4c2 5 2 11 0 16"/></svg><h3>Blinded, rotating discovery</h3></div>
+        <p>The discovery topic is <code>hash(psk, epoch)</code> — meaningless without the key and different every epoch. No fixed handle to add to a blocklist.</p>
+      </div>
+      <div class="claim">
+        <div class="t"><svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="8" cy="8" r="3.2"/><circle cx="17" cy="16" r="3.2"/><path d="M8 11.5v3M17 8.5v3M4 20c0-2 1.6-3 4-3"/></svg><h3>Decoupled identities</h3></div>
+        <p>A peer's <b>node id</b> (where it is) is independent from its <b>content id</b> (who authored). Hosting and authoring don't collapse to one stable name.</p>
+      </div>
+      <div class="claim">
+        <div class="t"><svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3a9 9 0 1 1-8.5 6"/><path d="M3 5v4h4"/></svg><h3>Per-epoch re-announce</h3></div>
+        <p>Membership refreshes on a clock (<code>keep_announced</code>), so the swarm heals through churn <b>without a registry</b> anyone could subpoena.</p>
+      </div>
+      <div class="claim">
+        <div class="t"><svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="4" y="10" width="16" height="10" rx="1.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/><path d="M12 14v2"/></svg><h3>Ciphertext addressing</h3></div>
+        <p>Blobs are named by the hash of their <b>ciphertext</b> under a random key — so a censor holding a banned item <b>can't compute its id</b> to hunt hosts. Content-addressing, minus the fingerprint.</p>
+      </div>
+      <div class="claim">
+        <div class="t"><svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="2.4"/><circle cx="12" cy="12" r="8.5" stroke-dasharray="2 3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg><h3>Nothing in the data path</h3></div>
+        <p>Optional volunteer <b>blind peers</b> reseed encrypted bytes they can't read. Nothing is required, nothing is central — availability without infrastructure.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── COMPARISON ────────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="kicker">how it compares</span>
+      <h2>Against IPFS, iroh &amp; Holepunch</h2>
+      <p>Warren isn't the first serverless data stack — it borrows heavily from these. What differs is the center of gravity: the others optimize for fast, verifiable P2P; Warren works outward from opacity to a censor.</p>
+    </div>
+    <div class="tablewrap reveal">
+      <table>
+        <caption>Architectural comparison. All four move data peer-to-peer; they disagree on discovery, addressing, and what sits in the path.</caption>
+        <thead>
+          <tr><th scope="col">&nbsp;</th><th scope="col">IPFS</th><th scope="col">iroh</th><th scope="col">Holepunch / Pear</th><th scope="col" class="col-us">Warren</th></tr>
+        </thead>
+        <tbody>
+          <tr><th scope="row">Discovery</th><td>public Kademlia DHT, keyed by CID</td><td>dial by public key; public relays</td><td>HyperDHT — by key or topic hash</td><td class="col-us"><b>blinded PSK topics that rotate per epoch</b></td></tr>
+          <tr><th scope="row">Content addressing</th><td>hash of the <b>plaintext</b> (CID)</td><td>BLAKE3 hash of the blob</td><td>Hypercore public key</td><td class="col-us">hash of the <b>ciphertext</b> (random per-item key)</td></tr>
+          <tr><th scope="row">Fingerprintable?</th><td class="nope">yes — CID = the content</td><td class="nope">yes — hash of bytes</td><td>key is stable</td><td class="col-us"><span class="yes">no</span> — id reveals nothing about the plaintext</td></tr>
+          <tr><th scope="row">Connectivity</th><td>bootstrap + gateways; DCUtR punch</td><td>hole-punch, <b>relay fallback</b></td><td>UDP hole-punch, <b>relay fallback</b></td><td class="col-us">single-socket punch, <b>no relay in path</b></td></tr>
+          <tr><th scope="row">Required infra</th><td>gateways, pinning services</td><td>operated relay ecosystem</td><td>relay nodes / blind peers</td><td class="col-us"><span class="yes">none</span> — volunteer blind peers are optional</td></tr>
+          <tr><th scope="row">Privacy default</th><td>public</td><td>key-addressed</td><td>key-addressed</td><td class="col-us"><b>private, PSK-gated swarms</b></td></tr>
+          <tr><th scope="row">Signed log</th><td>IPNS / mutable pointers</td><td>iroh-docs (key–value)</td><td><b>Hypercore</b> (append-only)</td><td class="col-us">signed append-only feed</td></tr>
+          <tr><th scope="row">Verified streaming</th><td>Bitswap blocks</td><td><b>BLAKE3 bao</b> stream</td><td>Hypercore merkle</td><td class="col-us">per-chunk BLAKE3-verified stream</td></tr>
+          <tr><th scope="row">Censorship resistance</th><td>not a design goal</td><td>not a design goal</td><td>not a design goal</td><td class="col-us"><b>the design center</b></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="credit reveal">
+      <div>
+        <h3 class="a">What Warren borrows</h3>
+        <p>The signed append-only feed echoes Hypercore. The per-chunk BLAKE3 verified streaming echoes iroh's bao. The hole-punching uses the same NAT tricks the whole field shares. Standing on shoulders, deliberately.</p>
+      </div>
+      <div>
+        <h3 class="b">What they do better</h3>
+        <p><b>IPFS:</b> a vast ecosystem and durable persistence. <b>iroh:</b> QUIC polish, throughput, and batteries-included protocols. <b>Holepunch:</b> a mature runtime shipping real apps like Keet. Warren is a research prototype by comparison.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ── STATUS ────────────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="kicker">status</span>
+      <h2>What's built, what's designed</h2>
+      <p>Warren is a research prototype under active development. The connectivity, data, sync, and real-time layers are built — including live-tail replication with swarm failover, blind-mirror store-and-forward, and multi-writer causal merge (the group-chat substrate); transport hardening is designed or planned.</p>
+    </div>
+    <div class="status reveal">
+      <div class="cap">DHT discovery + NAT hole-punching (birthday punch, ICE-style candidates)</div><div class="st built">built</div>
+      <div class="cap">Port mapping (PCP + UPnP-IGD) for a direct external port</div><div class="st built">built</div>
+      <div class="cap">Signed feeds (incremental Merkle head), content-addressed blobs, verified sync</div><div class="st built">built</div>
+      <div class="cap">Reliable transport: fragmentation, selective repeat, AIMD + RTT pacing</div><div class="st built">built</div>
+      <div class="cap">Multi-peer swarming (work-stealing, rarest-first, partial-seeder aware)</div><div class="st built">built</div>
+      <div class="cap">Streaming download: bounded-window, in-order delivery</div><div class="st built">built</div>
+      <div class="cap">Content encryption: seekable per-item seal, ciphertext addressing</div><div class="st built">built</div>
+      <div class="cap">Blinded rotating topics + decoupled node id + per-epoch re-announce</div><div class="st built">built</div>
+      <div class="cap">Live-tail feed replication (the real-time / chat unlock)</div><div class="st built">built</div>
+      <div class="cap">Swarm-failover subscription + blind-mirror store-and-forward (verified replicas)</div><div class="st built">built</div>
+      <div class="cap">Multi-writer causal merge (version-vector clocks, deterministic convergent linearizer)</div><div class="st built">built</div>
+      <div class="cap">Blind push notifier (iOS background wake without breaking serverless)</div><div class="st design">design</div>
+      <div class="cap">Obfuscated / pluggable transport, cover-DHT rendezvous</div><div class="st planned">planned</div>
+    </div>
+  </div>
+</section>
+
+<!-- ── REFERENCE APP ─────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="kicker">reference app</span>
+      <h2>Murmur — Warren, made tangible</h2>
+    </div>
+    <div class="refapp reveal">
+      <svg class="logo" viewBox="0 0 32 32" aria-hidden="true"><circle cx="16" cy="16" r="4" fill="#5ef2c8"/><circle cx="16" cy="16" r="9" fill="none" stroke="#7b6cf6" stroke-width="1.6" opacity=".75"/><circle cx="16" cy="16" r="14" fill="none" stroke="#ff5cc8" stroke-width="1.1" opacity=".45"/></svg>
+      <div>
+        <h3>Murmur</h3>
+        <p>A censorship-resistant short-video app — a vertical feed with no server in the middle. It's the proof that Warren carries real, heavy, encrypted content between real devices.</p>
+      </div>
+      <a class="go" href="https://murmur-3yy.pages.dev">visit murmur →</a>
+    </div>
+  </div>
+</section>
+
+<!-- ── LIMITATIONS ───────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="kicker">honest limitations</span>
+      <h2>What doesn't work yet</h2>
+      <p>A serverless design pays for its properties. These are framework-level costs — the app layer adds its own (a mobile client is suspended in the background; a desktop peer isn't).</p>
+    </div>
+    <div class="limits reveal">
+      <div class="limit"><span class="tag">nat</span><p><b>Two symmetric-NAT peers may not punch.</b> With no relay in the path, a pair behind carrier-grade symmetric NAT can fail to connect directly. Warren leaves that pair unconnected by design rather than routing data through infrastructure; a reachable peer or a volunteer blind peer bridges availability.</p></div>
+      <div class="limit"><span class="tag">real-time</span><p><b>No chat client yet.</b> The real-time substrate is complete — live-tail push, swarm-failover subscription, blind-mirror store-and-forward, and deterministic multi-writer causal merge all work and are tested over a real DHT. What's missing is an <em>application</em> on top: a chat client that drives the room view and publishes with a causal clock. The framework is ready for one; none is built.</p></div>
+      <div class="limit"><span class="tag">transport</span><p><b>No obfuscated transport yet.</b> Discovery is blinded and identities decoupled, but deep packet inspection can still see <em>that</em> a peer speaks a P2P protocol — just not what, or with whom. A pluggable obfuscated transport is planned.</p></div>
+    </div>
+  </div>
+</section>
+
+<!-- ── FOOTER ────────────────────────────────────────────────────────── -->
+<footer>
+  <div class="wrap foot">
+    <div>
+      <div class="sig">warren<span class="cursor" aria-hidden="true"></span></div>
+      <p class="meta" style="margin-top:10px;">A censorship-resistant peer-to-peer stack.<br/>A research prototype — not a production network.</p>
+    </div>
+    <div class="meta">
+      <a href="https://github.com/myleshorton/warren">github.com/myleshorton/warren</a><br/>
+      driver · swarm · transfer · feed · blob · crypto · portmap<br/>
+      built in Rust · reference app: <a href="https://murmur-3yy.pages.dev">Murmur</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+  // ── Theme toggle: OS preference default; button stamps an override. ──────
+  (function(){
+    var root=document.documentElement, btn=document.getElementById('themeToggle'), lbl=document.getElementById('themeLabel');
+    function current(){ return root.getAttribute('data-theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'); }
+    function paint(){ lbl.textContent = current(); }
+    paint();
+    btn.addEventListener('click', function(){ root.setAttribute('data-theme', current()==='dark' ? 'light' : 'dark'); paint(); });
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', paint);
+  })();
+
+  // ── Scroll reveal ───────────────────────────────────────────────────────
+  (function(){
+    var els=[].slice.call(document.querySelectorAll('.reveal'));
+    if(!('IntersectionObserver' in window) || matchMedia('(prefers-reduced-motion: reduce)').matches){
+      els.forEach(function(e){ e.classList.add('in'); }); return;
+    }
+    var io=new IntersectionObserver(function(es){
+      es.forEach(function(en){ if(en.isIntersecting){ en.target.classList.add('in'); io.unobserve(en.target); } });
+    },{ threshold:.12 });
+    els.forEach(function(e){ io.observe(e); });
+  })();
+
+  // ── Hero: a blueprint mesh. Square nodes, thin structural links, a slow
+  //    cyan signal pulse tracing an edge now and then. No center. ───────────
+  (function(){
+    var c=document.getElementById('mesh'); if(!c) return;
+    var ctx=c.getContext('2d'), DPR=Math.min(window.devicePixelRatio||1, 2);
+    var reduce=matchMedia('(prefers-reduced-motion: reduce)').matches;
+    var W=0,H=0,nodes=[],pulses=[],raf=0;
+
+    function tok(v){ return getComputedStyle(document.documentElement).getPropertyValue(v).trim(); }
+    function rgb(){ // parse --blue / --cyan into "r,g,b"
+      var probe=document.createElement('span'); probe.style.color=tok('--blue'); document.body.appendChild(probe);
+      var b=getComputedStyle(probe).color.match(/\d+/g); probe.style.color=tok('--cyan');
+      var cy=getComputedStyle(probe).color.match(/\d+/g); document.body.removeChild(probe);
+      return { blue:(b||[77,159,255]).slice(0,3).join(','), cyan:(cy||[56,224,232]).slice(0,3).join(',') };
+    }
+    var COL=rgb();
+    function resize(){ W=c.clientWidth; H=c.clientHeight; c.width=W*DPR; c.height=H*DPR; ctx.setTransform(DPR,0,0,DPR,0,0); build(); }
+    function build(){
+      var count=Math.max(20, Math.min(52, Math.round(W*H/30000)));
+      nodes=[]; pulses=[];
+      for(var i=0;i<count;i++){
+        nodes.push({ x:Math.random()*W, y:Math.random()*H,
+          vx:reduce?0:(Math.random()-.5)*0.1, vy:reduce?0:(Math.random()-.5)*0.1,
+          hub:Math.random()<0.14 });
+      }
+    }
+    var LINK=150;
+    function step(){
+      ctx.clearRect(0,0,W,H);
+      for(var i=0;i<nodes.length;i++){
+        var a=nodes[i]; a.x+=a.vx; a.y+=a.vy;
+        if(a.x<0||a.x>W) a.vx*=-1; if(a.y<0||a.y>H) a.vy*=-1;
+        for(var j=i+1;j<nodes.length;j++){
+          var b=nodes[j], dx=a.x-b.x, dy=a.y-b.y, d=Math.hypot(dx,dy);
+          if(d<LINK){
+            ctx.strokeStyle="rgba("+COL.blue+","+((1-d/LINK)*0.20)+")"; ctx.lineWidth=1;
+            ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke();
+            if(!reduce && Math.random()<0.0013 && pulses.length<18) pulses.push({a:i,b:j,t:0,sp:0.01+Math.random()*0.015});
+          }
+        }
+      }
+      for(var k=0;k<nodes.length;k++){
+        var n=nodes[k], s=n.hub?5:3;
+        ctx.strokeStyle="rgba("+COL.blue+",0.85)"; ctx.lineWidth=1.2;
+        ctx.strokeRect(n.x-s/2, n.y-s/2, s, s);
+        if(n.hub){ ctx.strokeStyle="rgba("+COL.cyan+",0.5)"; ctx.strokeRect(n.x-s/2-3, n.y-s/2-3, s+6, s+6); }
+      }
+      for(var p=pulses.length-1;p>=0;p--){
+        var pu=pulses[p], A=nodes[pu.a], B=nodes[pu.b];
+        pu.t+=pu.sp; if(pu.t>=1){ pulses.splice(p,1); continue; }
+        var x=A.x+(B.x-A.x)*pu.t, y=A.y+(B.y-A.y)*pu.t;
+        var g=ctx.createRadialGradient(x,y,0,x,y,6);
+        g.addColorStop(0,"rgba("+COL.cyan+",0.95)"); g.addColorStop(1,"rgba("+COL.cyan+",0)");
+        ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,6,0,7); ctx.fill();
+      }
+      // Reduced motion: render the mesh once as a static diagram — don't keep the
+      // rAF loop (and its per-frame redraw) running.
+      if(!reduce) raf=requestAnimationFrame(step);
+    }
+    resize(); step();
+    window.addEventListener('resize', function(){ resize(); if(reduce) step(); });
+  })();
+</script>
+</body>
+</html>

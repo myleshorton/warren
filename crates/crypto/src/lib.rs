@@ -23,6 +23,10 @@
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use thiserror::Error;
 
+/// Content-encryption envelope (policy-free): stream-cipher confidentiality +
+/// key-wrapping, for apps that hand the transport ciphertext (blind relays).
+pub mod seal;
+
 /// Length of an Ed25519 public key, in bytes.
 pub const PUBLIC_KEY_LEN: usize = 32;
 /// Length of the secret seed a [`Keypair`] is derived from, in bytes.

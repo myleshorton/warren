@@ -1,15 +1,15 @@
-//! A live, watchable end-to-end demo of the whole Warren stack, on loopback but
+//! A live, observable end-to-end demo of the whole Warren stack, on loopback but
 //! over real UDP sockets — no mocks, no server.
 //!
 //!   cargo run -p transfer --example stream
 //!
-//! A publisher writes a short "video" as a signed feed and announces it on the
-//! DHT under a *blinded, rotating topic* — conceptually `H(feed_key ‖ epoch)`
-//! (concretely `crypto`'s per-epoch keyed-BLAKE3 `blinded_topic`), not the
-//! cleartext key. A viewer, knowing only the feed key, computes the same topic,
-//! looks it up to discover *who* serves the content, punches a direct connection
-//! to that node, and streams the video back — verifying every frame against the
-//! publisher's signature.
+//! A publisher writes a short signed feed (a handful of content blocks — this
+//! demo doesn't care what they are) and announces it on the DHT under a *blinded,
+//! rotating topic* — conceptually `H(feed_key ‖ epoch)` (concretely `crypto`'s
+//! per-epoch keyed-BLAKE3 `blinded_topic`), not the cleartext key. A reader,
+//! knowing only the feed key, computes the same topic, looks it up to discover
+//! *who* serves the content, punches a direct connection to that node, and streams
+//! the feed back — verifying every block against the publisher's signature.
 //!
 //! Two censorship properties are visible in the log:
 //!  * the publisher's DHT node id is random, so the feed key is not a node id —
@@ -66,9 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Publisher ------------------------------------------------------------
     let feed_kp = Keypair::from_seed(&[42u8; 32]);
     let feed_pk = feed_kp.public();
-    // The feed key is the video id and the content key you verify against. The
-    // node id is random — the key is not the publisher's node id. Content is
-    // discovered under a blinded topic that rotates with the epoch, not the key.
+    // The feed key is the content id and the key you verify against. The node id is
+    // random — the key is not the publisher's node id. Content is discovered under
+    // a blinded topic that rotates with the epoch, not the key.
     let node_id = rng.node_id();
     assert_ne!(
         node_id.as_bytes(),
@@ -82,26 +82,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ep = epoch(now_secs, EPOCH_LEN_SECS);
     let topic = |e: u64| NodeId::from_bytes(feed_pk.blinded_topic(e));
 
-    // Each "frame" is ~40 KiB — larger than a single UDP datagram — so streaming
-    // it exercises the transport's fragmentation: every block is split across
-    // many datagrams and reassembled (then verified) on the viewer's side.
-    let frames: Vec<Vec<u8>> = (0..8)
+    // Each block is ~40 KiB — larger than a single UDP datagram — so streaming it
+    // exercises the transport's fragmentation: every block is split across many
+    // datagrams and reassembled (then verified) on the reader's side.
+    let blocks: Vec<Vec<u8>> = (0..8)
         .map(|i| {
-            let mut frame = format!("frame {i:02}: ").into_bytes();
-            frame.resize(40_000, i);
-            frame
+            let mut block = format!("block {i:02}: ").into_bytes();
+            block.resize(40_000, i);
+            block
         })
         .collect();
-    let total_bytes: usize = frames.iter().map(Vec::len).sum();
+    let total_bytes: usize = blocks.iter().map(Vec::len).sum();
 
     let mut log = Log::new(feed_kp);
-    for frame in &frames {
-        log.append(frame.clone());
+    for block in &blocks {
+        log.append(block.clone());
     }
     let log = Arc::new(log);
 
     println!(
-        "[publish] feed key    0x{}…  (the video id and the key every frame is verified against)",
+        "[publish] feed key    0x{}…  (the content id and the key every block is verified against)",
         short(feed_pk.as_bytes())
     );
     println!(
@@ -113,10 +113,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         short(topic(ep).as_bytes())
     );
     println!(
-        "[publish] wrote {} frames ({} KiB total, ~{} KiB each — a frame is larger than one datagram) to a signed feed",
-        frames.len(),
+        "[publish] wrote {} blocks ({} KiB total, ~{} KiB each — a block is larger than one datagram) to a signed feed",
+        blocks.len(),
         total_bytes / 1024,
-        total_bytes / frames.len() / 1024,
+        total_bytes / blocks.len() / 1024,
     );
 
     let publisher = Node::bind(lo, node_id).await?;
@@ -150,7 +150,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ep + 1
     );
 
-    // Serve one inbound viewer.
+    // Serve one inbound reader.
     let serve_log = log.clone();
     let serve_node = publisher.clone();
     tokio::spawn(async move {
@@ -159,22 +159,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    // --- Viewer ---------------------------------------------------------------
-    println!("\n[viewer]  knows only the feed key. Joining the DHT...");
-    let viewer = Node::bind(lo, rng.node_id()).await?;
-    viewer.add_contact(bootstrap).await?;
-    timeout(T, viewer.bootstrap()).await??;
+    // --- Reader ---------------------------------------------------------------
+    println!("\n[reader]  knows only the feed key. Joining the DHT...");
+    let reader = Node::bind(lo, rng.node_id()).await?;
+    reader.add_contact(bootstrap).await?;
+    timeout(T, reader.bootstrap()).await??;
 
     // Decoupling, made visible: the feed key is not a node id, so dialing it
     // directly (what a censor who scraped the key would try) reaches no one.
-    println!("[viewer]  the feed key is not a node id — dialing it directly finds no publisher:");
-    let by_key = timeout(T, viewer.connect(NodeId::from_bytes(feed_pk.to_bytes()))).await??;
-    println!("[viewer]  → {:?}", by_key.outcome);
+    println!("[reader]  the feed key is not a node id — dialing it directly finds no publisher:");
+    let by_key = timeout(T, reader.connect(NodeId::from_bytes(feed_pk.to_bytes()))).await??;
+    println!("[reader]  → {:?}", by_key.outcome);
 
     // The real path: compute the same blinded topic from the feed key and look it
     // up (current + previous epoch, for boundary overlap), then connect to the
     // discovered random-id provider.
-    let viewer_ep = epoch(
+    let reader_ep = epoch(
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system clock before 1970")
@@ -182,14 +182,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         EPOCH_LEN_SECS,
     );
     println!(
-        "[viewer]  deriving the blinded topic from the feed key for epoch {viewer_ep} = 0x{}… and looking it up (+ previous epoch)...",
-        short(topic(viewer_ep).as_bytes())
+        "[reader]  deriving the blinded topic from the feed key for epoch {reader_ep} = 0x{}… and looking it up (+ previous epoch)...",
+        short(topic(reader_ep).as_bytes())
     );
     // Always query both the current and previous epoch and merge — the publisher
     // might be present under one but not the other (partial DHT replication), and
     // `saturating_sub` keeps epoch 0 from underflowing.
-    let mut providers = timeout(T, viewer.lookup(topic(viewer_ep))).await??;
-    for c in timeout(T, viewer.lookup(topic(viewer_ep.saturating_sub(1)))).await?? {
+    let mut providers = timeout(T, reader.lookup(topic(reader_ep))).await??;
+    for c in timeout(T, reader.lookup(topic(reader_ep.saturating_sub(1)))).await?? {
         if !providers.iter().any(|p| p.id == c.id) {
             providers.push(c);
         }
@@ -199,34 +199,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|c| c.id == node_id)
         .ok_or("no provider announced under the blinded topic")?;
     println!(
-        "[viewer]  found provider node 0x{}… — connecting and hole-punching a direct channel...",
+        "[reader]  found provider node 0x{}… — connecting and hole-punching a direct channel...",
         short(provider.id.as_bytes())
     );
-    let conn = timeout(T, viewer.connect(provider.id)).await??;
+    let conn = timeout(T, reader.connect(provider.id)).await??;
     let outcome = conn.outcome;
     let mut channel = conn.channel.ok_or_else(|| {
         format!("connect resolved {outcome:?} with no data channel (a Relayed outcome yields none by design)")
     })?;
-    println!("[viewer]  connected: {outcome:?} — a direct path, no server relaying");
+    println!("[reader]  connected: {outcome:?} — a direct path, no server relaying");
 
-    println!("[viewer]  streaming frames over the punched channel — each split across datagrams, reassembled, and verified...");
+    println!("[reader]  streaming blocks over the punched channel — each split across datagrams, reassembled, and verified...");
     let received = timeout(T, download_feed(&mut channel, feed_pk, &Config::default())).await??;
 
     // --- Result ---------------------------------------------------------------
-    let ok = received == frames;
+    let ok = received == blocks;
     let got_bytes: usize = received.iter().map(Vec::len).sum();
     println!(
-        "[viewer]  ✓ received {}/{} frames ({} bytes), every frame verified against the publisher's signature",
+        "[reader]  ✓ received {}/{} blocks ({} bytes), every block verified against the publisher's signature",
         received.len(),
-        frames.len(),
+        blocks.len(),
         got_bytes
     );
     println!(
-        "\n[done]    the viewer reconstructed the exact video with no server in the path: {}",
+        "\n[done]    the reader reconstructed the exact feed with no server in the path: {}",
         if ok { "match ✓" } else { "MISMATCH ✗" }
     );
     if !ok {
-        return Err("reconstructed video did not match".into());
+        return Err("reconstructed feed did not match".into());
     }
     Ok(())
 }

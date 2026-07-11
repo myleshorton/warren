@@ -156,6 +156,18 @@ pub async fn download_feed<L: Link>(
     public_key: PublicKey,
     cfg: &Config,
 ) -> Result<Vec<Vec<u8>>, TransferError> {
+    Ok(download_feed_full(channel, public_key, cfg).await?.1)
+}
+
+/// Like [`download_feed`], but also return the feed's signed head — everything a
+/// mirror needs to build a [`feed::Replica`] (`Replica::new(key, head, blocks)`).
+/// The head is `None` only if the feed served nothing (never, in practice — a
+/// download always fetches the head first).
+pub async fn download_feed_full<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    cfg: &Config,
+) -> Result<(Option<feed::Head>, Vec<Vec<u8>>), TransferError> {
     let mut dl = FeedDownload::new(public_key);
     let mut wire = Wire::new(
         channel,
@@ -167,7 +179,92 @@ pub async fn download_feed<L: Link>(
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
     }
-    Ok(dl.into_blocks())
+    Ok((dl.head().cloned(), dl.into_blocks()))
+}
+
+/// Subscribe to a feed and deliver its blocks **as they are appended**, over a
+/// persistent `channel` against a peer serving [`serve_feed_tail`]. Each round:
+/// poll the head (the server holds this until the feed grows past our cursor),
+/// fetch `from..head.len` (every block verified against the signed head), deliver
+/// the new tail via `on_block`, advance the cursor, repeat. The tail is
+/// transferred once — never re-fetched. Returns only on a channel error; a live
+/// subscription otherwise runs until the future is dropped/aborted. `from` is how
+/// many blocks the caller already has (0 to tail from the start).
+pub async fn subscribe_feed<L, F>(
+    channel: &mut L,
+    public_key: PublicKey,
+    mut from: u64,
+    cfg: &Config,
+    mut on_block: F,
+) -> Result<(), TransferError>
+where
+    L: Link,
+    F: FnMut(u64, Vec<u8>),
+{
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
+    loop {
+        // Poll for the head — the server holds this until there are new blocks.
+        let head = exchange(&mut wire, &Message::Tail { have: from }, cfg).await?;
+        let mut dl = FeedDownload::resume(public_key, from);
+        dl.handle_response(&head)?;
+        while let Some(request) = dl.poll_request() {
+            let response = exchange(&mut wire, &request, cfg).await?;
+            dl.handle_response(&response)?;
+        }
+        let next = dl.head().map(|h| h.len).unwrap_or(from);
+        for (offset, block) in dl.into_blocks().into_iter().enumerate() {
+            on_block(from + offset as u64, block);
+        }
+        // Never let the cursor go backwards: on failover to a provider whose head is
+        // temporarily behind ours (or a buggy/hostile one reporting a short head), a
+        // regressing cursor would re-fetch and re-deliver already-seen blocks.
+        from = next.max(from);
+    }
+}
+
+/// Live-replicate a feed into a shared [`feed::Replica`]: tail `public_key`'s feed
+/// and, as blocks arrive, **advance** `into` and fire `appended` — so this node
+/// keeps an always-current, verified copy it can serve on the author's behalf
+/// (pair with [`serve_feed_tail`] over the same `Replica`). This is a blind
+/// mirror's store-and-forward. `into` must already hold a (possibly empty) prefix
+/// of the feed — bootstrap it with a one-shot [`download_feed`] + [`feed::Replica::new`]
+/// first; replication resumes from its current length. Runs until the channel breaks.
+pub async fn replicate_feed<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    into: &std::sync::Mutex<feed::Replica>,
+    appended: &tokio::sync::Notify,
+    cfg: &Config,
+) -> Result<(), TransferError> {
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
+    loop {
+        let from = into.lock().expect("replica").len() as u64;
+        let head_msg = exchange(&mut wire, &Message::Tail { have: from }, cfg).await?;
+        let mut dl = FeedDownload::resume(public_key, from);
+        dl.handle_response(&head_msg)?;
+        while let Some(request) = dl.poll_request() {
+            let response = exchange(&mut wire, &request, cfg).await?;
+            dl.handle_response(&response)?;
+        }
+        let head = dl.head().cloned();
+        let new_blocks = dl.into_blocks();
+        if !new_blocks.is_empty() {
+            if let Some(head) = head {
+                into.lock().expect("replica").advance(head, new_blocks);
+                appended.notify_waiters(); // wake subscribers tailing *this* mirror
+            }
+        }
+    }
 }
 
 /// Download and verify a whole blob over `channel`, returning its bytes. Trust
@@ -605,7 +702,30 @@ pub async fn serve_feed<L: Link>(
     log: &feed::Log,
     cfg: &Config,
 ) -> Result<(), TransferError> {
-    serve(channel, cfg, |request| sync::serve_feed(request, log)).await
+    serve(channel, cfg, None, |request| sync::serve_feed(request, log)).await
+}
+
+/// Like [`serve_feed`], but serve a **live subscriber**: when the client polls
+/// with [`sync::Message::Tail`] and the feed hasn't grown past its cursor, hold
+/// the reply until `appended` is signaled (or a keepalive elapses), so the
+/// subscriber is pushed new blocks the moment they land instead of polling. The
+/// caller must signal `appended` (e.g. `notify_waiters()`) whenever it appends a
+/// block to `log`.
+///
+/// Unlike [`serve_feed`], the log is a `Mutex` locked **per reply**, never across
+/// the (unbounded) session — otherwise a live subscriber would hold the lock
+/// forever and block every append. Each `serve_feed` answer is a pure, non-async
+/// computation, so no lock is held across an `.await`.
+pub async fn serve_feed_tail<L: Link, S: feed::Source>(
+    channel: &mut L,
+    source: &std::sync::Mutex<S>,
+    appended: &tokio::sync::Notify,
+    cfg: &Config,
+) -> Result<(), TransferError> {
+    serve(channel, cfg, Some(appended), |request| {
+        sync::serve_feed(request, &*source.lock().expect("feed source"))
+    })
+    .await
 }
 
 /// Serve blob sync requests on `channel` from a local [`blob::Store`]. The store
@@ -616,7 +736,10 @@ pub async fn serve_blob<L: Link>(
     store: &blob::Store,
     cfg: &Config,
 ) -> Result<(), TransferError> {
-    serve(channel, cfg, |request| sync::serve_blob(request, store)).await
+    serve(channel, cfg, None, |request| {
+        sync::serve_blob(request, store)
+    })
+    .await
 }
 
 /// Send `request` and return the verified response, repairing losses as it goes.
@@ -682,6 +805,7 @@ async fn exchange<L: Link>(
 async fn serve<L: Link>(
     channel: &L,
     cfg: &Config,
+    tail: Option<&tokio::sync::Notify>,
     respond: impl Fn(&Message) -> Message,
 ) -> Result<(), TransferError> {
     // The pacer caps the RTT it uses at request_timeout, so no single pacing
@@ -742,7 +866,37 @@ async fn serve<L: Link>(
                     lost = false;
                     last_request = Some(request.clone());
                 }
-                wire.send(&respond(&request)).await?;
+                let mut response = respond(&request);
+                // Live-tail: if this is a subscription poll (`Tail`) and the feed
+                // hasn't grown past the subscriber's cursor, hold the reply until an
+                // append is signaled — bounded by a keepalive kept under the client's
+                // stall bound, so it heartbeats rather than timing out. This is server
+                // push (new blocks the instant they land), not client polling.
+                if let (Some(notify), Message::Tail { have }) = (tail, &request) {
+                    let keepalive = cfg.request_timeout / 2;
+                    // Hold only while *exactly* at head (`len == have`); a cursor past
+                    // the head is abnormal and shouldn't incur a keepalive delay.
+                    while matches!(&response, Message::Head(h) if h.len == *have) {
+                        // Register the wake *before* re-reading the head:
+                        // `notify_waiters()` wakes only already-registered waiters (it
+                        // stores no permit), so an append signaled between the read and
+                        // the await would otherwise be missed and the push delayed to
+                        // the keepalive. `enable()` registers now; the re-check right
+                        // after it catches an append that landed in the gap.
+                        let notified = notify.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
+                        response = respond(&request);
+                        if !matches!(&response, Message::Head(h) if h.len == *have) {
+                            break; // grew in the gap: send the new head now
+                        }
+                        if timeout(keepalive, notified).await.is_err() {
+                            break; // keepalive elapsed: heartbeat the unchanged head
+                        }
+                        response = respond(&request); // an append woke us: re-read
+                    }
+                }
+                wire.send(&response).await?;
                 last_reply_at = Some(Instant::now());
                 deadline = Instant::now() + cfg.idle;
             }
@@ -1123,5 +1277,175 @@ mod tests {
         );
         served.expect("server ends cleanly on idle");
         assert_eq!(downloaded.expect("download verifies"), expected);
+    }
+
+    #[tokio::test]
+    async fn subscribe_receives_live_appends() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio::sync::Notify;
+
+        let kp = Keypair::from_seed(&[9u8; 32]);
+        let public_key = kp.public();
+        let log = Arc::new(StdMutex::new(Log::new(kp)));
+        // Two blocks exist before anyone subscribes.
+        {
+            let mut l = log.lock().unwrap();
+            l.append(vec![0u8; 100]);
+            l.append(vec![1u8; 100]);
+        }
+        let appended = Arc::new(Notify::new());
+        let (mut client, mut server) = lossy_pair(&[], &[]);
+        let cfg = fast_cfg();
+
+        // Server tails forever; client subscribes from 0 and forwards each block.
+        let srv_log = log.clone();
+        let srv_appended = appended.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = serve_feed_tail(&mut server, &srv_log, &srv_appended, &cfg).await;
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client_task = tokio::spawn(async move {
+            let _ = subscribe_feed(&mut client, public_key, 0, &cfg, move |index, block| {
+                let _ = tx.send((index, block));
+            })
+            .await;
+        });
+
+        // The two existing blocks arrive.
+        assert_eq!(rx.recv().await.unwrap(), (0, vec![0u8; 100]));
+        assert_eq!(rx.recv().await.unwrap(), (1, vec![1u8; 100]));
+
+        // A block appended *after* subscribing is pushed to the subscriber — no
+        // reconnect, no re-fetch of the earlier blocks.
+        {
+            log.lock().unwrap().append(vec![2u8; 100]);
+        }
+        appended.notify_waiters();
+        assert_eq!(rx.recv().await.unwrap(), (2, vec![2u8; 100]));
+
+        // And another, to confirm the tail keeps flowing.
+        {
+            log.lock().unwrap().append(vec![3u8; 100]);
+        }
+        appended.notify_waiters();
+        assert_eq!(rx.recv().await.unwrap(), (3, vec![3u8; 100]));
+
+        server_task.abort();
+        client_task.abort();
+    }
+
+    #[tokio::test]
+    async fn subscribe_tails_a_growing_replica() {
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio::sync::Notify;
+
+        let kp = Keypair::from_seed(&[0x2Au8; 32]);
+        let pk = kp.public();
+        // An author log, used here only to mint signed heads + blocks; the *mirror*
+        // holds a Replica of it and serves that — the author isn't in this exchange.
+        let mut author = Log::new(kp);
+        author.append(vec![0u8; 80]);
+        author.append(vec![1u8; 80]);
+        let seed: Vec<Vec<u8>> = (0..author.len())
+            .map(|i| author.get(i).unwrap().to_vec())
+            .collect();
+        let replica = Arc::new(StdMutex::new(
+            feed::Replica::new(pk, author.head(), seed).expect("faithful replica"),
+        ));
+        let appended = Arc::new(Notify::new());
+        let (mut client, mut server) = lossy_pair(&[], &[]);
+        let cfg = fast_cfg();
+
+        let srv_replica = replica.clone();
+        let srv_appended = appended.clone();
+        let server_task = tokio::spawn(async move {
+            let _ = serve_feed_tail(&mut server, &srv_replica, &srv_appended, &cfg).await;
+        });
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let client_task = tokio::spawn(async move {
+            let _ = subscribe_feed(&mut client, pk, 0, &cfg, move |index, block| {
+                let _ = tx.send((index, block));
+            })
+            .await;
+        });
+
+        // The mirror serves the two blocks it already holds.
+        assert_eq!(rx.recv().await.unwrap(), (0, vec![0u8; 80]));
+        assert_eq!(rx.recv().await.unwrap(), (1, vec![1u8; 80]));
+
+        // The author appends; the mirror advances its replica + signals — the
+        // subscriber is pushed the new block straight from the mirror, verified.
+        author.append(vec![2u8; 80]);
+        let new = vec![author.get(2).unwrap().to_vec()];
+        assert!(replica.lock().unwrap().advance(author.head(), new));
+        appended.notify_waiters();
+        assert_eq!(rx.recv().await.unwrap(), (2, vec![2u8; 80]));
+
+        server_task.abort();
+        client_task.abort();
+    }
+
+    #[tokio::test]
+    async fn replicate_maintains_a_live_replica() {
+        use feed::Source as _;
+        use std::sync::{Arc, Mutex as StdMutex};
+        use tokio::sync::Notify;
+
+        let kp = Keypair::from_seed(&[0x3Bu8; 32]);
+        let pk = kp.public();
+        let author = Arc::new(StdMutex::new(Log::new(kp)));
+        author.lock().unwrap().append(vec![0u8; 60]);
+        let author_appended = Arc::new(Notify::new());
+
+        // The mirror bootstraps a Replica of the author's current feed (1 block),
+        // then keeps it current by replicating.
+        let (head0, block0) = {
+            let a = author.lock().unwrap();
+            (a.head(), a.get(0).unwrap().to_vec())
+        };
+        let mirror = Arc::new(StdMutex::new(
+            feed::Replica::new(pk, head0, vec![block0]).expect("faithful replica"),
+        ));
+
+        let (mut mirror_client, mut author_server) = lossy_pair(&[], &[]);
+        let cfg = fast_cfg();
+
+        let a_log = author.clone();
+        let a_app = author_appended.clone();
+        let author_task = tokio::spawn(async move {
+            let _ = serve_feed_tail(&mut author_server, &a_log, &a_app, &cfg).await;
+        });
+        let m_rep = mirror.clone();
+        let mirror_appended = Arc::new(Notify::new());
+        let m_app = mirror_appended.clone();
+        let mirror_task = tokio::spawn(async move {
+            let _ = replicate_feed(&mut mirror_client, pk, &m_rep, &m_app, &cfg).await;
+        });
+
+        // The author appends a second block; the mirror's replica catches up on its
+        // own — no manual advance, straight off the live tail.
+        author.lock().unwrap().append(vec![1u8; 60]);
+        author_appended.notify_waiters();
+        for _ in 0..100 {
+            if mirror.lock().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let r = mirror.lock().unwrap();
+        assert_eq!(r.len(), 2, "the mirror replicated the new block");
+        // The replicated block verifies against the author's signed head.
+        let head = r.head();
+        assert!(feed::verify_block(
+            &pk,
+            &head,
+            1,
+            r.get(1).unwrap(),
+            &r.proof(1).unwrap()
+        ));
+        drop(r);
+
+        author_task.abort();
+        mirror_task.abort();
     }
 }

@@ -11,6 +11,10 @@ publish = false
 ed25519-dalek = "2"
 blake3 = "1"
 getrandom = "0.2"
+# Content-encryption envelope (crypto::seal): a seekable stream cipher for
+# confidentiality + an AEAD for key-wrapping. Policy-free building blocks.
+chacha20 = "0.9"
+chacha20poly1305 = "0.10"
 thiserror.workspace = true
 
 [dev-dependencies]

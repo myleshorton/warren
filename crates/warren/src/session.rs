@@ -250,6 +250,7 @@ impl Session {
             body: None,
             meta,
             enc: enc.clone(),
+            ..Default::default()
         };
         let line = serde_json::to_string(&record).unwrap_or_default();
         self.log

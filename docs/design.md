@@ -253,6 +253,6 @@ censorship-resistant rendezvous, rather than a fixed, blockable set.
 | Streaming download: bounded-window fetch, in-order delivery, drop-after-deliver | built |
 | Live-tail feed replication (subscribe to appends; the real-time / chat unlock) | built (Layer 1) — [`live-tail.md`](live-tail.md) |
 | Swarm-failover subscription + blind-mirror store-and-forward (verified replicas) | built (Layer 2) — [`live-tail.md`](live-tail.md) |
-| Multi-writer causal merge (Autobase-style; concurrent-writer chat rooms) | planned (Layer 3) |
+| Multi-writer causal merge (Autobase-style; concurrent-writer chat rooms) | substrate built (Layer 3) — [`multi-writer.md`](multi-writer.md); live app glue remains |
 | Blind push notifier (iOS/Android background wake without breaking serverless) | design — [`blind-notifier.md`](blind-notifier.md) |
 | Background seeder inside the VPN Network Extension (sustained iOS availability) | design — [`ios-vpn-extension-seeder.md`](ios-vpn-extension-seeder.md) |

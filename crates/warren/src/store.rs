@@ -172,6 +172,7 @@ mod tests {
                 body: None,
                 meta: serde_json::Map::new(),
                 enc: None,
+                ..Default::default()
             };
             serde_json::to_string(&rec).unwrap()
         };

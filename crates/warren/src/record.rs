@@ -7,10 +7,14 @@
 //! (a video title, a chat reply-to, …). `enc` is present when the payload is
 //! encrypted. Murmur's video post is one specialization; a chat message is another.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
+use crate::{merge, util};
+
 /// A signed feed record, content-agnostic.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Record {
     /// The author's feed public key (hex) — the content identity. Often implied by
     /// the feed a record lives in, but carried explicitly for merged views.
@@ -34,6 +38,51 @@ pub struct Record {
     /// Encryption envelope; present ⇒ `blob` / `body` are ciphertext.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enc: Option<Enc>,
+    /// Causal clock for multi-writer merge (Layer 3): `clock[author_hex] = k` means
+    /// this record causally follows the first `k` records of that author (a version
+    /// vector, see [`merge`]). Empty — and omitted on the wire — for single-author
+    /// content (e.g. a video post) that needs no cross-writer ordering.
+    #[serde(default, skip_serializing_if = "is_empty_clock")]
+    pub clock: BTreeMap<String, u64>,
+    /// Lamport timestamp for merge ordering (`1 + max` over `clock`); `0` — and
+    /// omitted — when unused.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub lamport: u64,
+}
+
+impl Record {
+    /// This record's causal clock as [`merge::Clock`] (hex author keys decoded to
+    /// writer-id bytes). Malformed keys are skipped.
+    pub fn causal_clock(&self) -> merge::Clock {
+        self.clock
+            .iter()
+            .filter_map(|(k, &v)| util::bytes_from_hex::<32>(k).map(|w| (w, v)))
+            .collect()
+    }
+
+    /// Bridge this record into a [`merge::Entry`] positioned at `index` in its author's
+    /// feed, consuming it as the entry's opaque payload. `None` if `author` isn't a
+    /// valid 32-byte hex key.
+    pub fn into_entry(self, index: u64) -> Option<merge::Entry<Record>> {
+        let writer = util::bytes_from_hex::<32>(&self.author)?;
+        let lamport = self.lamport;
+        let clock = self.causal_clock();
+        Some(merge::Entry {
+            writer,
+            index,
+            lamport,
+            clock,
+            payload: self,
+        })
+    }
+}
+
+fn is_empty_clock(m: &BTreeMap<String, u64>) -> bool {
+    m.is_empty()
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// Per-item encryption envelope carried in the (signed) record: the payload's

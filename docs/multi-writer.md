@@ -1,8 +1,9 @@
 # Warren — multi-writer causal merge (Layer 3, design note)
 
-**Status:** Layer 3a (the pure linearizer) built (2026-07-11); wiring into records +
-the session and an app room view are follow-on. A companion to
-[`live-tail.md`](live-tail.md) and [`design.md`](design.md).
+**Status:** the Layer 3 **substrate** is built (2026-07-11) — the pure linearizer, the
+record clock, and the `Room` view/frontier. What remains is the live-network/app glue
+(feed a chat app's subscribed blocks into a `Room` and publish with a room clock). A
+companion to [`live-tail.md`](live-tail.md) and [`design.md`](design.md).
 
 ## The problem
 
@@ -45,36 +46,48 @@ deterministically into one linear view.
   then becomes orderable. So the view is *eventually* consistent: the linearizable
   prefix grows as feeds fill in, and never reorders what it has already shown.
 
-## What Layer 3a builds (this increment)
+## What's built (the substrate)
 
-`warren::merge` — the pure core, sans-IO and exhaustively testable:
-
+**L3a — `warren::merge`, the pure linearizer** (sans-IO, exhaustively testable):
 - `Clock` (a version vector over `WriterId = [u8; 32]`) and `Entry<T>` (a record's
   causal metadata + an opaque payload the merge layer never inspects).
 - `linearize(entries) -> Linearized { ordered, pending }` — the Kahn topological sort
   with the `(lamport, writer, index)` tiebreak, splitting off records with missing
   ancestors as `pending`.
-- `next_lamport` / clock helpers for the append side.
+- `next_lamport` for the append side.
+- Tests assert the two things that matter: **causal order is respected**, and **the
+  output is identical across shuffled / subset inputs** (convergence + the grow-only
+  pending frontier).
 
-Tests assert the two things that matter: **causal order is respected**, and
-**the output is identical across shuffled / subset inputs** (convergence + the
-grow-only pending frontier).
+**L3b — the clock in the record envelope** (`warren::record`):
+- `Record` gains optional `clock` (author-hex → seen-len version vector) and `lamport`
+  fields, serde-default and omitted on the wire when empty/zero — so single-author
+  content (a video post) serializes byte-identically to before and nothing else moves.
+- `Record::into_entry(index)` / `causal_clock()` bridge a decoded record into a
+  `merge::Entry`, decoding the hex author key to a `WriterId`.
 
-## Follow-on (not yet built)
+**L3c — `warren::room`, the stateful view + frontier** (`Room`):
+- `observe(index, record)` accumulates decoded blocks; `view()` re-linearizes on
+  demand (ordered transcript + pending).
+- `frontier()` is the observed version vector (contiguous prefix per writer);
+  `next_message_clock()` returns the `(clock, lamport)` a new local message should
+  carry so it causally follows everything this node has seen.
+- Tests: two-writer merge, contiguous-only frontier, a stamped message sorting after
+  all it observed, reply-before-cause held pending then resolved, idempotent observe.
 
-- **L3b — carry the clock in the record + session glue.** Add the version vector +
-  Lamport to the record envelope (a `meta` field or a dedicated one), compute it at
-  publish time from the room's observed frontier, and expose a session helper that
-  feeds subscribed blocks through `linearize` and hands the app the ordered view +
-  the pending frontier as feeds live-update.
-- **L3c — the app room view.** Murmur (or a chat app) materializes the ordered
-  records into a transcript, updating as `subscribe` delivers new blocks.
+## Follow-on (the live glue)
+
+- **Wire it to the network path.** A chat app: subscribe to each room member's feed
+  (Layer 2), `Room::observe` every delivered block (its feed index is the block's
+  position), render `view().ordered`, and on send stamp the record with
+  `Room::next_message_clock()` before `Session::publish`. No substrate changes — this
+  is app wiring on top of what's built.
 - **Writer-set management.** First cut: the writer set is the room's discovered
-  members (the PSK channel). Explicit add/remove-writer records (membership as
-  data, Autobase-style) are a later refinement.
+  members (the PSK channel). Explicit add/remove-writer records (membership as data,
+  Autobase-style) are a later refinement.
 - **Presence / typing** stays *out* of the signed log — ephemeral signals ride as
   plain datagrams on the open channel, never appended (see the live-tail note).
 
 The point, as with sync: the hard part is a **pure, deterministic, convergent**
-algorithm that can be proven on the bench; the network layer already carries the
-records it needs.
+algorithm proven on the bench; the substrate is complete, and the network layer
+already carries the records it needs.

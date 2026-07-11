@@ -48,11 +48,19 @@ pub struct Discovered {
     /// The members found online (including ourselves) — for the app's bootstrap
     /// cache; the caller filters out its own id.
     pub members: Vec<swarm::Contact>,
+    /// Every member we connected to and downloaded a feed from, with its node id +
+    /// feed key — **including members whose feed was empty**. An app resolving a
+    /// list/label author by feed key (e.g. a moderation list published by someone
+    /// with no posts of their own) needs these, not just the record authors.
+    pub reached: Vec<(swarm::NodeId, crypto::PublicKey)>,
     /// How many members we connected to and downloaded a feed from.
     pub connected: usize,
 }
 
-/// A running session over one channel.
+/// A running session over one channel. Cheap to `clone` — every field is a handle
+/// (the node, `Arc`-shared log/store/held/clip-keys, a copied key) — so a clone is
+/// the *same* session, which lets an app move one into a spawned task.
+#[derive(Clone)]
 pub struct Session {
     /// The DHT node, exposed so the app can announce + run its own accept loop.
     pub node: driver::Node,
@@ -240,7 +248,7 @@ impl Session {
 
         let me = self.node.id();
         let mut records = Vec::new();
-        let mut connected = 0usize;
+        let mut reached = Vec::new();
         let mut clip_keys = Vec::new();
         for member in &members {
             if member.id == me {
@@ -249,7 +257,7 @@ impl Session {
             if let Some((blocks, pubkey)) =
                 protocol::fetch_feed(&self.node, member.id, protocol::REQ_FEED, &cfg).await
             {
-                connected += 1;
+                reached.push((member.id, pubkey));
                 for b in blocks {
                     if let Ok(rec) = serde_json::from_slice::<Record>(&b) {
                         if let (Some(blob), Some(enc)) = (&rec.blob, &rec.enc) {
@@ -263,9 +271,11 @@ impl Session {
         if !clip_keys.is_empty() {
             self.clip_keys.lock().expect("clip_keys").extend(clip_keys);
         }
+        let connected = reached.len();
         Discovered {
             records,
             members,
+            reached,
             connected,
         }
     }

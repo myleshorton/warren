@@ -15,6 +15,7 @@ pub mod channel;
 pub mod invite;
 pub mod protocol;
 pub mod record;
+pub mod session;
 pub mod store;
 pub mod util;
 

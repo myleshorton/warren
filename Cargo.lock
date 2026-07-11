@@ -899,6 +899,7 @@ dependencies = [
  "serde_json",
  "swarm",
  "tempfile",
+ "tokio",
  "transfer",
 ]
 

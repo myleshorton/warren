@@ -45,8 +45,16 @@ fn feed_path(data_dir: &Path) -> PathBuf {
     data_dir.join("feed.jsonl")
 }
 
-fn blob_path(data_dir: &Path, blob_hex: &str) -> PathBuf {
-    blobs_dir(data_dir).join(format!("{blob_hex}.bin"))
+/// A content id is lowercase hex, so it can never contain a path separator or
+/// `..`. Validate before building a path from it, so a malformed or hostile
+/// `blob` field (e.g. from a record synced off the network) can't escape the
+/// blobs directory — the store never trusts the caller to have sanitized it.
+fn is_hex_id(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+fn blob_path(data_dir: &Path, blob_hex: &str) -> Option<PathBuf> {
+    is_hex_id(blob_hex).then(|| blobs_dir(data_dir).join(format!("{blob_hex}.bin")))
 }
 
 fn peers_path(data_dir: &Path) -> PathBuf {
@@ -94,9 +102,11 @@ pub fn rebuild(
         // Re-ingest the blob bytes so we can serve them (content-addressed, so
         // re-splitting reproduces the same manifest/blob id).
         if let Some(blob_hex) = &record.blob {
-            if let Ok(bytes) = fs::read(blob_path(data_dir, blob_hex)) {
-                let manifest = store.add(&bytes);
-                store.put(manifest.encode());
+            if let Some(path) = blob_path(data_dir, blob_hex) {
+                if let Ok(bytes) = fs::read(path) {
+                    let manifest = store.add(&bytes);
+                    store.put(manifest.encode());
+                }
             }
         }
         records.push(record);
@@ -112,8 +122,10 @@ pub fn append_record(
     blob_bytes: &[u8],
     line: &str,
 ) -> std::io::Result<()> {
+    let path = blob_path(data_dir, blob_hex)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid blob id"))?;
     fs::create_dir_all(blobs_dir(data_dir))?;
-    fs::write(blob_path(data_dir, blob_hex), blob_bytes)?;
+    fs::write(path, blob_bytes)?;
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -183,5 +195,18 @@ mod tests {
         assert_eq!(log.len(), 2, "both feed blocks restored");
         assert_eq!(records[0].blob.as_deref(), Some("aa01"));
         assert_eq!(records[1].content_type, "application/octet-stream");
+    }
+
+    #[test]
+    fn append_rejects_non_hex_blob_id() {
+        // A blob id is always lowercase hex; anything else (path separators, `..`,
+        // non-hex) is rejected before it can touch the filesystem.
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["../escape", "a/b", "..", "zz", ""] {
+            assert!(
+                append_record(dir.path(), bad, b"x", "{}").is_err(),
+                "rejected {bad:?}"
+            );
+        }
     }
 }

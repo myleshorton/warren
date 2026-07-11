@@ -31,8 +31,11 @@ store-and-forward on top. A companion to [`design.md`](design.md).
   the whole loop: author publishes → mirror replicates → author goes offline →
   subscriber fails over to the mirror and tails the full, verified feed.
 
-**Still ahead:** Layer 3 — deterministic multi-writer merge (Autobase-style, for chat
-rooms where many members write concurrently); see the scope notes at the end.
+**Layer 3 — deterministic multi-writer merge** (Autobase-style, for chat rooms where
+many members write concurrently) — the *substrate* is now built too: `warren::merge`
+(the convergent linearizer), the record clock, and `warren::room::Room`. See
+[`multi-writer.md`](multi-writer.md). What remains is the app wiring (a chat client
+driving the room view).
 
 The original design follows, for the rationale.
 

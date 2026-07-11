@@ -871,11 +871,26 @@ async fn serve<L: Link>(
                 // push (new blocks the instant they land), not client polling.
                 if let (Some(notify), Message::Tail { have }) = (tail, &request) {
                     let keepalive = cfg.request_timeout / 2;
-                    while matches!(&response, Message::Head(h) if h.len <= *have) {
-                        if timeout(keepalive, notify.notified()).await.is_err() {
-                            break; // keepalive elapsed: send the unchanged head
-                        }
+                    // Hold only while *exactly* at head (`len == have`); a cursor past
+                    // the head is abnormal and shouldn't incur a keepalive delay.
+                    while matches!(&response, Message::Head(h) if h.len == *have) {
+                        // Register the wake *before* re-reading the head:
+                        // `notify_waiters()` wakes only already-registered waiters (it
+                        // stores no permit), so an append signaled between the read and
+                        // the await would otherwise be missed and the push delayed to
+                        // the keepalive. `enable()` registers now; the re-check right
+                        // after it catches an append that landed in the gap.
+                        let notified = notify.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
                         response = respond(&request);
+                        if !matches!(&response, Message::Head(h) if h.len == *have) {
+                            break; // grew in the gap: send the new head now
+                        }
+                        if timeout(keepalive, notified).await.is_err() {
+                            break; // keepalive elapsed: heartbeat the unchanged head
+                        }
+                        response = respond(&request); // an append woke us: re-read
                     }
                 }
                 wire.send(&response).await?;

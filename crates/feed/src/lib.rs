@@ -531,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn replica_faithfully_reserves_a_feed() {
+    fn replica_faithfully_preserves_a_feed() {
         let log = log_with(10);
         let pk = log.public_key();
         let head = log.head();

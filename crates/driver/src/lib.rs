@@ -175,6 +175,12 @@ const RECV_BUF: usize = 4096;
 const REFLECTORS: usize = 3;
 /// How long to wait for each reflector to echo before trying the next.
 const REFLECT_TIMEOUT: Duration = Duration::from_millis(500);
+/// Upper bound on the run loop's idle sleep: even with no pending query/connect/probe
+/// (so `Dht::poll_timeout()` is `None`), wake at least this often to run
+/// `handle_timeout` — which expires stale provider-announce leases. Lease GC is
+/// coarse by nature, so a minute of slack is fine, and keeping it out of
+/// `poll_timeout` leaves that a pure protocol-timing signal (the sim relies on that).
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(60);
 
 /// A driver operation failed because the node's task is no longer running.
 ///
@@ -297,9 +303,10 @@ pub struct Node {
 
 /// A running periodic re-announce started by [`Node::keep_announced`]. Hold it
 /// for as long as the content should stay discoverable; dropping it stops the
-/// loop. (Announce records don't expire on their own, so a long-lived provider
-/// re-announces both to survive DHT churn — the closest-K set near a topic
-/// changes as peers come and go — and to follow a topic that rotates by epoch.)
+/// loop. Announce records expire unless refreshed, so a long-lived provider
+/// re-announces both to renew its lease, to survive DHT churn — the closest-K set
+/// near a topic changes as peers come and go — and to follow a topic that rotates
+/// by epoch.
 #[must_use = "dropping the Announcer immediately stops the re-announce loop; bind it to a variable that lives as long as you want to stay discoverable"]
 pub struct Announcer {
     task: tokio::task::JoinHandle<()>,
@@ -661,10 +668,16 @@ async fn run(
             let _ = socket.send_to(&t.data, t.to).await;
         }
 
-        // Sleep until the core's next deadline (or forever if it has none).
-        let delay = dht
-            .poll_timeout()
-            .map(|deadline| Duration::from_millis(deadline.saturating_sub(now())));
+        // Sleep until the core's next deadline, but never longer than the
+        // housekeeping interval — so time-based maintenance (expiring announce
+        // leases in handle_timeout) still runs on an otherwise-idle node, whose
+        // poll_timeout() is None because no query/connect/probe is pending.
+        let delay = match dht.poll_timeout() {
+            Some(deadline) => {
+                Duration::from_millis(deadline.saturating_sub(now())).min(HOUSEKEEPING_INTERVAL)
+            }
+            None => HOUSEKEEPING_INTERVAL,
+        };
 
         tokio::select! {
             cmd = cmd_rx.recv() => {
@@ -745,12 +758,7 @@ async fn run(
                     });
                 }
             }
-            _ = async {
-                match &delay {
-                    Some(d) => tokio::time::sleep(*d).await,
-                    None => std::future::pending::<()>().await,
-                }
-            } => {
+            _ = tokio::time::sleep(delay) => {
                 dht.handle_timeout(now());
             }
         }

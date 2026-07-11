@@ -35,6 +35,12 @@ const MAX_PENDING_INCOMING: usize = 256;
 /// when the routing table is too small for [`Dht::responsible_for`] to bite.
 const MAX_ANNOUNCE_TOPICS: usize = 65_536;
 
+/// How long a stored provider announcement remains valid without a refresh.
+/// Providers re-announce well inside this window (the driver example uses a
+/// 15-minute cadence), so an hour tolerates missed rounds while eventually
+/// removing departed or unreachable providers.
+pub const ANNOUNCE_TTL_MS: Millis = 60 * 60 * 1_000;
+
 /// Concurrency parameter: how many lookup requests may be in flight at once.
 pub const ALPHA: usize = 3;
 
@@ -232,6 +238,12 @@ struct IncomingState {
     deadline: Millis,
 }
 
+#[derive(Clone, Copy)]
+struct AnnounceRecord {
+    contact: Contact,
+    expires_at: Millis,
+}
+
 /// A Kademlia DHT node.
 pub struct Dht {
     id: NodeId,
@@ -244,7 +256,10 @@ pub struct Dht {
     /// This node's own firewall type, shared with peers during connect signaling.
     local_firewall: Firewall,
     /// topic -> peers that have announced under it (records this node stores).
-    announces: HashMap<NodeId, Vec<Contact>>,
+    announces: HashMap<NodeId, Vec<AnnounceRecord>>,
+    /// Earliest announcement expiry, cached so ordinary packet/timer handling can
+    /// skip a full record scan until at least one lease is actually due.
+    next_announce_expiry: Option<Millis>,
     /// Targets we are mid-connect to -> the connect's state (deadline + the
     /// coordinator we're expecting the reply from).
     connecting: HashMap<NodeId, ConnectState>,
@@ -276,6 +291,7 @@ impl Dht {
             self_reachable: false,
             local_firewall: Firewall::Open,
             announces: HashMap::new(),
+            next_announce_expiry: None,
             connecting: HashMap::new(),
             seen_initiators: VecDeque::new(),
             pending_incoming: HashMap::new(),
@@ -484,10 +500,15 @@ impl Dht {
                 }
             }
             Message::FindNode { target } => {
+                self.prune_announces_if_due(now);
                 let contacts = self.table.closest(&target, K);
                 // Include any announce records we hold for the queried target,
                 // so a lookup discovers announcers as it converges.
-                let peers = self.announces.get(&target).cloned().unwrap_or_default();
+                let peers = self
+                    .announces
+                    .get(&target)
+                    .map(|records| records.iter().map(|r| r.contact).collect())
+                    .unwrap_or_default();
                 self.send(from, packet.rid, Message::Nodes { contacts, peers });
             }
             Message::Nodes { contacts, peers } => {
@@ -497,7 +518,7 @@ impl Dht {
                 // Only store if we're plausibly responsible for the topic, so a
                 // remote can't grow our store with announces for arbitrary keys.
                 if self.responsible_for(&topic) {
-                    self.store_announce(topic, Contact::new(packet.sender, from));
+                    self.store_announce(topic, Contact::new(packet.sender, from), now);
                 }
             }
             Message::Reflect => {
@@ -553,6 +574,11 @@ impl Dht {
 
         // Expire NAT probes; a lost Pong simply yields one fewer sample.
         self.nat_pending.retain(|_, pending| pending.deadline > now);
+
+        // Provider announcements are leases, not permanent reservations. Remove
+        // expired records and their now-empty topic entries so departed providers
+        // cannot occupy a topic's bounded K slots forever.
+        self.prune_announces_if_due(now);
 
         // Fail connects whose signaling never completed, so they can't hang.
         let stale: Vec<NodeId> = self
@@ -685,17 +711,67 @@ impl Dht {
         self.firewall().unwrap_or(self.local_firewall)
     }
 
-    fn store_announce(&mut self, topic: NodeId, announcer: Contact) {
+    fn store_announce(&mut self, topic: NodeId, announcer: Contact, now: Millis) {
+        self.prune_announces_if_due(now);
         // Don't create a new topic entry past the absolute cap (existing topics
         // still accept updates), so memory stays bounded even in small networks.
         if !self.announces.contains_key(&topic) && self.announces.len() >= MAX_ANNOUNCE_TOPICS {
             return;
         }
+        let cached_min = self.next_announce_expiry;
         let records = self.announces.entry(topic).or_default();
-        if let Some(existing) = records.iter_mut().find(|c| c.id == announcer.id) {
-            existing.addr = announcer.addr; // refresh the mapping
+        let expires_at = now.saturating_add(ANNOUNCE_TTL_MS);
+        let mut refreshed_earliest = false;
+        if let Some(existing) = records.iter_mut().find(|r| r.contact.id == announcer.id) {
+            // If this record currently defines the cached earliest expiry, moving it
+            // later invalidates the cache and forces a recompute below.
+            refreshed_earliest = Some(existing.expires_at) == cached_min;
+            existing.contact.addr = announcer.addr;
+            existing.expires_at = expires_at;
         } else if records.len() < K {
-            records.push(announcer);
+            records.push(AnnounceRecord {
+                contact: announcer,
+                expires_at,
+            });
+        }
+        // Keep the cached earliest expiry correct with O(1) work in the common case:
+        // a new/refreshed record always carries the *latest* expiry, so it can only
+        // *set* the cache when empty, never lower it. The one case that needs a full
+        // rescan is refreshing the record that *was* the earliest — its expiry just
+        // moved later, so the new earliest is some other record.
+        if refreshed_earliest {
+            self.recompute_next_expiry();
+        } else {
+            self.next_announce_expiry =
+                Some(cached_min.map_or(expires_at, |current| current.min(expires_at)));
+        }
+    }
+
+    fn prune_announces(&mut self, now: Millis) {
+        self.announces.retain(|_, records| {
+            records.retain(|record| record.expires_at > now);
+            !records.is_empty()
+        });
+        self.recompute_next_expiry();
+    }
+
+    /// Refresh the cached earliest announce-lease expiry (the wakeup the driver's
+    /// housekeeping tick compares against) from the current record set.
+    fn recompute_next_expiry(&mut self) {
+        self.next_announce_expiry = self
+            .announces
+            .values()
+            .flatten()
+            .map(|record| record.expires_at)
+            .min();
+    }
+
+    fn prune_announces_if_due(&mut self, now: Millis) {
+        if self
+            .next_announce_expiry
+            .is_some_and(|expiry| expiry <= now)
+        {
+            self.prune_announces(now);
         }
     }
 
@@ -884,6 +960,7 @@ impl Dht {
         is_reply: bool,
         now: Millis,
     ) {
+        self.prune_announces_if_due(now);
         // `data_addrs` is untrusted wire input. A Signal with no candidate can
         // never lead to a punch, and a well-behaved peer never sends one (our
         // `connect`/`accept_connect` both require >= 1). Drop it as malformed on
@@ -931,8 +1008,8 @@ impl Dht {
             } else if let Some(target_addr) = self
                 .announces
                 .get(&target)
-                .and_then(|r| r.iter().find(|c| c.id == target))
-                .map(|c| c.addr)
+                .and_then(|r| r.iter().find(|r| r.contact.id == target))
+                .map(|r| r.contact.addr)
             {
                 // We are a coordinator: forward to the target's own record (the
                 // announcer whose id is the target), over the mapping it opened
@@ -976,10 +1053,10 @@ impl Dht {
                 });
             }
         } else if self.seen_initiators.contains(&(target, initiator_addr))
-            && self
-                .announces
-                .get(&target)
-                .is_some_and(|recs| recs.iter().any(|c| c.id == target && c.addr == from))
+            && self.announces.get(&target).is_some_and(|recs| {
+                recs.iter()
+                    .any(|r| r.contact.id == target && r.contact.addr == from)
+            })
         {
             // We are the coordinator relaying the reply — but only to an address
             // that actually initiated (so the target can't redirect it to a
@@ -1046,6 +1123,101 @@ mod tests {
             },
         }
         .encode()
+    }
+
+    #[test]
+    fn announce_lease_refreshes_then_expires() {
+        let mut dht = Dht::new(id(1));
+        let topic = id(100);
+        let provider = Contact::new(id(2), addr("10.0.0.2:200"));
+
+        dht.store_announce(topic, provider, 0);
+        dht.store_announce(topic, provider, ANNOUNCE_TTL_MS - 1);
+
+        dht.handle_timeout(ANNOUNCE_TTL_MS);
+        assert_eq!(dht.announces.get(&topic).map(Vec::len), Some(1));
+
+        dht.handle_timeout(2 * ANNOUNCE_TTL_MS - 1);
+        assert!(!dht.announces.contains_key(&topic));
+    }
+
+    #[test]
+    fn an_idle_node_schedules_no_protocol_timeout_but_still_prunes_on_a_tick() {
+        // Regression for the lease-expiry gap: with no pending query/connect/NAT
+        // probe, poll_timeout() is None, so the core never asks to be woken for the
+        // announce lease. That is *by design* — lease GC is housekeeping, not protocol
+        // timing — which is exactly why the driver drives handle_timeout on a periodic
+        // tick rather than folding the lease into poll_timeout. This test pins both
+        // halves of that contract: poll_timeout stays None while a lease is live, and
+        // handle_timeout at the boundary still prunes it.
+        let mut dht = Dht::new(id(1));
+        let topic = id(100);
+        let provider = Contact::new(id(2), addr("10.0.0.2:200"));
+
+        dht.store_announce(topic, provider, 0);
+        assert_eq!(
+            dht.poll_timeout(),
+            None,
+            "an idle node schedules no protocol timeout for the lease — the driver's \
+             housekeeping tick is what must eventually prune it"
+        );
+        assert_eq!(dht.announces.get(&topic).map(Vec::len), Some(1));
+
+        // The driver's periodic tick fires handle_timeout at/after the lease boundary.
+        dht.handle_timeout(ANNOUNCE_TTL_MS);
+        assert!(
+            !dht.announces.contains_key(&topic),
+            "the tick's handle_timeout prunes the expired lease even though nothing \
+             scheduled it"
+        );
+    }
+
+    #[test]
+    fn refreshing_the_earliest_lease_advances_the_cached_expiry() {
+        // Regression: next_announce_expiry must track the *true* earliest expiry, not
+        // stay pinned at a stale-early value. A refresh moves a record's expiry later,
+        // so if the earliest record is refreshed the cache has to advance to the new
+        // earliest — otherwise it fires needless full prune scans early.
+        let mut dht = Dht::new(id(1));
+        let topic = id(100);
+        let a = Contact::new(id(2), addr("10.0.0.2:200"));
+        let b = Contact::new(id(3), addr("10.0.0.3:300"));
+
+        dht.store_announce(topic, a, 0); // a expires at ANNOUNCE_TTL_MS
+        dht.store_announce(topic, b, 100); // b expires at ANNOUNCE_TTL_MS + 100
+        assert_eq!(
+            dht.next_announce_expiry,
+            Some(ANNOUNCE_TTL_MS),
+            "a is earliest"
+        );
+
+        // Refresh a (the earliest) well before it lapses; now b is the earliest.
+        dht.store_announce(topic, a, 500);
+        assert_eq!(
+            dht.next_announce_expiry,
+            Some(ANNOUNCE_TTL_MS + 100),
+            "the cache advances to b's expiry, not the stale pre-refresh value"
+        );
+    }
+
+    #[test]
+    fn a_fresh_announce_can_fill_a_previously_stale_topic() {
+        let mut dht = Dht::new(id(1));
+        let topic = id(100);
+        for i in 0..K {
+            dht.store_announce(
+                topic,
+                Contact::new(id(i as u8), addr(&format!("10.0.0.2:{}", 200 + i))),
+                0,
+            );
+        }
+
+        let newcomer = Contact::new(id(250), addr("10.0.0.250:9000"));
+        dht.store_announce(topic, newcomer, ANNOUNCE_TTL_MS);
+
+        let records = &dht.announces[&topic];
+        assert_eq!(records.len(), 1);
+        assert!(records.iter().any(|r| r.contact == newcomer));
     }
 
     #[test]

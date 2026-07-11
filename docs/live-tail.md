@@ -71,8 +71,8 @@ Nothing new is needed at the transport or crypto layer. The work is a new
 ## The primitive
 
 ```
-transfer::subscribe_feed(channel, public_key, from_index, cfg) -> stream of verified blocks
-transfer::serve_feed_tail(channel, &log, cfg)                  -> serves appends until the channel breaks
+transfer::subscribe_feed(channel, public_key, from, cfg, on_block)      // deliver each new block (verified) via on_block, from `from`
+transfer::serve_feed_tail(channel, &Mutex<Source>, appended, cfg)       // serve + hold at head, pushing on each `appended` signal
 ```
 
 Semantics: the client says *"I have feed `P` up to index `n` — send me `n` and

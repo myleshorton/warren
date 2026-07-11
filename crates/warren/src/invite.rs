@@ -58,7 +58,9 @@ pub fn encode_invite(
             })
             .collect(),
     };
-    let json = serde_json::to_vec(&wire).unwrap_or_default();
+    // A `Wire` is plain data and can't fail to serialize; `expect` rather than
+    // silently emitting an empty/invalid invite on the impossible error.
+    let json = serde_json::to_vec(&wire).expect("invite serializes");
     format!("{prefix}{}", to_hex(&json))
 }
 

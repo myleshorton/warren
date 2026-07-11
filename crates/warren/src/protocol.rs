@@ -243,8 +243,13 @@ pub async fn fetch_feed(
     let mut ch = conn.channel?;
     ch.send(&[req]).await.ok()?;
 
+    // Bound the handshake reply so a reachable-but-silent peer can't stall discovery
+    // (the same guard as the by-key subscribe/replicate/fetch_replica handshakes).
     let mut buf = [0u8; 64];
-    let n = ch.recv(&mut buf).await.ok()?;
+    let n = tokio::time::timeout(cfg.request_timeout * 2, ch.recv(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
     if n < 32 {
         return None;
     }

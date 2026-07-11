@@ -252,7 +252,11 @@ impl Session {
             enc: enc.clone(),
             ..Default::default()
         };
-        let line = serde_json::to_string(&record).unwrap_or_default();
+        // Never append an empty/garbage block on a serialize error — that would
+        // corrupt the signed log. (A plain Record can't fail to serialize, but treat
+        // it as an error rather than silently persisting nonsense.)
+        let line = serde_json::to_string(&record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         self.log
             .lock()
             .expect("feed log")

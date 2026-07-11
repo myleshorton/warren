@@ -50,7 +50,13 @@ fn feed_path(data_dir: &Path) -> PathBuf {
 /// `blob` field (e.g. from a record synced off the network) can't escape the
 /// blobs directory — the store never trusts the caller to have sanitized it.
 fn is_hex_id(s: &str) -> bool {
-    !s.is_empty() && s.len() <= 128 && s.bytes().all(|b| b.is_ascii_hexdigit())
+    // Lowercase hex only: ids are produced by `to_hex` (lowercase), and accepting
+    // uppercase would let a record's blob id round-trip to an on-disk path that never
+    // matches the lowercase filename written elsewhere.
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn blob_path(data_dir: &Path, blob_hex: &str) -> Option<PathBuf> {

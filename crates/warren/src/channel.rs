@@ -39,3 +39,12 @@ pub fn channel_topic(domain: &[u8], psk: &[u8], epoch: u64) -> NodeId {
 pub fn content_topic(domain: &[u8], blob_id: &[u8]) -> NodeId {
     NodeId::from_bytes(crypto::hash_parts(&[domain, blob_id]))
 }
+
+/// The discovery topic for a feed, keyed by its owner's public key (`feed_key`):
+/// the author and every mirror holding a replica of that feed announce under it,
+/// so a subscriber can `lookup` all of them and live-tail from any — the feed
+/// analogue of [`content_topic`], and what makes swarm-failover subscription +
+/// blind-mirror store-and-forward possible. Namespaced by the app's `domain`.
+pub fn feed_topic(domain: &[u8], feed_key: &[u8]) -> NodeId {
+    NodeId::from_bytes(crypto::hash_parts(&[domain, feed_key]))
+}

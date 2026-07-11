@@ -16,6 +16,11 @@ use swarm::NodeId;
 pub const REQ_FEED: u8 = 0;
 /// Request a blob by its (already-known) content id.
 pub const REQ_BLOB: u8 = 1;
+/// Request a *specific* feed by key: this byte is followed by the 32-byte feed
+/// public key, and the peer serves that feed whether it's the peer's own or a
+/// [`feed::Replica`] it mirrors. (Applications choose their own additional kinds;
+/// `warren` reserves 0, 1, and 3.)
+pub const REQ_FEED_KEY: u8 = 3;
 
 /// Serve our feed to a peer that asked for it: send our feed public key (the trust
 /// anchor) first, then stream the log. Returns `false` on a broken channel.
@@ -91,6 +96,45 @@ where
     let pk_bytes: [u8; 32] = buf[..32].try_into().map_err(|_| "bad feed key")?;
     let pubkey = crypto::PublicKey::from_bytes(&pk_bytes).map_err(|_| "bad feed key")?;
     transfer::subscribe_feed(&mut ch, pubkey, from, cfg, on_block)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Live-tail a *specific* feed `feed_key` from `provider` — which may be the feed's
+/// author (serving its own log) or a mirror (serving a [`feed::Replica`] of it).
+/// Sends [`REQ_FEED_KEY`] + the target key; the provider replies with the key it's
+/// serving, which must match, then streams the tail (every block verified against
+/// `feed_key`). This is what makes swarm-failover subscription work: the caller
+/// can point it at any provider that announced the feed's topic.
+pub async fn subscribe_feed_by_key<F>(
+    node: &Node,
+    provider: NodeId,
+    feed_key: crypto::PublicKey,
+    from: u64,
+    cfg: &transfer::Config,
+    on_block: F,
+) -> Result<(), String>
+where
+    F: FnMut(u64, Vec<u8>),
+{
+    let conn = node
+        .connect(provider)
+        .await
+        .map_err(|e| format!("connect: {e:?}"))?;
+    let mut ch = conn.channel.ok_or("no data channel")?;
+    let key_bytes = feed_key.to_bytes();
+    let mut req = Vec::with_capacity(1 + key_bytes.len());
+    req.push(REQ_FEED_KEY);
+    req.extend_from_slice(&key_bytes);
+    ch.send(&req).await.map_err(|e| format!("send: {e}"))?;
+
+    // The provider echoes the feed key it's about to serve; it must be ours.
+    let mut buf = [0u8; 64];
+    let n = ch.recv(&mut buf).await.map_err(|e| format!("recv: {e}"))?;
+    if n < 32 || buf[..32] != key_bytes[..] {
+        return Err("provider does not serve the requested feed".to_string());
+    }
+    transfer::subscribe_feed(&mut ch, feed_key, from, cfg, on_block)
         .await
         .map_err(|e| format!("{e:?}"))
 }

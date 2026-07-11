@@ -15,11 +15,15 @@ pub mod channel;
 pub mod invite;
 pub mod protocol;
 pub mod record;
+pub mod store;
 pub mod util;
+
+use serde::{Deserialize, Serialize};
 
 /// A bootstrap peer to seed the DHT: a node id (hex) and the UDP `host:port` to
 /// reach it at. The app's binding layer wraps this in whatever FFI type it needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serializable so it doubles as the on-disk bootstrap-cache entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Peer {
     pub node_id: String,
     pub addr: String,

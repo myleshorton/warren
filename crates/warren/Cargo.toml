@@ -16,3 +16,6 @@ feed = { path = "../feed" }
 blob = { path = "../blob" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

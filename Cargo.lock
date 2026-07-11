@@ -898,6 +898,7 @@ dependencies = [
  "serde",
  "serde_json",
  "swarm",
+ "tempfile",
  "transfer",
 ]
 

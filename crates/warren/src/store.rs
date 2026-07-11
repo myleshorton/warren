@@ -151,6 +151,20 @@ pub fn append_record(
     Ok(())
 }
 
+/// Persist a body-only record: append just its feed-block line, with no blob file.
+/// For records whose payload rides inline in `body` (a chat message, a comment)
+/// rather than as a content-addressed attachment. `line` must be exactly the bytes
+/// appended to the feed.
+pub fn append_line(data_dir: &Path, line: &str) -> std::io::Result<()> {
+    fs::create_dir_all(data_dir)?;
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(feed_path(data_dir))?;
+    writeln!(f, "{line}")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +227,33 @@ mod tests {
         assert_eq!(log.len(), 2, "both feed blocks restored");
         assert_eq!(records[0].blob.as_deref(), Some("aa01"));
         assert_eq!(records[1].content_type, "application/octet-stream");
+    }
+
+    #[test]
+    fn append_line_persists_a_body_only_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp = crypto::Keypair::generate();
+
+        // A comment-shaped body-only record: no blob, payload inline in `body`.
+        let rec = Record {
+            author: "bb".repeat(32),
+            created_at: 7,
+            content_type: "comment".into(),
+            body: Some("nice clip".into()),
+            meta: [("reply_to".to_string(), "aa01".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&rec).unwrap();
+        append_line(dir.path(), &line).unwrap();
+
+        let (log, _store, records) = rebuild(dir.path(), kp).unwrap();
+        assert_eq!(log.len(), 1, "the body-only line is a feed block");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body.as_deref(), Some("nice clip"));
+        assert!(records[0].blob.is_none(), "no blob for a body-only record");
+        assert_eq!(records[0].content_type, "comment");
     }
 
     #[test]

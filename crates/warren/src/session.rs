@@ -277,6 +277,45 @@ impl Session {
         Ok(record)
     }
 
+    /// Publish a **body-only** record (no blob) — a chat message, a comment, any small
+    /// inline payload. Fills in author + timestamp, appends the signed block, persists
+    /// the line, and fires `appended` so live subscribers are pushed it at once.
+    /// `clock`/`lamport` carry the multi-writer merge position (see [`crate::merge`]);
+    /// pass empty/`0` for content that needs no cross-writer ordering. Unlike
+    /// [`Self::publish`] there is no blob to seal, store, or announce — the body rides
+    /// in the signed record as plaintext (as record `meta` already does), so a blind
+    /// mirror replicating the feed can read it; keep secrets out of it.
+    pub async fn publish_body(
+        &self,
+        content_type: String,
+        body: String,
+        meta: serde_json::Map<String, serde_json::Value>,
+        clock: std::collections::BTreeMap<String, u64>,
+        lamport: u64,
+    ) -> std::io::Result<Record> {
+        let record = Record {
+            author: util::to_hex(&self.feed_pubkey.to_bytes()),
+            created_at: util::now_secs(),
+            content_type,
+            blob: None,
+            size: 0,
+            body: Some(body),
+            meta,
+            enc: None,
+            clock,
+            lamport,
+        };
+        let line = serde_json::to_string(&record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        self.log
+            .lock()
+            .expect("feed log")
+            .append(line.clone().into_bytes());
+        self.appended.notify_waiters(); // wake any live-tail subscribers
+        store::append_line(&self.data_dir, &line)?;
+        Ok(record)
+    }
+
     /// Live-tail a feed by its owner's `feed_key`, from block `from`, delivering each
     /// new block via `on_block` as it's appended. Finds **every** provider of the feed
     /// (its author plus any mirrors) via the feed topic and tails from one, **failing

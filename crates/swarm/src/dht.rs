@@ -198,6 +198,13 @@ impl Query {
 struct Pending {
     query: QueryId,
     contact: NodeId,
+    addr: SocketAddr,
+    deadline: Millis,
+}
+
+struct NatPending {
+    contact: NodeId,
+    addr: SocketAddr,
     deadline: Millis,
 }
 
@@ -232,7 +239,7 @@ pub struct Dht {
     queries: HashMap<QueryId, Query>,
     pending: HashMap<u64, Pending>,
     nat: NatSampler,
-    nat_pending: HashMap<u64, Millis>,
+    nat_pending: HashMap<u64, NatPending>,
     self_reachable: bool,
     /// This node's own firewall type, shared with peers during connect signaling.
     local_firewall: Firewall,
@@ -306,17 +313,19 @@ impl Dht {
     /// is the outbound half of NAT detection; reachability (Open vs Consistent)
     /// comes from a separate inbound probe fed via [`Dht::note_reachable`].
     pub fn sample_nat(&mut self, now: Millis, count: usize) {
-        let peers: Vec<SocketAddr> = self
-            .table
-            .closest(&self.id, count)
-            .into_iter()
-            .map(|c| c.addr)
-            .collect();
-        for addr in peers {
+        let peers = self.table.closest(&self.id, count);
+        for peer in peers {
             let rid = self.next_rid;
             self.next_rid += 1;
-            self.nat_pending.insert(rid, now + REQUEST_TIMEOUT_MS);
-            self.send(addr, rid, Message::Ping);
+            self.nat_pending.insert(
+                rid,
+                NatPending {
+                    contact: peer.id,
+                    addr: peer.addr,
+                    deadline: now + REQUEST_TIMEOUT_MS,
+                },
+            );
+            self.send(peer.addr, rid, Message::Ping);
         }
     }
 
@@ -465,7 +474,12 @@ impl Dht {
                 self.send(from, packet.rid, Message::Pong { observed: from });
             }
             Message::Pong { observed } => {
-                if self.nat_pending.remove(&packet.rid).is_some() {
+                let matches_probe = self
+                    .nat_pending
+                    .get(&packet.rid)
+                    .is_some_and(|p| p.contact == packet.sender && p.addr == from);
+                if matches_probe {
+                    self.nat_pending.remove(&packet.rid);
                     self.nat.add(observed);
                 }
             }
@@ -538,7 +552,7 @@ impl Dht {
         }
 
         // Expire NAT probes; a lost Pong simply yields one fewer sample.
-        self.nat_pending.retain(|_, deadline| *deadline > now);
+        self.nat_pending.retain(|_, pending| pending.deadline > now);
 
         // Fail connects whose signaling never completed, so they can't hang.
         let stale: Vec<NodeId> = self
@@ -570,7 +584,7 @@ impl Dht {
         self.pending
             .values()
             .map(|p| p.deadline)
-            .chain(self.nat_pending.values().copied())
+            .chain(self.nat_pending.values().map(|p| p.deadline))
             .chain(self.connecting.values().map(|cs| cs.deadline))
             .chain(self.pending_incoming.values().map(|inc| inc.deadline))
             .min()
@@ -606,9 +620,18 @@ impl Dht {
         peers: Vec<Contact>,
         now: Millis,
     ) {
-        let Some(p) = self.pending.remove(&rid) else {
+        let Some(p) = self.pending.get(&rid) else {
             return;
         };
+        // A transaction id correlates a response with a request, but it does not
+        // identify the respondent. Require the same node id and UDP endpoint we
+        // queried before consuming the request; otherwise an unrelated peer that
+        // learns or guesses a live rid could inject contacts/announce records and
+        // mark the legitimate contact complete.
+        if p.contact != responder || p.addr != responder_addr {
+            return;
+        }
+        let p = self.pending.remove(&rid).expect("pending request exists");
         let Some(q) = self.queries.get_mut(&p.query) else {
             return;
         };
@@ -761,6 +784,7 @@ impl Dht {
                 Pending {
                     query: qid,
                     contact: contact_id,
+                    addr,
                     deadline: now + REQUEST_TIMEOUT_MS,
                 },
             );
@@ -1022,6 +1046,83 @@ mod tests {
             },
         }
         .encode()
+    }
+
+    #[test]
+    fn nodes_response_must_match_the_queried_contact() {
+        let me = id(1);
+        let peer = id(2);
+        let peer_addr = addr("10.0.0.2:200");
+        let mut dht = Dht::new(me);
+        dht.add_contact(Contact::new(peer, peer_addr));
+        dht.find_node(id(3), 0);
+
+        let request = dht.poll_transmit().expect("find-node request");
+        let rid = Packet::decode(&request.data).unwrap().rid;
+        assert_eq!(request.to, peer_addr);
+
+        let response = |sender| {
+            Packet {
+                sender,
+                rid,
+                msg: Message::Nodes {
+                    contacts: vec![],
+                    peers: vec![],
+                },
+            }
+            .encode()
+        };
+
+        dht.handle_input(addr("10.0.0.9:900"), &response(id(9)), 1);
+        assert!(
+            dht.pending.contains_key(&rid),
+            "wrong peer consumed request"
+        );
+
+        dht.handle_input(addr("10.0.0.9:900"), &response(peer), 1);
+        assert!(
+            dht.pending.contains_key(&rid),
+            "wrong endpoint consumed request"
+        );
+
+        dht.handle_input(peer_addr, &response(peer), 1);
+        assert!(!dht.pending.contains_key(&rid));
+        assert!(matches!(
+            dht.poll_event(),
+            Some(Event::QueryFinished { .. })
+        ));
+    }
+
+    #[test]
+    fn pong_must_match_the_sampled_contact() {
+        let me = id(1);
+        let peer = id(2);
+        let peer_addr = addr("10.0.0.2:200");
+        let mut dht = Dht::new(me);
+        dht.add_contact(Contact::new(peer, peer_addr));
+        dht.sample_nat(0, 1);
+
+        let request = dht.poll_transmit().expect("ping request");
+        let rid = Packet::decode(&request.data).unwrap().rid;
+        let pong = |sender| {
+            Packet {
+                sender,
+                rid,
+                msg: Message::Pong {
+                    observed: addr("203.0.113.1:40000"),
+                },
+            }
+            .encode()
+        };
+
+        dht.handle_input(addr("10.0.0.9:900"), &pong(id(9)), 1);
+        dht.handle_input(addr("10.0.0.9:900"), &pong(peer), 1);
+        assert_eq!(dht.nat_samples(), 0);
+        assert!(dht.nat_pending.contains_key(&rid));
+
+        dht.handle_input(peer_addr, &pong(peer), 1);
+        assert_eq!(dht.nat_samples(), 1);
+        assert!(!dht.nat_pending.contains_key(&rid));
     }
 
     /// A connect request replayed for the same initiator must surface

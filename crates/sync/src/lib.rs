@@ -66,6 +66,7 @@ const KIND_GET_CHUNK: u8 = 8;
 const KIND_CHUNK: u8 = 9;
 const KIND_GET_HAVE: u8 = 10;
 const KIND_HAVE: u8 = 11;
+const KIND_TAIL: u8 = 12;
 
 /// A sync protocol message: a request from the client, or a response from the
 /// server. A session is tied to one feed, so feed requests carry no id; blob
@@ -75,6 +76,15 @@ const KIND_HAVE: u8 = 11;
 pub enum Message {
     /// Client → server: send the feed's current signed head.
     GetHead,
+    /// Client → server: a live-tail poll — "I already have `have` blocks; send the
+    /// current signed head." Like [`Message::GetHead`], but signals a subscription:
+    /// the server may hold the response until the feed grows past `have` (bounded by
+    /// a keepalive at the I/O layer), so a subscriber blocks until there is genuinely
+    /// new data rather than busy-polling.
+    Tail {
+        /// How many blocks the subscriber already holds (its verified length).
+        have: u64,
+    },
     /// Server → client: the signed head.
     Head(Head),
     /// Client → server: send block `index` with its inclusion proof.
@@ -140,6 +150,10 @@ impl Message {
             Message::GetHead => {
                 enc.u8(KIND_GET_HEAD);
             }
+            Message::Tail { have } => {
+                enc.u8(KIND_TAIL);
+                enc.uint(*have);
+            }
             Message::Head(head) => {
                 enc.u8(KIND_HEAD);
                 enc.bytes(&head.encode());
@@ -190,6 +204,7 @@ impl Message {
         let mut dec = Decoder::new(buf);
         let msg = match dec.u8()? {
             KIND_GET_HEAD => Message::GetHead,
+            KIND_TAIL => Message::Tail { have: dec.uint()? },
             KIND_HEAD => Message::Head(Head::decode(dec.bytes()?)?),
             KIND_GET_BLOCK => Message::GetBlock { index: dec.uint()? },
             KIND_BLOCK => Message::Block {
@@ -228,6 +243,7 @@ impl Message {
         matches!(
             self,
             Message::GetHead
+                | Message::Tail { .. }
                 | Message::GetBlock { .. }
                 | Message::GetManifest { .. }
                 | Message::GetChunk { .. }
@@ -241,7 +257,9 @@ impl Message {
 /// response the server has nothing to say to is also `Absent`.
 pub fn serve_feed(request: &Message, log: &feed::Log) -> Message {
     match request {
-        Message::GetHead => Message::Head(log.head()),
+        // Both a plain head request and a live-tail poll answer with the current
+        // signed head; holding a `Tail` until the feed grows is the I/O layer's job.
+        Message::GetHead | Message::Tail { .. } => Message::Head(log.head()),
         Message::GetBlock { index } => {
             let index = *index;
             match usize::try_from(index)
@@ -268,16 +286,28 @@ pub struct FeedDownload {
     received: HashMap<u64, Vec<u8>>,
     /// Sequential request cursor; advances past blocks already received.
     cursor: u64,
+    /// Blocks below this index are assumed already held (a resumed / live-tail
+    /// download): never requested, never stored, never returned. 0 for a full sync.
+    base: u64,
 }
 
 impl FeedDownload {
-    /// Begin syncing the feed identified by `public_key`.
+    /// Begin syncing the feed identified by `public_key` from the start.
     pub fn new(public_key: PublicKey) -> Self {
+        Self::resume(public_key, 0)
+    }
+
+    /// Resume syncing from block `have`: the caller already holds (and has
+    /// verified) blocks `0..have`, so this download requests, stores, and returns
+    /// only `have..head.len`. Used by a live subscription that keeps a running
+    /// cursor across many rounds — new blocks are transferred once, never re-fetched.
+    pub fn resume(public_key: PublicKey, have: u64) -> Self {
         Self {
             public_key,
             head: None,
             received: HashMap::new(),
-            cursor: 0,
+            cursor: have,
+            base: have,
         }
     }
 
@@ -349,20 +379,24 @@ impl FeedDownload {
         self.head.as_ref()
     }
 
-    /// Whether every block up to the head has been received and verified.
+    /// Whether every block from `base` up to the head has been received and
+    /// verified (for a full download `base` is 0, so this is "every block").
     pub fn is_complete(&self) -> bool {
         match &self.head {
-            Some(head) => self.received.len() as u64 == head.len,
+            Some(head) => self.received.len() as u64 == head.len.saturating_sub(self.base),
             None => false,
         }
     }
 
-    /// The verified blocks in order. Only meaningful once [`Self::is_complete`];
-    /// a missing block is skipped (so a partial download yields what it has).
+    /// The verified blocks in order, from `base` to the head (all blocks for a full
+    /// download; only the newly-fetched tail for a resumed one). Only meaningful
+    /// once [`Self::is_complete`]; a missing block is skipped.
     pub fn into_blocks(self) -> Vec<Vec<u8>> {
         let mut received = self.received;
         let len = self.head.map(|h| h.len).unwrap_or(0);
-        (0..len).filter_map(|i| received.remove(&i)).collect()
+        (self.base..len)
+            .filter_map(|i| received.remove(&i))
+            .collect()
     }
 }
 
@@ -602,6 +636,48 @@ mod tests {
     fn syncs_an_empty_feed() {
         let server = log_with(0, 0xB2);
         assert_eq!(sync(&server), Vec::<Vec<u8>>::new());
+    }
+
+    /// Run a resumed download (a live-tail round) from block `have`, returning only
+    /// the newly-fetched tail.
+    fn resume_sync(server: &Log, have: u64) -> Vec<Vec<u8>> {
+        let mut dl = FeedDownload::resume(server.public_key(), have);
+        while let Some(request) = dl.poll_request() {
+            dl.handle_response(&serve_feed(&request, server)).unwrap();
+        }
+        assert!(dl.is_complete());
+        dl.into_blocks()
+    }
+
+    #[test]
+    fn resume_fetches_only_the_new_tail() {
+        let server = log_with(8, 0x5A);
+        // A subscriber that already holds 5 blocks fetches only 5, 6, 7 — the tail,
+        // each still verified against the signed head.
+        let expected: Vec<Vec<u8>> = (5..8).map(|i| vec![i as u8; (i % 7) + 1]).collect();
+        assert_eq!(resume_sync(&server, 5), expected);
+    }
+
+    #[test]
+    fn resume_at_or_past_head_fetches_nothing() {
+        let server = log_with(4, 0x6B);
+        assert_eq!(resume_sync(&server, 4), Vec::<Vec<u8>>::new());
+        // A cursor claiming more than exists is a harmless no-op (append-only).
+        assert_eq!(resume_sync(&server, 9), Vec::<Vec<u8>>::new());
+    }
+
+    #[test]
+    fn tail_serves_the_current_head_and_roundtrips() {
+        let server = log_with(3, 0x7C);
+        // A live-tail poll answers with the current signed head, like GetHead.
+        assert_eq!(
+            serve_feed(&Message::Tail { have: 1 }, &server),
+            Message::Head(server.head())
+        );
+        // And it survives the wire.
+        let m = Message::Tail { have: 42 };
+        assert_eq!(Message::decode(&m.encode()).unwrap(), m);
+        assert!(m.is_request());
     }
 
     #[test]

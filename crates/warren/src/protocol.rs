@@ -1,0 +1,103 @@
+//! The peer request protocol: how one peer asks another, over a punched channel,
+//! to serve a signed feed or a content-addressed blob.
+//!
+//! A one-byte request kind prefixes the exchange. `warren` reserves `REQ_FEED`
+//! (0) and `REQ_BLOB` (1); an application may define its own additional kinds and
+//! dispatch them in its own accept loop (Murmur, for instance, adds a moderation-
+//! list kind). Feed requests reply with the server's 32-byte feed public key —
+//! the trust anchor every downloaded block is verified against — then stream the
+//! log; blob requests stream the (content-addressed, self-verifying) blob.
+
+use driver::{Channel, Node};
+use swarm::NodeId;
+
+/// Request the peer's signed feed. The peer replies with its 32-byte feed public
+/// key, then serves the feed.
+pub const REQ_FEED: u8 = 0;
+/// Request a blob by its (already-known) content id.
+pub const REQ_BLOB: u8 = 1;
+
+/// Serve our feed to a peer that asked for it: send our feed public key (the trust
+/// anchor) first, then stream the log. Returns `false` on a broken channel.
+pub async fn serve_feed(
+    channel: &mut Channel,
+    feed_pubkey: &crypto::PublicKey,
+    log: &feed::Log,
+    cfg: &transfer::Config,
+) -> bool {
+    if channel.send(&feed_pubkey.to_bytes()).await.is_err() {
+        return false;
+    }
+    transfer::serve_feed(channel, log, cfg).await.is_ok()
+}
+
+/// Serve a blob to a peer that asked for it.
+pub async fn serve_blob(
+    channel: &mut Channel,
+    store: &blob::Store,
+    cfg: &transfer::Config,
+) -> bool {
+    transfer::serve_blob(channel, store, cfg).await.is_ok()
+}
+
+/// Connect to `peer`, send the feed-style request kind `req`, receive the peer's
+/// 32-byte feed public key, and download + verify the feed it serves. Returns the
+/// raw signed blocks plus the key they were verified against. Used both for the
+/// standard [`REQ_FEED`] and for app-defined feed-shaped kinds (e.g. a signed
+/// moderation list).
+pub async fn fetch_feed(
+    node: &Node,
+    peer: NodeId,
+    req: u8,
+    cfg: &transfer::Config,
+) -> Option<(Vec<Vec<u8>>, crypto::PublicKey)> {
+    let conn = node.connect(peer).await.ok()?;
+    let mut ch = conn.channel?;
+    ch.send(&[req]).await.ok()?;
+
+    let mut buf = [0u8; 64];
+    let n = ch.recv(&mut buf).await.ok()?;
+    if n < 32 {
+        return None;
+    }
+    let pk_bytes: [u8; 32] = buf[..32].try_into().ok()?;
+    let pubkey = crypto::PublicKey::from_bytes(&pk_bytes).ok()?;
+    let blocks = transfer::download_feed(&mut ch, pubkey, cfg).await.ok()?;
+    Some((blocks, pubkey))
+}
+
+/// Open blob channels to several providers of `blob_hash` for a swarm download:
+/// the known feed provider plus everyone announcing `content_topic`. Each returned
+/// channel has already sent the [`REQ_BLOB`] header, ready to hand to `transfer`.
+pub async fn gather_blob_channels(
+    node: &Node,
+    content_topic: NodeId,
+    feed_provider: Option<NodeId>,
+    max: usize,
+) -> Vec<Channel> {
+    let me = node.id();
+    let mut ids: Vec<NodeId> = Vec::new();
+    if let Some(p) = feed_provider {
+        if p != me {
+            ids.push(p);
+        }
+    }
+    if let Ok(contacts) = node.lookup(content_topic).await {
+        for c in contacts {
+            if c.id != me && !ids.contains(&c.id) {
+                ids.push(c.id);
+            }
+        }
+    }
+    let mut channels = Vec::new();
+    for id in ids.into_iter().take(max) {
+        if let Ok(conn) = node.connect(id).await {
+            if let Some(ch) = conn.channel {
+                if ch.send(&[REQ_BLOB]).await.is_ok() {
+                    channels.push(ch);
+                }
+            }
+        }
+    }
+    channels
+}

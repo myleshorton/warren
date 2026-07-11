@@ -13,6 +13,7 @@
 
 pub mod channel;
 pub mod invite;
+pub mod protocol;
 pub mod record;
 pub mod util;
 

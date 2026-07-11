@@ -891,10 +891,14 @@ dependencies = [
 name = "warren"
 version = "0.0.0"
 dependencies = [
+ "blob",
  "crypto",
+ "driver",
+ "feed",
  "serde",
  "serde_json",
  "swarm",
+ "transfer",
 ]
 
 [[package]]

@@ -695,9 +695,14 @@ impl Dht {
         if !self.announces.contains_key(&topic) && self.announces.len() >= MAX_ANNOUNCE_TOPICS {
             return;
         }
+        let cached_min = self.next_announce_expiry;
         let records = self.announces.entry(topic).or_default();
         let expires_at = now.saturating_add(ANNOUNCE_TTL_MS);
+        let mut refreshed_earliest = false;
         if let Some(existing) = records.iter_mut().find(|r| r.contact.id == announcer.id) {
+            // If this record currently defines the cached earliest expiry, moving it
+            // later invalidates the cache and forces a recompute below.
+            refreshed_earliest = Some(existing.expires_at) == cached_min;
             existing.contact.addr = announcer.addr;
             existing.expires_at = expires_at;
         } else if records.len() < K {
@@ -706,12 +711,17 @@ impl Dht {
                 expires_at,
             });
         }
-        // Recompute the earliest expiry rather than only lowering it toward
-        // `expires_at`: a new/refreshed record always carries the *latest* expiry, so
-        // `min(current, expires_at)` would never move — leaving the cache pointing at a
-        // stale-early time when the current earliest record is the one being refreshed,
-        // which triggers needless full prune scans. The set is small (≤ K per topic).
-        self.recompute_next_expiry();
+        // Keep the cached earliest expiry correct with O(1) work in the common case:
+        // a new/refreshed record always carries the *latest* expiry, so it can only
+        // *set* the cache when empty, never lower it. The one case that needs a full
+        // rescan is refreshing the record that *was* the earliest — its expiry just
+        // moved later, so the new earliest is some other record.
+        if refreshed_earliest {
+            self.recompute_next_expiry();
+        } else {
+            self.next_announce_expiry =
+                Some(cached_min.map_or(expires_at, |current| current.min(expires_at)));
+        }
     }
 
     fn prune_announces(&mut self, now: Millis) {

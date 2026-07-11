@@ -13,6 +13,7 @@
 
 pub mod channel;
 pub mod invite;
+pub mod record;
 pub mod util;
 
 /// A bootstrap peer to seed the DHT: a node id (hex) and the UDP `host:port` to

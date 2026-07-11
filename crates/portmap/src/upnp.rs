@@ -139,6 +139,13 @@ pub(crate) async fn map_via_location(
     let service = parse_igd_service(&xml).ok_or(UpnpError::BadDescription)?;
     let control_url =
         resolve_url(location, &service.control_url).ok_or(UpnpError::BadDescription)?;
+    // A control URL we can't even parse (non-`http` scheme, malformed) is a bad
+    // description, not a cross-origin attack — classify it as such, and reserve
+    // `UntrustedControlUrl` for a well-formed URL that genuinely points at a
+    // different origin.
+    if parse_url(&control_url).is_none() {
+        return Err(UpnpError::BadDescription);
+    }
     if !same_http_origin(location, &control_url) {
         return Err(UpnpError::UntrustedControlUrl);
     }

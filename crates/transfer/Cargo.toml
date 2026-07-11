@@ -14,7 +14,7 @@ blob = { path = "../blob" }
 sync = { path = "../sync" }
 driver = { path = "../driver" }
 wire = { path = "../wire" }
-tokio = { version = "1", features = ["time", "rt"] }
+tokio = { version = "1", features = ["time", "rt", "sync"] }
 thiserror.workspace = true
 
 [dev-dependencies]

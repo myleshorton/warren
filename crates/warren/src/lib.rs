@@ -12,4 +12,13 @@
 //! moderation model, the UniFFI bindings) lives in the app, not here.
 
 pub mod channel;
+pub mod invite;
 pub mod util;
+
+/// A bootstrap peer to seed the DHT: a node id (hex) and the UDP `host:port` to
+/// reach it at. The app's binding layer wraps this in whatever FFI type it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Peer {
+    pub node_id: String,
+    pub addr: String,
+}

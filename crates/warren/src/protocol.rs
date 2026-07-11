@@ -139,6 +139,71 @@ where
         .map_err(|e| format!("{e:?}"))
 }
 
+/// Keep a mirror's [`feed::Replica`] of `feed_key` current: handshake by key with
+/// `provider`, then live-tail into `into`, firing `appended` on each growth (so our
+/// own downstream subscribers are pushed the new blocks at once). The counterpart
+/// to [`subscribe_feed_by_key`] for a store-and-forward mirror. Returns on channel
+/// error; the caller re-connects (failing over across the feed's providers).
+pub async fn replicate_feed_by_key(
+    node: &Node,
+    provider: NodeId,
+    feed_key: crypto::PublicKey,
+    into: &std::sync::Mutex<feed::Replica>,
+    appended: &tokio::sync::Notify,
+    cfg: &transfer::Config,
+) -> Result<(), String> {
+    let conn = node
+        .connect(provider)
+        .await
+        .map_err(|e| format!("connect: {e:?}"))?;
+    let mut ch = conn.channel.ok_or("no data channel")?;
+    let key_bytes = feed_key.to_bytes();
+    let mut req = Vec::with_capacity(1 + key_bytes.len());
+    req.push(REQ_FEED_KEY);
+    req.extend_from_slice(&key_bytes);
+    ch.send(&req).await.map_err(|e| format!("send: {e}"))?;
+
+    let mut buf = [0u8; 64];
+    let n = ch.recv(&mut buf).await.map_err(|e| format!("recv: {e}"))?;
+    if n < 32 || buf[..32] != key_bytes[..] {
+        return Err("provider does not serve the requested feed".to_string());
+    }
+    transfer::replicate_feed(&mut ch, feed_key, into, appended, cfg)
+        .await
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Bootstrap a [`feed::Replica`] of `feed_key` from `provider` — the one-shot full
+/// download a mirror does before it starts live-tailing. Handshakes by key (so the
+/// provider may be the author or another mirror), downloads the whole feed with its
+/// signed head, and builds a `Replica` (which self-verifies: wrong key, a doctored
+/// block, or a truncated log all yield `None`). Feed a live `replicate_feed` from
+/// the returned replica to keep it current.
+pub async fn fetch_replica(
+    node: &Node,
+    provider: NodeId,
+    feed_key: crypto::PublicKey,
+    cfg: &transfer::Config,
+) -> Option<feed::Replica> {
+    let conn = node.connect(provider).await.ok()?;
+    let mut ch = conn.channel?;
+    let key_bytes = feed_key.to_bytes();
+    let mut req = Vec::with_capacity(1 + key_bytes.len());
+    req.push(REQ_FEED_KEY);
+    req.extend_from_slice(&key_bytes);
+    ch.send(&req).await.ok()?;
+
+    let mut buf = [0u8; 64];
+    let n = ch.recv(&mut buf).await.ok()?;
+    if n < 32 || buf[..32] != key_bytes[..] {
+        return None;
+    }
+    let (head, blocks) = transfer::download_feed_full(&mut ch, feed_key, cfg)
+        .await
+        .ok()?;
+    feed::Replica::new(feed_key, head?, blocks)
+}
+
 /// Connect to `peer`, send the feed-style request kind `req`, receive the peer's
 /// 32-byte feed public key, and download + verify the feed it serves. Returns the
 /// raw signed blocks plus the key they were verified against. Used both for the

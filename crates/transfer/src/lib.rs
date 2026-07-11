@@ -156,6 +156,18 @@ pub async fn download_feed<L: Link>(
     public_key: PublicKey,
     cfg: &Config,
 ) -> Result<Vec<Vec<u8>>, TransferError> {
+    Ok(download_feed_full(channel, public_key, cfg).await?.1)
+}
+
+/// Like [`download_feed`], but also return the feed's signed head — everything a
+/// mirror needs to build a [`feed::Replica`] (`Replica::new(key, head, blocks)`).
+/// The head is `None` only if the feed served nothing (never, in practice — a
+/// download always fetches the head first).
+pub async fn download_feed_full<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    cfg: &Config,
+) -> Result<(Option<feed::Head>, Vec<Vec<u8>>), TransferError> {
     let mut dl = FeedDownload::new(public_key);
     let mut wire = Wire::new(
         channel,
@@ -167,7 +179,7 @@ pub async fn download_feed<L: Link>(
         let response = exchange(&mut wire, &request, cfg).await?;
         dl.handle_response(&response)?;
     }
-    Ok(dl.into_blocks())
+    Ok((dl.head().cloned(), dl.into_blocks()))
 }
 
 /// Subscribe to a feed and deliver its blocks **as they are appended**, over a

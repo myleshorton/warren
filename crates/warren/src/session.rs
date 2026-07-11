@@ -26,6 +26,9 @@ pub const MAX_SOURCES: usize = 5;
 /// unboundedly.
 const RESEED_MAX_BYTES: usize = 16 * 1024 * 1024;
 const RESEED_HELD_CAP: usize = 96;
+/// Backoff between failover rounds when a subscribe/mirror loop has tried every
+/// known provider of a feed, so it re-looks-up at a bounded rate instead of spinning.
+const RESUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The channel keys + topic domains a session runs under. `content_key` empty ⇒ a
 /// blind node that can discover, cache, and serve ciphertext but cannot decrypt.
@@ -37,6 +40,9 @@ pub struct Keys {
     pub channel_domain: Vec<u8>,
     /// App topic namespace for content, e.g. `b"myapp:content:v1"`.
     pub content_domain: Vec<u8>,
+    /// App topic namespace for feed discovery, e.g. `b"myapp:feed:v1"` — the domain
+    /// under which a feed's author + mirrors announce so a subscriber finds them.
+    pub feed_domain: Vec<u8>,
     /// Domain separating the content KEK derivation, e.g. `b"myapp:content-kek:v1"`.
     pub kek_domain: Vec<u8>,
 }
@@ -76,7 +82,16 @@ pub struct Session {
     clip_keys: Arc<StdMutex<HashMap<String, Enc>>>,
     /// Fired on every append to `log` so a live-tail serve wakes and pushes at once.
     appended: Arc<tokio::sync::Notify>,
+    /// Feeds we mirror on behalf of other authors, keyed by feed-key hex: a verified
+    /// [`feed::Replica`] plus the `Notify` fired when it grows (so our own live-tail
+    /// serve pushes the new blocks to downstream subscribers). This is the blind-
+    /// mirror store-and-forward layer — we keep an author's feed available and
+    /// tailable even while the author is offline.
+    mirrored: Arc<StdMutex<HashMap<String, Mirror>>>,
 }
+
+/// A mirrored feed: the replica we keep current, and the signal fired when it grows.
+type Mirror = (Arc<StdMutex<feed::Replica>>, Arc<tokio::sync::Notify>);
 
 impl Session {
     /// Build a session over already-loaded state (see [`store::rebuild`] for the
@@ -102,6 +117,7 @@ impl Session {
             held,
             clip_keys,
             appended: Arc::new(tokio::sync::Notify::new()),
+            mirrored: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -140,6 +156,25 @@ impl Session {
     /// The content topic a `blob` is announced/looked-up under.
     pub fn content_topic(&self, blob: &[u8]) -> swarm::NodeId {
         channel::content_topic(&self.keys.content_domain, blob)
+    }
+    /// The discovery topic for a feed keyed by its owner's `feed_key` bytes — where
+    /// the author and every mirror announce, so a subscriber finds all providers.
+    pub fn feed_topic(&self, feed_key: &[u8]) -> swarm::NodeId {
+        channel::feed_topic(&self.keys.feed_domain, feed_key)
+    }
+    /// Our own feed's discovery topic — announce it so subscribers can tail us.
+    pub fn own_feed_topic(&self) -> swarm::NodeId {
+        self.feed_topic(&self.feed_pubkey.to_bytes())
+    }
+    /// The feed topics of every feed we currently mirror — announce these too, so a
+    /// subscriber can fail over to us when the author (or another mirror) drops.
+    pub fn mirror_topics(&self) -> Vec<swarm::NodeId> {
+        self.mirrored
+            .lock()
+            .expect("mirrored")
+            .keys()
+            .filter_map(|hex| util::from_hex(hex).map(|b| self.feed_topic(&b)))
+            .collect()
     }
 
     /// The channel content key-encryption-key. `None` for a blind node.
@@ -237,30 +272,145 @@ impl Session {
         Ok(record)
     }
 
-    /// Live-tail a member's feed: connect and deliver its blocks via `on_block` as
-    /// they are appended, starting from block `from`. Runs until the channel breaks
-    /// or the future is dropped/aborted — a real-time app (chat) spawns one per
-    /// member and merges the streams. The member's feed key is learned + trusted
-    /// from the serve handshake (as in discovery); every block is verified against
-    /// it. The peer must serve with `serve_feed_tail` (Murmur's accept loop does).
+    /// Live-tail a feed by its owner's `feed_key`, from block `from`, delivering each
+    /// new block via `on_block` as it's appended. Finds **every** provider of the feed
+    /// (its author plus any mirrors) via the feed topic and tails from one, **failing
+    /// over** to another whenever a provider drops — so a subscription survives the
+    /// author going offline as long as a mirror is up. Every block is verified against
+    /// `feed_key`. Runs until the future is dropped/aborted; a real-time app (chat)
+    /// spawns one per feed it follows and merges the streams. Providers must serve
+    /// with [`Self::serve_by_key`] (Murmur's accept loop does).
     pub async fn subscribe<F>(
         &self,
-        member: swarm::NodeId,
+        feed_key: crypto::PublicKey,
         from: u64,
-        on_block: F,
+        mut on_block: F,
     ) -> Result<(), String>
     where
         F: FnMut(u64, Vec<u8>),
     {
-        protocol::subscribe_feed(
-            &self.node,
-            member,
-            protocol::REQ_FEED,
-            from,
-            &transfer::Config::default(),
-            on_block,
-        )
-        .await
+        let cfg = transfer::Config::default();
+        let me = self.node.id();
+        let topic = self.feed_topic(&feed_key.to_bytes());
+        let mut cursor = from;
+        loop {
+            let providers = self.node.lookup(topic).await.unwrap_or_default();
+            for p in providers {
+                if p.id == me {
+                    continue;
+                }
+                let start = cursor;
+                let _ = protocol::subscribe_feed_by_key(
+                    &self.node,
+                    p.id,
+                    feed_key,
+                    start,
+                    &cfg,
+                    |i, b| {
+                        cursor = cursor.max(i + 1);
+                        on_block(i, b);
+                    },
+                )
+                .await;
+            }
+            // All providers exhausted (or none online) — back off before re-looking-up.
+            tokio::time::sleep(RESUBSCRIBE_BACKOFF).await;
+        }
+    }
+
+    /// Serve the feed `feed_key` to a subscriber — the accept-loop counterpart to
+    /// [`Self::subscribe`], dispatched on a [`protocol::REQ_FEED_KEY`] request. Serves
+    /// our own log if `feed_key` is ours, or a [`feed::Replica`] if we mirror it (see
+    /// [`Self::mirror_feed`]); either way it live-tails (holds the connection open and
+    /// pushes new blocks). `false` if we serve neither.
+    pub async fn serve_by_key(
+        &self,
+        channel: &mut driver::Channel,
+        feed_key: crypto::PublicKey,
+        cfg: &transfer::Config,
+    ) -> bool {
+        if feed_key == self.feed_pubkey {
+            return protocol::serve_feed_tail(
+                channel,
+                &self.feed_pubkey,
+                &self.log,
+                &self.appended,
+                cfg,
+            )
+            .await;
+        }
+        let hex = util::to_hex(&feed_key.to_bytes());
+        let entry = self.mirrored.lock().expect("mirrored").get(&hex).cloned();
+        if let Some((replica, appended)) = entry {
+            if channel.send(&feed_key.to_bytes()).await.is_err() {
+                return false;
+            }
+            return transfer::serve_feed_tail(channel, &*replica, &appended, cfg)
+                .await
+                .is_ok();
+        }
+        false
+    }
+
+    /// Begin mirroring `feed_key` on behalf of its author: bootstrap a **verified**
+    /// replica from `provider` (a one-shot full download — a doctored or truncated
+    /// feed fails to build one), register it, and announce ourselves under the feed's
+    /// topic so subscribers can find + fail over to us. Returns the replica handle and
+    /// its growth signal, which the app pairs with [`Self::run_mirror`] (spawned) to
+    /// keep the replica live. Idempotent: a feed we already mirror returns its handles.
+    pub async fn mirror_feed(
+        &self,
+        provider: swarm::NodeId,
+        feed_key: crypto::PublicKey,
+    ) -> Option<Mirror> {
+        let hex = util::to_hex(&feed_key.to_bytes());
+        if let Some(entry) = self.mirrored.lock().expect("mirrored").get(&hex).cloned() {
+            return Some(entry);
+        }
+        let replica =
+            protocol::fetch_replica(&self.node, provider, feed_key, &transfer::Config::default())
+                .await?;
+        let entry: Mirror = (
+            Arc::new(StdMutex::new(replica)),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        self.mirrored
+            .lock()
+            .expect("mirrored")
+            .insert(hex, entry.clone());
+        let _ = self
+            .node
+            .announce(self.feed_topic(&feed_key.to_bytes()))
+            .await;
+        Some(entry)
+    }
+
+    /// Keep a mirrored feed current, forever: fail over across the feed's providers
+    /// (author + other mirrors), live-tailing new blocks into `replica` and firing
+    /// `appended` so our own downstream subscribers are pushed at once. Spawn this
+    /// after [`Self::mirror_feed`]; the app owns the task and aborts it to stop.
+    pub async fn run_mirror(
+        &self,
+        feed_key: crypto::PublicKey,
+        replica: Arc<StdMutex<feed::Replica>>,
+        appended: Arc<tokio::sync::Notify>,
+    ) {
+        let cfg = transfer::Config::default();
+        let me = self.node.id();
+        let topic = self.feed_topic(&feed_key.to_bytes());
+        loop {
+            let providers = self.node.lookup(topic).await.unwrap_or_default();
+            for p in providers {
+                if p.id == me {
+                    continue;
+                }
+                let _ = protocol::replicate_feed_by_key(
+                    &self.node, p.id, feed_key, &replica, &appended, &cfg,
+                )
+                .await;
+            }
+            tokio::time::sleep(RESUBSCRIBE_BACKOFF).await;
+        }
     }
 
     /// Discover the channel: look up members (current + previous epoch), download

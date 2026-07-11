@@ -1100,6 +1100,37 @@ mod tests {
     }
 
     #[test]
+    fn an_idle_node_schedules_no_protocol_timeout_but_still_prunes_on_a_tick() {
+        // Regression for the lease-expiry gap: with no pending query/connect/NAT
+        // probe, poll_timeout() is None, so the core never asks to be woken for the
+        // announce lease. That is *by design* — lease GC is housekeeping, not protocol
+        // timing — which is exactly why the driver drives handle_timeout on a periodic
+        // tick rather than folding the lease into poll_timeout. This test pins both
+        // halves of that contract: poll_timeout stays None while a lease is live, and
+        // handle_timeout at the boundary still prunes it.
+        let mut dht = Dht::new(id(1));
+        let topic = id(100);
+        let provider = Contact::new(id(2), addr("10.0.0.2:200"));
+
+        dht.store_announce(topic, provider, 0);
+        assert_eq!(
+            dht.poll_timeout(),
+            None,
+            "an idle node schedules no protocol timeout for the lease — the driver's \
+             housekeeping tick is what must eventually prune it"
+        );
+        assert_eq!(dht.announces.get(&topic).map(Vec::len), Some(1));
+
+        // The driver's periodic tick fires handle_timeout at/after the lease boundary.
+        dht.handle_timeout(ANNOUNCE_TTL_MS);
+        assert!(
+            !dht.announces.contains_key(&topic),
+            "the tick's handle_timeout prunes the expired lease even though nothing \
+             scheduled it"
+        );
+    }
+
+    #[test]
     fn a_fresh_announce_can_fill_a_previously_stale_topic() {
         let mut dht = Dht::new(id(1));
         let topic = id(100);

@@ -697,10 +697,6 @@ impl Dht {
         }
         let records = self.announces.entry(topic).or_default();
         let expires_at = now.saturating_add(ANNOUNCE_TTL_MS);
-        self.next_announce_expiry = Some(
-            self.next_announce_expiry
-                .map_or(expires_at, |current| current.min(expires_at)),
-        );
         if let Some(existing) = records.iter_mut().find(|r| r.contact.id == announcer.id) {
             existing.contact.addr = announcer.addr;
             existing.expires_at = expires_at;
@@ -710,6 +706,12 @@ impl Dht {
                 expires_at,
             });
         }
+        // Recompute the earliest expiry rather than only lowering it toward
+        // `expires_at`: a new/refreshed record always carries the *latest* expiry, so
+        // `min(current, expires_at)` would never move — leaving the cache pointing at a
+        // stale-early time when the current earliest record is the one being refreshed,
+        // which triggers needless full prune scans. The set is small (≤ K per topic).
+        self.recompute_next_expiry();
     }
 
     fn prune_announces(&mut self, now: Millis) {
@@ -717,6 +719,12 @@ impl Dht {
             records.retain(|record| record.expires_at > now);
             !records.is_empty()
         });
+        self.recompute_next_expiry();
+    }
+
+    /// Refresh the cached earliest announce-lease expiry (the wakeup the driver's
+    /// housekeeping tick compares against) from the current record set.
+    fn recompute_next_expiry(&mut self) {
         self.next_announce_expiry = self
             .announces
             .values()
@@ -1127,6 +1135,34 @@ mod tests {
             !dht.announces.contains_key(&topic),
             "the tick's handle_timeout prunes the expired lease even though nothing \
              scheduled it"
+        );
+    }
+
+    #[test]
+    fn refreshing_the_earliest_lease_advances_the_cached_expiry() {
+        // Regression: next_announce_expiry must track the *true* earliest expiry, not
+        // stay pinned at a stale-early value. A refresh moves a record's expiry later,
+        // so if the earliest record is refreshed the cache has to advance to the new
+        // earliest — otherwise it fires needless full prune scans early.
+        let mut dht = Dht::new(id(1));
+        let topic = id(100);
+        let a = Contact::new(id(2), addr("10.0.0.2:200"));
+        let b = Contact::new(id(3), addr("10.0.0.3:300"));
+
+        dht.store_announce(topic, a, 0); // a expires at ANNOUNCE_TTL_MS
+        dht.store_announce(topic, b, 100); // b expires at ANNOUNCE_TTL_MS + 100
+        assert_eq!(
+            dht.next_announce_expiry,
+            Some(ANNOUNCE_TTL_MS),
+            "a is earliest"
+        );
+
+        // Refresh a (the earliest) well before it lapses; now b is the earliest.
+        dht.store_announce(topic, a, 500);
+        assert_eq!(
+            dht.next_announce_expiry,
+            Some(ANNOUNCE_TTL_MS + 100),
+            "the cache advances to b's expiry, not the stale pre-refresh value"
         );
     }
 

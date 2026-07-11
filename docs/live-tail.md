@@ -1,6 +1,27 @@
-# Warren — live-tail feed replication (design note)
+# Warren — live-tail feed replication
 
-**Status:** design only, not built (2026-07-11). A companion to [`design.md`](design.md).
+**Status: Layer 1 built (2026-07-11).** Server-push, resumable, per-block-verified
+live replication ships across `sync` → `transfer` → `warren::session`. A companion
+to [`design.md`](design.md).
+
+**What shipped (Layer 1 — the primitive):**
+- `sync`: a `Tail { have }` message + `FeedDownload::resume(pubkey, have)` — request,
+  store, and return only `have..head.len`; the tail is transferred once, never
+  re-fetched, and every block is still verified against the signed head.
+- `transfer`: `serve_feed_tail` (holds a `Tail` at head until an `appended` signal
+  or a keepalive, then pushes — the log is a `Mutex` locked per reply, never across
+  the session, so a subscriber can't block appends) + `subscribe_feed` (the client
+  loop). Tested end-to-end over a lossy link: a subscriber gets pre-existing blocks
+  and each live append, no reconnect, no re-fetch.
+- `warren::session`: `Session::subscribe(member, from, on_block)`; the feed log is a
+  sync `Mutex` + an `appended` `Notify` fired on publish; the accept loop serves via
+  `serve_feed_tail` (batch-compatible, so a normal refresh is unaffected).
+
+**Still ahead:** Layer 2 (swarm-aware tailing + blind-mirror store-and-forward) and
+Layer 3 (deterministic multi-writer merge, Autobase-style, for chat rooms) — see the
+scope notes at the end.
+
+The original design follows, for the rationale.
 
 ## The problem
 

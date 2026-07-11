@@ -333,8 +333,8 @@
         <a href="https://murmur-3yy.pages.dev">see Murmur →</a>
       </div>
       <div class="build">
-        <div class="bh"><h3>Group chat / messaging</h3><span class="state soon">needs live-tail</span></div>
-        <p>Rooms map cleanly onto merged member feeds (text as records, media as blobs). What's missing is <b>live-tail replication</b> — subscribe to a feed and receive appends in real time, rather than polling.</p>
+        <div class="bh"><h3>Group chat / messaging</h3><span class="state now">live-tail built</span></div>
+        <p>Rooms map onto merged member feeds (text as records, media as blobs). <b>Live-tail replication is built</b> — subscribe and get pushed new blocks in real time, each verified against the signed head, no polling. A full room additionally needs deterministic multi-writer ordering (Autobase-style) — the remaining piece.</p>
         <a href="https://github.com/myleshorton/warren/blob/main/docs/live-tail.md">read the design note →</a>
       </div>
       <div class="build">
@@ -439,7 +439,7 @@
       <div class="cap">Streaming download: bounded-window, in-order delivery</div><div class="st built">built</div>
       <div class="cap">Content encryption: seekable per-item seal, ciphertext addressing</div><div class="st built">built</div>
       <div class="cap">Blinded rotating topics + decoupled node id + per-epoch re-announce</div><div class="st built">built</div>
-      <div class="cap">Live-tail feed replication (the real-time / chat unlock)</div><div class="st design">design</div>
+      <div class="cap">Live-tail feed replication (the real-time / chat unlock)</div><div class="st built">built</div>
       <div class="cap">Blind push notifier (iOS background wake without breaking serverless)</div><div class="st design">design</div>
       <div class="cap">Obfuscated / pluggable transport, cover-DHT rendezvous</div><div class="st planned">planned</div>
     </div>

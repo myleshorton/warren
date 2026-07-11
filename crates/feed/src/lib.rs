@@ -159,6 +159,93 @@ impl Log {
     }
 }
 
+/// A readable feed: the three things a sync server needs to answer for — the
+/// current signed head, a block by index, and that block's inclusion proof. The
+/// owner's writable [`Log`] and a read-only [`Replica`] of someone else's feed
+/// both implement it, so a server can serve from either.
+pub trait Source {
+    /// The current signed head.
+    fn head(&self) -> Head;
+    /// The block at `index`, if present.
+    fn get(&self, index: usize) -> Option<&[u8]>;
+    /// An inclusion proof for the block at `index` against the head, or `None`.
+    fn proof(&self, index: usize) -> Option<Proof>;
+}
+
+impl Source for Log {
+    fn head(&self) -> Head {
+        Log::head(self)
+    }
+    fn get(&self, index: usize) -> Option<&[u8]> {
+        Log::get(self, index)
+    }
+    fn proof(&self, index: usize) -> Option<Proof> {
+        Log::proof(self, index)
+    }
+}
+
+/// A verified, read-only copy of *another* owner's feed: their signed [`Head`]
+/// plus the blocks it commits to. Unlike a [`Log`] it holds no keypair, so it can
+/// neither append nor re-sign — only serve what it was given. A blind mirror uses
+/// one to hold and serve a feed on the author's behalf (store-and-forward), and a
+/// subscriber can tail from any replica-holder, not only the author.
+pub struct Replica {
+    public_key: PublicKey,
+    head: Head,
+    blocks: Vec<Vec<u8>>,
+    leaves: Vec<Hash>,
+}
+
+impl Replica {
+    /// Build a replica from a feed's signed `head` and its `blocks` in order.
+    /// Returns `None` unless the copy is provably faithful: the head verifies under
+    /// `public_key`, the block count matches `head.len`, and the blocks reproduce
+    /// `head.root`. So a mirror can neither invent a feed nor serve a doctored one —
+    /// a replica that exists is a real, complete prefix of the owner's feed.
+    pub fn new(public_key: PublicKey, head: Head, blocks: Vec<Vec<u8>>) -> Option<Replica> {
+        if !verify_head(&public_key, &head) || blocks.len() as u64 != head.len {
+            return None;
+        }
+        let leaves: Vec<Hash> = blocks.iter().map(|b| tree::leaf_hash(b)).collect();
+        if tree::merkle_root(&leaves) != head.root {
+            return None;
+        }
+        Some(Replica {
+            public_key,
+            head,
+            blocks,
+            leaves,
+        })
+    }
+
+    /// The replicated feed's owner (the key its head is verified against).
+    pub fn public_key(&self) -> PublicKey {
+        self.public_key
+    }
+    /// Number of blocks held.
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+    /// Whether the replica holds no blocks.
+    pub fn is_empty(&self) -> bool {
+        self.blocks.is_empty()
+    }
+}
+
+impl Source for Replica {
+    fn head(&self) -> Head {
+        self.head.clone()
+    }
+    fn get(&self, index: usize) -> Option<&[u8]> {
+        self.blocks.get(index).map(Vec::as_slice)
+    }
+    fn proof(&self, index: usize) -> Option<Proof> {
+        (index < self.blocks.len()).then(|| Proof {
+            siblings: tree::audit_path(&self.leaves, index),
+        })
+    }
+}
+
 /// The exact bytes the owner signs for a head: a domain tag, the length, and the
 /// root. Both signing and verification go through this, so they can't diverge.
 fn head_message(len: u64, root: &Hash) -> Vec<u8> {
@@ -415,6 +502,63 @@ mod tests {
             let proof = log.proof(i).unwrap();
             assert_eq!(Proof::decode(&proof.encode()).unwrap(), proof);
         }
+    }
+
+    #[test]
+    fn replica_faithfully_reserves_a_feed() {
+        let log = log_with(10);
+        let pk = log.public_key();
+        let head = log.head();
+        let blocks: Vec<Vec<u8>> = (0..log.len())
+            .map(|i| log.get(i).unwrap().to_vec())
+            .collect();
+
+        let replica = Replica::new(pk, head.clone(), blocks).expect("faithful replica");
+        assert_eq!(replica.len(), 10);
+        assert_eq!(replica.head(), head); // same signed head — not re-signed
+        for i in 0..replica.len() {
+            assert_eq!(replica.get(i), log.get(i));
+            let proof = replica.proof(i).unwrap();
+            // The replica's recomputed proof verifies against the owner's head.
+            assert!(verify_block(
+                &pk,
+                &head,
+                i as u64,
+                replica.get(i).unwrap(),
+                &proof
+            ));
+        }
+        assert!(replica.proof(10).is_none());
+    }
+
+    #[test]
+    fn replica_rejects_an_unfaithful_copy() {
+        let log = log_with(5);
+        let pk = log.public_key();
+        let head = log.head();
+        let blocks: Vec<Vec<u8>> = (0..log.len())
+            .map(|i| log.get(i).unwrap().to_vec())
+            .collect();
+
+        // Wrong owner key.
+        let attacker = Keypair::from_seed(&[0x11; 32]).public();
+        assert!(Replica::new(attacker, head.clone(), blocks.clone()).is_none());
+        // A doctored block: the blocks no longer reproduce the signed root.
+        let mut tampered = blocks.clone();
+        tampered[2] = b"evil".to_vec();
+        assert!(Replica::new(pk, head.clone(), tampered).is_none());
+        // A truncated copy: count doesn't match head.len.
+        let mut short = blocks;
+        short.pop();
+        assert!(Replica::new(pk, head, short).is_none());
+    }
+
+    #[test]
+    fn an_empty_feed_replicates() {
+        let log = log_with(0);
+        let replica = Replica::new(log.public_key(), log.head(), vec![]).expect("empty replica");
+        assert!(replica.is_empty());
+        assert_eq!(replica.head(), log.head());
     }
 
     #[test]

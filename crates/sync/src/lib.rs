@@ -255,16 +255,16 @@ impl Message {
 /// Answer a sync request from a local feed. Requests the server can't satisfy
 /// (an out-of-range block) get [`Message::Absent`]. A no-op-safe default for a
 /// response the server has nothing to say to is also `Absent`.
-pub fn serve_feed(request: &Message, log: &feed::Log) -> Message {
+pub fn serve_feed<S: feed::Source>(request: &Message, source: &S) -> Message {
     match request {
         // Both a plain head request and a live-tail poll answer with the current
         // signed head; holding a `Tail` until the feed grows is the I/O layer's job.
-        Message::GetHead | Message::Tail { .. } => Message::Head(log.head()),
+        Message::GetHead | Message::Tail { .. } => Message::Head(source.head()),
         Message::GetBlock { index } => {
             let index = *index;
             match usize::try_from(index)
                 .ok()
-                .and_then(|i| log.get(i).map(<[u8]>::to_vec).zip(log.proof(i)))
+                .and_then(|i| source.get(i).map(<[u8]>::to_vec).zip(source.proof(i)))
             {
                 Some((data, proof)) => Message::Block { index, data, proof },
                 None => Message::Absent,

@@ -668,7 +668,7 @@ pub async fn serve_feed_tail<L: Link>(
     cfg: &Config,
 ) -> Result<(), TransferError> {
     serve(channel, cfg, Some(appended), |request| {
-        sync::serve_feed(request, &log.lock().expect("feed log"))
+        sync::serve_feed(request, &*log.lock().expect("feed log"))
     })
     .await
 }

@@ -14,7 +14,7 @@
 //! ```
 
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::record::Record;
@@ -95,12 +95,20 @@ pub fn rebuild(
     let mut store = blob::Store::new();
     let mut records = Vec::new();
 
-    let raw = fs::read_to_string(feed_path(data_dir)).unwrap_or_default();
-    for line in raw.lines() {
+    // Stream the feed line-by-line rather than slurping it whole (a long feed
+    // shouldn't spike memory at startup). A missing file is a fresh node (empty);
+    // any *other* open/read error is surfaced, not silently treated as data loss.
+    let file = match fs::File::open(feed_path(data_dir)) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((log, store, records)),
+        Err(e) => return Err(e),
+    };
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line?; // propagate a mid-file read error rather than truncate
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<Record>(line) else {
+        let Ok(record) = serde_json::from_str::<Record>(&line) else {
             continue; // skip a corrupt line rather than fail the whole rebuild
         };
         // The line verbatim is the feed block.

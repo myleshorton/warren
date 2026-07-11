@@ -541,7 +541,8 @@
       var count=Math.max(20, Math.min(52, Math.round(W*H/30000)));
       nodes=[]; pulses=[];
       for(var i=0;i<count;i++){
-        nodes.push({ x:Math.random()*W, y:Math.random()*H, vx:(Math.random()-.5)*0.1, vy:(Math.random()-.5)*0.1,
+        nodes.push({ x:Math.random()*W, y:Math.random()*H,
+          vx:reduce?0:(Math.random()-.5)*0.1, vy:reduce?0:(Math.random()-.5)*0.1,
           hub:Math.random()<0.14 });
       }
     }
@@ -574,10 +575,12 @@
         g.addColorStop(0,"rgba("+COL.cyan+",0.95)"); g.addColorStop(1,"rgba("+COL.cyan+",0)");
         ctx.fillStyle=g; ctx.beginPath(); ctx.arc(x,y,6,0,7); ctx.fill();
       }
-      raf=requestAnimationFrame(step);
+      // Reduced motion: render the mesh once as a static diagram — don't keep the
+      // rAF loop (and its per-frame redraw) running.
+      if(!reduce) raf=requestAnimationFrame(step);
     }
     resize(); step();
-    window.addEventListener('resize', function(){ resize(); });
+    window.addEventListener('resize', function(){ resize(); if(reduce) step(); });
   })();
 </script>
 </body>

@@ -64,13 +64,18 @@ pub struct Discovered {
 pub struct Session {
     /// The DHT node, exposed so the app can announce + run its own accept loop.
     pub node: driver::Node,
-    log: Arc<AsyncMutex<feed::Log>>,
+    /// The signed feed log. A **sync** mutex, not async: it's locked briefly per
+    /// operation and never held across an `.await`, so a live-tail serve (which
+    /// locks per reply, forever) can't block appends.
+    log: Arc<StdMutex<feed::Log>>,
     store: Arc<AsyncMutex<blob::Store>>,
     feed_pubkey: crypto::PublicKey,
     keys: Keys,
     data_dir: PathBuf,
     held: Arc<StdMutex<Vec<crypto::Hash>>>,
     clip_keys: Arc<StdMutex<HashMap<String, Enc>>>,
+    /// Fired on every append to `log` so a live-tail serve wakes and pushes at once.
+    appended: Arc<tokio::sync::Notify>,
 }
 
 impl Session {
@@ -79,7 +84,7 @@ impl Session {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         node: driver::Node,
-        log: Arc<AsyncMutex<feed::Log>>,
+        log: Arc<StdMutex<feed::Log>>,
         store: Arc<AsyncMutex<blob::Store>>,
         feed_pubkey: crypto::PublicKey,
         keys: Keys,
@@ -96,12 +101,19 @@ impl Session {
             data_dir,
             held,
             clip_keys,
+            appended: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
-    /// Shared feed log — the app's accept loop serves it.
-    pub fn log(&self) -> Arc<AsyncMutex<feed::Log>> {
+    /// Shared feed log — the app's accept loop serves it (via `serve_feed_tail`,
+    /// paired with [`Self::appended`]). Locked per operation, never across `.await`.
+    pub fn log(&self) -> Arc<StdMutex<feed::Log>> {
         self.log.clone()
+    }
+    /// The append signal to pass to `serve_feed_tail`; fired whenever we publish, so
+    /// a live subscriber is pushed the new block immediately.
+    pub fn appended(&self) -> Arc<tokio::sync::Notify> {
+        self.appended.clone()
     }
     /// Shared blob store — the app's accept loop serves from it.
     pub fn store(&self) -> Arc<AsyncMutex<blob::Store>> {
@@ -205,7 +217,11 @@ impl Session {
             enc: enc.clone(),
         };
         let line = serde_json::to_string(&record).unwrap_or_default();
-        self.log.lock().await.append(line.clone().into_bytes());
+        self.log
+            .lock()
+            .expect("feed log")
+            .append(line.clone().into_bytes());
+        self.appended.notify_waiters(); // wake any live-tail subscribers
         store::append_record(&self.data_dir, &blob_hex, &stored, &line)?;
 
         if let Some(hash) = util::bytes_from_hex::<32>(&blob_hex) {
@@ -219,6 +235,32 @@ impl Session {
                 .insert(blob_hex, enc);
         }
         Ok(record)
+    }
+
+    /// Live-tail a member's feed: connect and deliver its blocks via `on_block` as
+    /// they are appended, starting from block `from`. Runs until the channel breaks
+    /// or the future is dropped/aborted — a real-time app (chat) spawns one per
+    /// member and merges the streams. The member's feed key is learned + trusted
+    /// from the serve handshake (as in discovery); every block is verified against
+    /// it. The peer must serve with `serve_feed_tail` (Murmur's accept loop does).
+    pub async fn subscribe<F>(
+        &self,
+        member: swarm::NodeId,
+        from: u64,
+        on_block: F,
+    ) -> Result<(), String>
+    where
+        F: FnMut(u64, Vec<u8>),
+    {
+        protocol::subscribe_feed(
+            &self.node,
+            member,
+            protocol::REQ_FEED,
+            from,
+            &transfer::Config::default(),
+            on_block,
+        )
+        .await
     }
 
     /// Discover the channel: look up members (current + previous epoch), download

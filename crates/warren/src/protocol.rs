@@ -31,6 +31,26 @@ pub async fn serve_feed(
     transfer::serve_feed(channel, log, cfg).await.is_ok()
 }
 
+/// Serve our feed to a **live subscriber**: send our feed key, then hold the
+/// connection open and push new blocks as they're appended (see
+/// [`transfer::serve_feed_tail`]). A superset of [`serve_feed`] — a batch client
+/// that never polls with `Tail` is served identically — so an accept loop can use
+/// this for every feed request. Signal `appended` on each append to `log`.
+pub async fn serve_feed_tail(
+    channel: &mut Channel,
+    feed_pubkey: &crypto::PublicKey,
+    log: &std::sync::Mutex<feed::Log>,
+    appended: &tokio::sync::Notify,
+    cfg: &transfer::Config,
+) -> bool {
+    if channel.send(&feed_pubkey.to_bytes()).await.is_err() {
+        return false;
+    }
+    transfer::serve_feed_tail(channel, log, appended, cfg)
+        .await
+        .is_ok()
+}
+
 /// Serve a blob to a peer that asked for it.
 pub async fn serve_blob(
     channel: &mut Channel,
@@ -38,6 +58,41 @@ pub async fn serve_blob(
     cfg: &transfer::Config,
 ) -> bool {
     transfer::serve_blob(channel, store, cfg).await.is_ok()
+}
+
+/// Connect to `peer`, do the feed handshake (send `req`, receive the peer's 32-byte
+/// feed key), then **live-tail** its feed from block `from`: deliver each new block
+/// via `on_block` as it's appended, verified against the served key. Runs until the
+/// channel breaks (or the future is dropped). The peer must serve with
+/// [`serve_feed_tail`].
+pub async fn subscribe_feed<F>(
+    node: &Node,
+    peer: NodeId,
+    req: u8,
+    from: u64,
+    cfg: &transfer::Config,
+    on_block: F,
+) -> Result<(), String>
+where
+    F: FnMut(u64, Vec<u8>),
+{
+    let conn = node
+        .connect(peer)
+        .await
+        .map_err(|e| format!("connect: {e:?}"))?;
+    let mut ch = conn.channel.ok_or("no data channel")?;
+    ch.send(&[req]).await.map_err(|e| format!("send: {e}"))?;
+
+    let mut buf = [0u8; 64];
+    let n = ch.recv(&mut buf).await.map_err(|e| format!("recv: {e}"))?;
+    if n < 32 {
+        return Err("no feed key in handshake".to_string());
+    }
+    let pk_bytes: [u8; 32] = buf[..32].try_into().map_err(|_| "bad feed key")?;
+    let pubkey = crypto::PublicKey::from_bytes(&pk_bytes).map_err(|_| "bad feed key")?;
+    transfer::subscribe_feed(&mut ch, pubkey, from, cfg, on_block)
+        .await
+        .map_err(|e| format!("{e:?}"))
 }
 
 /// Connect to `peer`, send the feed-style request kind `req`, receive the peer's

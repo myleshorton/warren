@@ -220,7 +220,10 @@ where
         for (offset, block) in dl.into_blocks().into_iter().enumerate() {
             on_block(from + offset as u64, block);
         }
-        from = next;
+        // Never let the cursor go backwards: on failover to a provider whose head is
+        // temporarily behind ours (or a buggy/hostile one reporting a short head), a
+        // regressing cursor would re-fetch and re-deliver already-seen blocks.
+        from = next.max(from);
     }
 }
 

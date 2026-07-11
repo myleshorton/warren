@@ -108,11 +108,14 @@ pub fn rebuild(
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(record) = serde_json::from_str::<Record>(&line) else {
-            continue; // skip a corrupt line rather than fail the whole rebuild
-        };
-        // The line verbatim is the feed block.
+        // The line verbatim IS the feed block — append it *unconditionally* so the
+        // rebuilt log reproduces the originally-published Merkle roots (and the same
+        // signed feed). Decoding it into a Record is best-effort, for the records
+        // list + blob cache; a line that fails to decode is still a real block.
         log.append(line.as_bytes().to_vec());
+        let Ok(record) = serde_json::from_str::<Record>(&line) else {
+            continue; // undecodable line: kept as a feed block, no record/blob
+        };
         // Re-ingest the blob bytes so we can serve them (content-addressed, so
         // re-splitting reproduces the same manifest/blob id).
         if let Some(blob_hex) = &record.blob {

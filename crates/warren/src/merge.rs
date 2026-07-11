@@ -16,7 +16,7 @@
 //!   `pending` (you can't place a reply before the message it answers); it becomes
 //!   orderable once the ancestor arrives, and what's already ordered never reorders.
 //!
-//! This is sans-IO and pure — the same discipline as [`sync`](sync). The network
+//! This is sans-IO and pure — the same discipline as the `sync` crate. The network
 //! layer (Layer 2) already carries the records; ordering them is entirely local.
 
 use std::cmp::Reverse;

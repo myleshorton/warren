@@ -1,6 +1,6 @@
 //! The general signed-record envelope + its encryption metadata.
 //!
-//! A record is one block in a creator's signed [`feed`](feed) log. It is
+//! A record is one block in a creator's signed [`feed`] log. It is
 //! deliberately content-agnostic: `content_type` says what the payload is, a small
 //! payload can ride inline in `body`, a large one is a content-addressed `blob`
 //! attachment, and `meta` carries whatever app-specific fields an application needs

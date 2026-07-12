@@ -125,23 +125,26 @@ pub fn meta(subject: WriterId) -> serde_json::Map<String, serde_json::Value> {
 }
 
 /// Compute the current member set from a batch of positioned feed records — the bridge an
-/// aggregator (e.g. a session that discovered channel members' feeds) calls. Each item is
-/// `(index, record)`, the record at its 0-based position in its author's feed. Roster
-/// records are decoded to changes and folded via [`resolve`]; every other record is
-/// ignored. The author is the record's authenticated feed key (see [`resolve`]).
+/// aggregator (e.g. a session that discovered channel members' feeds) calls.
+///
+/// Each item is `(writer, index, record)`: `writer` is the **authenticated feed key** the
+/// record's blocks were verified against (i.e. the feed it was replicated in), and `index`
+/// its 0-based position in that feed. The record's own `author` field is self-declared and
+/// is **never** consulted here — trusting it would let a forged `author` bypass roster
+/// authorization. Roster records are decoded to changes and folded via [`resolve`]; every
+/// other record is ignored.
 pub fn members_from_records(
     founder: WriterId,
-    records: impl IntoIterator<Item = (u64, Record)>,
+    records: impl IntoIterator<Item = (WriterId, u64, Record)>,
 ) -> BTreeSet<WriterId> {
     let entries: Vec<Entry<Change>> = records
         .into_iter()
-        .filter_map(|(index, rec)| {
-            let change = change_from_record(&rec)?;
-            rec.into_entry(index).map(|e| Entry {
-                writer: e.writer,
-                index: e.index,
-                lamport: e.lamport,
-                clock: e.clock,
+        .filter_map(|(writer, index, rec)| {
+            change_from_record(&rec).map(|change| Entry {
+                writer, // the authenticated feed key, not rec.author
+                index,
+                lamport: rec.lamport,
+                clock: rec.causal_clock(),
                 payload: change,
             })
         })
@@ -326,10 +329,11 @@ mod tests {
 
     #[test]
     fn members_from_records_folds_a_discovered_batch() {
-        // founder(1) adds 2 at feed #0; 2 (having seen it) adds 3 at feed #0 (clock {1:1}).
+        // (authenticated writer, index, record). founder(1) adds 2 at feed #0; 2 (having
+        // seen it) adds 3 at feed #0 (clock {1:1}).
         let batch = vec![
-            (0u64, rec(1, ADD, 2, &[], 0)),
-            (0u64, rec(2, ADD, 3, &[(1, 1)], 1)),
+            (id(1), 0u64, rec(1, ADD, 2, &[], 0)),
+            (id(2), 0u64, rec(2, ADD, 3, &[(1, 1)], 1)),
         ];
         assert_eq!(
             members_from_records(id(1), batch),
@@ -340,12 +344,25 @@ mod tests {
     #[test]
     fn members_from_records_ignores_non_membership_records() {
         let batch = vec![
-            (0u64, rec(1, ADD, 2, &[], 0)),
-            (1u64, rec(1, "video/mp4", 0, &[(1, 1)], 1)), // 1's next feed record, not a change
+            (id(1), 0u64, rec(1, ADD, 2, &[], 0)),
+            (id(1), 1u64, rec(1, "video/mp4", 0, &[(1, 1)], 1)), // 1's next record, not a change
         ];
         assert_eq!(
             members_from_records(id(1), batch),
             BTreeSet::from([id(1), id(2)])
+        );
+    }
+
+    #[test]
+    fn members_from_records_ignores_a_forged_author_field() {
+        // An attacker (feed key 9) publishes an add-of-8, but forges the record's `author`
+        // field to claim the founder (1). The authenticated writer is 9 (the feed it was
+        // verified in) — which isn't a member — so the change is inert and 8 never joins.
+        let mut forged = rec(9, ADD, 8, &[], 0);
+        forged.author = util::to_hex(&id(1)); // lie: claim to be the founder
+        assert_eq!(
+            members_from_records(id(1), vec![(id(9), 0u64, forged)]),
+            BTreeSet::from([id(1)])
         );
     }
 }

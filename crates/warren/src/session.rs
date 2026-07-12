@@ -310,12 +310,14 @@ impl Session {
         };
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Persist and append under the log lock, so the two stay in the *same order*
-        // even with concurrent publishers (on-disk line order == in-memory Merkle
-        // order, so the head served to subscribers is what rebuild reproduces), and so
-        // a returned `Err` (the persist failed) means "not published" — the in-memory
-        // log is only touched after the durable write. `append_line` is synchronous fs
-        // (no `.await`), so this brief hold can't wedge a live-tail serve.
+        // Append to the feed file and the in-memory log under the log lock, so the two
+        // stay in the *same order* even with concurrent publishers (on-disk line order
+        // == in-memory Merkle order, so the head served to subscribers is what rebuild
+        // reproduces), and so a returned `Err` (the file append failed) means "not
+        // published" — the in-memory log is touched only after the append returns `Ok`.
+        // (Best-effort persistence: `append_line` doesn't `fsync`, so it isn't durable
+        // against a crash/power loss.) It's synchronous fs (no `.await`), so this brief
+        // hold can't wedge a live-tail serve.
         {
             let mut log = self.log.lock().expect("feed log");
             store::append_line(&self.data_dir, &line)?;

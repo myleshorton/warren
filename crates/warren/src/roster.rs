@@ -124,13 +124,16 @@ pub fn meta(subject: WriterId) -> serde_json::Map<String, serde_json::Value> {
     m
 }
 
-/// Compute the current member set from a batch of an author's feed records — the bridge an
-/// aggregator (e.g. a session that discovered channel members' feeds) calls.
+/// Compute the current member set from a batch of feed records — typically every record an
+/// aggregator discovered across the channel's members (many authors), which is exactly what
+/// a session hands over.
 ///
 /// Each item is `(writer, record)`, where `writer` is the **authenticated feed key** the
 /// record's blocks were verified against (the feed it was replicated in) — the record's own
 /// `author` field is self-declared and is **never** consulted here, so a forged `author`
-/// can't bypass authorization. Pass each author's records **in feed order**.
+/// can't bypass authorization. The batch may mix authors freely; the only ordering
+/// requirement is that records **from the same author appear in that author's feed order**
+/// (so the per-author roster index below is assigned correctly).
 ///
 /// The roster is **its own append-only log**: only `member.add`/`member.remove` records
 /// count, and each is positioned by its index *among that author's roster records* (a

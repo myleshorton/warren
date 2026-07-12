@@ -19,6 +19,11 @@
 use std::collections::BTreeSet;
 
 use crate::merge::{self, Entry, WriterId};
+use crate::record::Record;
+use crate::util;
+
+/// The `meta` key a membership record carries: the hex feed key being added/removed.
+pub const SUBJECT: &str = "subject";
 
 /// `content_type` of the two membership records (the record's `meta.subject` is the hex
 /// feed key being added/removed).
@@ -90,6 +95,61 @@ pub fn resolve(founder: WriterId, entries: Vec<Entry<Change>>) -> BTreeSet<Write
     let changes: Vec<(WriterId, Change)> =
         ordered.into_iter().map(|e| (e.writer, e.payload)).collect();
     members(founder, &changes)
+}
+
+/// Decode a membership [`Change`] from a record, or `None` if it isn't a `member.add` /
+/// `member.remove` (or its `meta.subject` isn't a 32-byte hex key). The author is *not*
+/// read from the record here — [`members_from_records`] takes it from the authenticated
+/// feed position, never a payload field.
+pub fn change_from_record(rec: &Record) -> Option<Change> {
+    let add = match rec.content_type.as_str() {
+        ADD => true,
+        REMOVE => false,
+        _ => return None,
+    };
+    let subject = rec
+        .meta
+        .get(SUBJECT)
+        .and_then(|v| v.as_str())
+        .and_then(util::bytes_from_hex::<32>)?;
+    Some(Change { subject, add })
+}
+
+/// The `meta` map a `member.add`/`member.remove` record carries — the counterpart to
+/// [`change_from_record`], for the publish side. Publish a roster record as a body-less
+/// record with `content_type` [`ADD`]/[`REMOVE`] and this `meta`.
+pub fn meta(subject: WriterId) -> serde_json::Map<String, serde_json::Value> {
+    let mut m = serde_json::Map::new();
+    m.insert(SUBJECT.to_string(), util::to_hex(&subject).into());
+    m
+}
+
+/// Compute the current member set from a batch of positioned feed records — the bridge an
+/// aggregator (e.g. a session that discovered channel members' feeds) calls.
+///
+/// Each item is `(writer, index, record)`: `writer` is the **authenticated feed key** the
+/// record's blocks were verified against (i.e. the feed it was replicated in), and `index`
+/// its 0-based position in that feed. The record's own `author` field is self-declared and
+/// is **never** consulted here — trusting it would let a forged `author` bypass roster
+/// authorization. Roster records are decoded to changes and folded via [`resolve`]; every
+/// other record is ignored.
+pub fn members_from_records(
+    founder: WriterId,
+    records: impl IntoIterator<Item = (WriterId, u64, Record)>,
+) -> BTreeSet<WriterId> {
+    let entries: Vec<Entry<Change>> = records
+        .into_iter()
+        .filter_map(|(writer, index, rec)| {
+            change_from_record(&rec).map(|change| Entry {
+                writer, // the authenticated feed key, not rec.author
+                index,
+                lamport: rec.lamport,
+                clock: rec.causal_clock(),
+                payload: change,
+            })
+        })
+        .collect();
+    resolve(founder, entries)
 }
 
 #[cfg(test)]
@@ -219,5 +279,90 @@ mod tests {
         // would apply once 1's record arrives — nothing is discarded.)
         let e_add3 = entry(2, 0, 1, &[(1, 1)], 3, true);
         assert_eq!(resolve(id(1), vec![e_add3]), BTreeSet::from([id(1)]));
+    }
+
+    // --- the record bridge: decode real Records and fold a discovered batch ---
+
+    /// A membership record: authored by feed key `author`, `content_type` add/remove of
+    /// `subject`, with the given merge clock/lamport.
+    fn rec(
+        author: u8,
+        content_type: &str,
+        subject: u8,
+        clock: &[(u8, u64)],
+        lamport: u64,
+    ) -> Record {
+        Record {
+            author: util::to_hex(&id(author)),
+            content_type: content_type.to_string(),
+            meta: meta(id(subject)),
+            clock: clock
+                .iter()
+                .map(|&(w, k)| (util::to_hex(&id(w)), k))
+                .collect(),
+            lamport,
+            ..Record::default()
+        }
+    }
+
+    #[test]
+    fn change_from_record_decodes_add_and_remove_and_ignores_others() {
+        assert_eq!(
+            change_from_record(&rec(1, ADD, 2, &[], 0)),
+            Some(Change {
+                subject: id(2),
+                add: true
+            })
+        );
+        assert_eq!(
+            change_from_record(&rec(1, REMOVE, 2, &[], 0)),
+            Some(Change {
+                subject: id(2),
+                add: false
+            })
+        );
+        // a non-membership record (e.g. a video post) is not a change
+        let mut video = rec(1, "video/mp4", 0, &[], 0);
+        video.meta.clear();
+        assert_eq!(change_from_record(&video), None);
+    }
+
+    #[test]
+    fn members_from_records_folds_a_discovered_batch() {
+        // (authenticated writer, index, record). founder(1) adds 2 at feed #0; 2 (having
+        // seen it) adds 3 at feed #0 (clock {1:1}).
+        let batch = vec![
+            (id(1), 0u64, rec(1, ADD, 2, &[], 0)),
+            (id(2), 0u64, rec(2, ADD, 3, &[(1, 1)], 1)),
+        ];
+        assert_eq!(
+            members_from_records(id(1), batch),
+            BTreeSet::from([id(1), id(2), id(3)])
+        );
+    }
+
+    #[test]
+    fn members_from_records_ignores_non_membership_records() {
+        let batch = vec![
+            (id(1), 0u64, rec(1, ADD, 2, &[], 0)),
+            (id(1), 1u64, rec(1, "video/mp4", 0, &[(1, 1)], 1)), // 1's next record, not a change
+        ];
+        assert_eq!(
+            members_from_records(id(1), batch),
+            BTreeSet::from([id(1), id(2)])
+        );
+    }
+
+    #[test]
+    fn members_from_records_ignores_a_forged_author_field() {
+        // An attacker (feed key 9) publishes an add-of-8, but forges the record's `author`
+        // field to claim the founder (1). The authenticated writer is 9 (the feed it was
+        // verified in) — which isn't a member — so the change is inert and 8 never joins.
+        let mut forged = rec(9, ADD, 8, &[], 0);
+        forged.author = util::to_hex(&id(1)); // lie: claim to be the founder
+        assert_eq!(
+            members_from_records(id(1), vec![(id(9), 0u64, forged)]),
+            BTreeSet::from([id(1)])
+        );
     }
 }

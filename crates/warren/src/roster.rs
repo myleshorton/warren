@@ -102,10 +102,22 @@ mod tests {
 
     /// (authenticated author, change) — the shape `members` folds.
     fn add(author: u8, subject: u8) -> (WriterId, Change) {
-        (id(author), Change { subject: id(subject), add: true })
+        (
+            id(author),
+            Change {
+                subject: id(subject),
+                add: true,
+            },
+        )
     }
     fn remove(author: u8, subject: u8) -> (WriterId, Change) {
-        (id(author), Change { subject: id(subject), add: false })
+        (
+            id(author),
+            Change {
+                subject: id(subject),
+                add: false,
+            },
+        )
     }
 
     #[test]
@@ -156,13 +168,23 @@ mod tests {
     /// A roster record as a merge entry: feed key `writer` authored it at `index`, having
     /// seen the positions in `clock`; `lamport` supplied for the tiebreak. The payload is
     /// the change (subject + add) — the author is `writer`, not anything in the payload.
-    fn entry(writer: u8, index: u64, lamport: u64, clock: &[(u8, u64)], subject: u8, add: bool) -> Entry<Change> {
+    fn entry(
+        writer: u8,
+        index: u64,
+        lamport: u64,
+        clock: &[(u8, u64)],
+        subject: u8,
+        add: bool,
+    ) -> Entry<Change> {
         Entry {
             writer: id(writer),
             index,
             lamport,
             clock: clock.iter().map(|&(w, k)| (id(w), k)).collect(),
-            payload: Change { subject: id(subject), add },
+            payload: Change {
+                subject: id(subject),
+                add,
+            },
         }
     }
 
@@ -184,7 +206,10 @@ mod tests {
         let forward = resolve(id(1), vec![e_add2.clone(), e_add3.clone()]);
         let shuffled = resolve(id(1), vec![e_add3, e_add2]);
         assert_eq!(forward, BTreeSet::from([id(1), id(2), id(3)]));
-        assert_eq!(forward, shuffled, "membership converges regardless of arrival order");
+        assert_eq!(
+            forward, shuffled,
+            "membership converges regardless of arrival order"
+        );
     }
 
     #[test]

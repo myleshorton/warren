@@ -72,6 +72,18 @@ the state at that point:
 - Because authorization is evaluated against the linearized prefix, the result is a pure
   function of the record set — the convergence invariant extends to membership.
 
+**The roster is its own log.** A membership record's merge clock is stamped over *other
+roster records only*, and it is positioned by its index *among its author's roster records*
+(a roster-only index space, distinct from the author's full-feed position). So membership
+orders and converges **independently of content volume** — a `member.add` never waits on a
+video block to become orderable, and the resolver never has to hold the entire content log
+to place a membership change. The alternative (fold membership over the full content log,
+sharing one clock/index space) was rejected: it couples roster convergence to content and
+forces the resolver to linearize everything. Consequences: a publisher stamps membership
+clocks from a roster-only view, and `warren::roster::members_from_records` enumerates the
+per-author roster index itself (it takes `(writer, record)` in feed order and counts only
+roster records).
+
 ### Record shape
 
 Roster records are ordinary body-only feed records (same envelope as a comment/message),

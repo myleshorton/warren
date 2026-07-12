@@ -124,23 +124,36 @@ pub fn meta(subject: WriterId) -> serde_json::Map<String, serde_json::Value> {
     m
 }
 
-/// Compute the current member set from a batch of positioned feed records — the bridge an
-/// aggregator (e.g. a session that discovered channel members' feeds) calls.
+/// Compute the current member set from a batch of feed records — typically every record an
+/// aggregator discovered across the channel's members (many authors), which is exactly what
+/// a session hands over.
 ///
-/// Each item is `(writer, index, record)`: `writer` is the **authenticated feed key** the
-/// record's blocks were verified against (i.e. the feed it was replicated in), and `index`
-/// its 0-based position in that feed. The record's own `author` field is self-declared and
-/// is **never** consulted here — trusting it would let a forged `author` bypass roster
-/// authorization. Roster records are decoded to changes and folded via [`resolve`]; every
-/// other record is ignored.
+/// Each item is `(writer, record)`, where `writer` is the **authenticated feed key** the
+/// record's blocks were verified against (the feed it was replicated in) — the record's own
+/// `author` field is self-declared and is **never** consulted here, so a forged `author`
+/// can't bypass authorization. The batch may mix authors freely; the only ordering
+/// requirement is that records **from the same author appear in that author's feed order**
+/// (so the per-author roster index below is assigned correctly).
+///
+/// The roster is **its own append-only log**: only `member.add`/`member.remove` records
+/// count, and each is positioned by its index *among that author's roster records* (a
+/// roster-only index space, enumerated here), matching how a publisher stamps a membership
+/// record's clock over other roster records only. So the roster orders and converges
+/// independently of how much other content (videos, comments, chat) a feed carries — a
+/// membership record never waits on a video to become orderable. Non-roster records are
+/// ignored; the roster changes are folded via [`resolve`].
 pub fn members_from_records(
     founder: WriterId,
-    records: impl IntoIterator<Item = (WriterId, u64, Record)>,
+    records: impl IntoIterator<Item = (WriterId, Record)>,
 ) -> BTreeSet<WriterId> {
+    let mut next: std::collections::BTreeMap<WriterId, u64> = std::collections::BTreeMap::new();
     let entries: Vec<Entry<Change>> = records
         .into_iter()
-        .filter_map(|(writer, index, rec)| {
-            change_from_record(&rec).map(|change| Entry {
+        .filter_map(|(writer, rec)| {
+            let change = change_from_record(&rec)?; // only roster records advance the index
+            let index = *next.get(&writer).unwrap_or(&0);
+            next.insert(writer, index + 1);
+            Some(Entry {
                 writer, // the authenticated feed key, not rec.author
                 index,
                 lamport: rec.lamport,
@@ -329,11 +342,12 @@ mod tests {
 
     #[test]
     fn members_from_records_folds_a_discovered_batch() {
-        // (authenticated writer, index, record). founder(1) adds 2 at feed #0; 2 (having
-        // seen it) adds 3 at feed #0 (clock {1:1}).
+        // (authenticated writer, record), each author's records in feed order. founder(1)
+        // adds 2 (1's roster record #0); 2, having seen it, adds 3 (2's roster record #0,
+        // clock {1:1} = saw 1's first roster record).
         let batch = vec![
-            (id(1), 0u64, rec(1, ADD, 2, &[], 0)),
-            (id(2), 0u64, rec(2, ADD, 3, &[(1, 1)], 1)),
+            (id(1), rec(1, ADD, 2, &[], 0)),
+            (id(2), rec(2, ADD, 3, &[(1, 1)], 1)),
         ];
         assert_eq!(
             members_from_records(id(1), batch),
@@ -342,10 +356,12 @@ mod tests {
     }
 
     #[test]
-    fn members_from_records_ignores_non_membership_records() {
+    fn members_from_records_ignores_non_membership_records_without_shifting_the_index() {
+        // The interleaved video is not a roster record, so it's ignored and does NOT
+        // advance 1's roster-record index — 1's add-of-2 is still roster record #0.
         let batch = vec![
-            (id(1), 0u64, rec(1, ADD, 2, &[], 0)),
-            (id(1), 1u64, rec(1, "video/mp4", 0, &[(1, 1)], 1)), // 1's next record, not a change
+            (id(1), rec(1, "video/mp4", 0, &[], 0)),
+            (id(1), rec(1, ADD, 2, &[], 0)),
         ];
         assert_eq!(
             members_from_records(id(1), batch),
@@ -361,7 +377,7 @@ mod tests {
         let mut forged = rec(9, ADD, 8, &[], 0);
         forged.author = util::to_hex(&id(1)); // lie: claim to be the founder
         assert_eq!(
-            members_from_records(id(1), vec![(id(9), 0u64, forged)]),
+            members_from_records(id(1), vec![(id(9), forged)]),
             BTreeSet::from([id(1)])
         );
     }

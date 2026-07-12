@@ -17,6 +17,7 @@ pub mod merge;
 pub mod protocol;
 pub mod record;
 pub mod room;
+pub mod roster;
 pub mod session;
 pub mod store;
 pub mod util;

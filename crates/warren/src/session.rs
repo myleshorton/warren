@@ -257,12 +257,19 @@ impl Session {
         // it as an error rather than silently persisting nonsense.)
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        self.log
-            .lock()
-            .expect("feed log")
-            .append(line.clone().into_bytes());
+        // Persist the blob (content-addressed, order-independent) *outside* the log
+        // lock so a large write can't block feed serving; then append the feed line
+        // and the in-memory log together *under* the lock — the same ordering + error
+        // semantics as `publish_body`: concurrent publishers can't reorder the on-disk
+        // feed against the in-memory Merkle order, and a returned `Err` means "not
+        // published". Notify only after the (best-effort) line append returns `Ok`.
+        store::write_blob(&self.data_dir, &blob_hex, &stored)?;
+        {
+            let mut log = self.log.lock().expect("feed log");
+            store::append_line(&self.data_dir, &line)?;
+            log.append(line.into_bytes());
+        }
         self.appended.notify_waiters(); // wake any live-tail subscribers
-        store::append_record(&self.data_dir, &blob_hex, &stored, &line)?;
 
         if let Some(hash) = util::bytes_from_hex::<32>(&blob_hex) {
             self.held.lock().expect("held").push(hash);

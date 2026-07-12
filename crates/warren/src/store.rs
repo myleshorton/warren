@@ -155,17 +155,21 @@ pub fn append_record(
     line: &str,
 ) -> std::io::Result<()> {
     // Validate the line before touching the filesystem, so a bad one can't leave an
-    // orphan blob behind.
+    // orphan blob behind, then write the blob and append the feed line.
     check_feed_line(line)?;
+    write_blob(data_dir, blob_hex, blob_bytes)?;
+    append_line(data_dir, line)
+}
+
+/// Write a blob's bytes to its content-addressed file (no feed append). Split out so
+/// a caller can persist a (possibly large) blob *outside* a lock and append the feed
+/// line separately under one — keeping on-disk feed order aligned with the in-memory
+/// log without holding that lock across a big write.
+pub fn write_blob(data_dir: &Path, blob_hex: &str, blob_bytes: &[u8]) -> std::io::Result<()> {
     let path = blob_path(data_dir, blob_hex)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid blob id"))?;
     fs::create_dir_all(blobs_dir(data_dir))?;
     fs::write(path, blob_bytes)?;
-    let mut f = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(feed_path(data_dir))?;
-    writeln!(f, "{line}")?;
     Ok(())
 }
 

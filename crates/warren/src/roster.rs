@@ -73,8 +73,12 @@ pub fn members(founder: WriterId, changes: &[Change]) -> BTreeSet<WriterId> {
 /// set — the network-facing entry point. Hand it every [`Change`] you've decoded (each
 /// wrapped in its record's merge [`Entry`]); it computes membership in the one causal order
 /// all participants agree on. Entries whose causal ancestor hasn't arrived stay *pending*
-/// in `merge` and are simply not yet applied (you can't authorize on an unseen prefix),
-/// so membership grows monotonically as feeds fill in — never reordering what it has.
+/// in `merge` and are simply not yet applied (you can't authorize on an unseen prefix).
+/// What grows monotonically as feeds fill in is `merge`'s **ordered record sequence** (its
+/// grow-only prefix, never reordered); the member *set* is a deterministic fold over that
+/// sequence and may grow *or* shrink as records arrive — a newly-orderable `member.remove`
+/// reduces it. What never happens is a reorder that retroactively changes an earlier
+/// membership decision.
 pub fn resolve(founder: WriterId, entries: Vec<Entry<Change>>) -> BTreeSet<WriterId> {
     let ordered = merge::linearize(entries).ordered;
     let changes: Vec<Change> = ordered.into_iter().map(|e| e.payload).collect();

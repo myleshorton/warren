@@ -131,6 +131,20 @@ pub fn rebuild(
     Ok((log, store, records))
 }
 
+/// A feed block is exactly one line, so reject an empty, whitespace-only, or
+/// multi-line `line`: `writeln!` would otherwise append several blocks at once, or a
+/// line `rebuild` skips (it drops lines that trim to empty) — either way the on-disk
+/// feed would diverge from the in-memory log on restart.
+fn check_feed_line(line: &str) -> std::io::Result<()> {
+    if line.trim().is_empty() || line.contains('\n') || line.contains('\r') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "feed line must be a single non-empty, non-whitespace line",
+        ));
+    }
+    Ok(())
+}
+
 /// Persist a freshly published record: write its blob bytes and append its
 /// feed-block line. `line` is the feed-block text *without* a trailing newline — a
 /// single `\n` delimiter is added here.
@@ -140,6 +154,9 @@ pub fn append_record(
     blob_bytes: &[u8],
     line: &str,
 ) -> std::io::Result<()> {
+    // Validate the line before touching the filesystem, so a bad one can't leave an
+    // orphan blob behind.
+    check_feed_line(line)?;
     let path = blob_path(data_dir, blob_hex)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid blob id"))?;
     fs::create_dir_all(blobs_dir(data_dir))?;
@@ -157,16 +174,7 @@ pub fn append_record(
 /// rather than as a content-addressed attachment. `line` is the feed-block text
 /// *without* a trailing newline — a single `\n` delimiter is added here.
 pub fn append_line(data_dir: &Path, line: &str) -> std::io::Result<()> {
-    // One block per line: reject an empty, whitespace-only, or multi-line `line`.
-    // Whitespace-only matters too — `rebuild` skips lines that trim to empty, so one
-    // would be durably written yet silently dropped on restart, diverging the on-disk
-    // feed from the in-memory log; a multi-line `line` would append several blocks.
-    if line.trim().is_empty() || line.contains('\n') || line.contains('\r') {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "feed line must be a single non-empty, non-whitespace line",
-        ));
-    }
+    check_feed_line(line)?;
     fs::create_dir_all(data_dir)?;
     let mut f = fs::OpenOptions::new()
         .create(true)

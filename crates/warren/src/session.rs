@@ -310,11 +310,17 @@ impl Session {
         };
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Persist first, so a returned `Err` means "not published": only after the
-        // durable append do we mutate the in-memory log and notify live subscribers
-        // (the log append is infallible, and rebuild replays exactly this line).
-        store::append_line(&self.data_dir, &line)?;
-        self.log.lock().expect("feed log").append(line.into_bytes());
+        // Persist and append under the log lock, so the two stay in the *same order*
+        // even with concurrent publishers (on-disk line order == in-memory Merkle
+        // order, so the head served to subscribers is what rebuild reproduces), and so
+        // a returned `Err` (the persist failed) means "not published" — the in-memory
+        // log is only touched after the durable write. `append_line` is synchronous fs
+        // (no `.await`), so this brief hold can't wedge a live-tail serve.
+        {
+            let mut log = self.log.lock().expect("feed log");
+            store::append_line(&self.data_dir, &line)?;
+            log.append(line.into_bytes());
+        }
         self.appended.notify_waiters(); // wake any live-tail subscribers
         Ok(record)
     }

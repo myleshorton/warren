@@ -132,7 +132,8 @@ pub fn rebuild(
 }
 
 /// Persist a freshly published record: write its blob bytes and append its
-/// feed-block line. `line` must be exactly the bytes appended to the feed.
+/// feed-block line. `line` is the feed-block text *without* a trailing newline — a
+/// single `\n` delimiter is added here.
 pub fn append_record(
     data_dir: &Path,
     blob_hex: &str,
@@ -153,16 +154,17 @@ pub fn append_record(
 
 /// Persist a body-only record: append just its feed-block line, with no blob file.
 /// For records whose payload rides inline in `body` (a chat message, a comment)
-/// rather than as a content-addressed attachment. `line` must be exactly the bytes
-/// appended to the feed.
+/// rather than as a content-addressed attachment. `line` is the feed-block text
+/// *without* a trailing newline — a single `\n` delimiter is added here.
 pub fn append_line(data_dir: &Path, line: &str) -> std::io::Result<()> {
-    // One block per line: reject an empty or multi-line `line` so a caller can't
-    // append several blocks (or blank lines `rebuild` would skip) in one write and
-    // silently diverge the on-disk feed from the in-memory log.
-    if line.is_empty() || line.contains('\n') || line.contains('\r') {
+    // One block per line: reject an empty, whitespace-only, or multi-line `line`.
+    // Whitespace-only matters too — `rebuild` skips lines that trim to empty, so one
+    // would be durably written yet silently dropped on restart, diverging the on-disk
+    // feed from the in-memory log; a multi-line `line` would append several blocks.
+    if line.trim().is_empty() || line.contains('\n') || line.contains('\r') {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "feed line must be a single non-empty line",
+            "feed line must be a single non-empty, non-whitespace line",
         ));
     }
     fs::create_dir_all(data_dir)?;

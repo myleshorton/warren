@@ -278,13 +278,16 @@ impl Session {
     }
 
     /// Publish a **body-only** record (no blob) — a chat message, a comment, any small
-    /// inline payload. Fills in author + timestamp, appends the signed block, persists
-    /// the line, and fires `appended` so live subscribers are pushed it at once.
+    /// inline payload. Fills in author + timestamp, persists the line, appends the
+    /// signed block, and fires `appended` so live subscribers are pushed it at once.
     /// `clock`/`lamport` carry the multi-writer merge position (see [`crate::merge`]);
-    /// pass empty/`0` for content that needs no cross-writer ordering. Unlike
-    /// [`Self::publish`] there is no blob to seal, store, or announce — the body rides
-    /// in the signed record as plaintext (as record `meta` already does), so a blind
-    /// mirror replicating the feed can read it; keep secrets out of it.
+    /// pass empty/`0` for content that needs no cross-writer ordering.
+    ///
+    /// The body is **not encrypted** — even in a channel with a content key. Unlike
+    /// [`Self::publish`], which seals its blob payload under the content KEK,
+    /// `publish_body` writes the body in the clear in the signed record (as record
+    /// `meta` already rides), so a blind mirror replicating the feed can read it. Keep
+    /// secrets out of it.
     pub async fn publish_body(
         &self,
         content_type: String,
@@ -307,12 +310,12 @@ impl Session {
         };
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        self.log
-            .lock()
-            .expect("feed log")
-            .append(line.clone().into_bytes());
-        self.appended.notify_waiters(); // wake any live-tail subscribers
+        // Persist first, so a returned `Err` means "not published": only after the
+        // durable append do we mutate the in-memory log and notify live subscribers
+        // (the log append is infallible, and rebuild replays exactly this line).
         store::append_line(&self.data_dir, &line)?;
+        self.log.lock().expect("feed log").append(line.into_bytes());
+        self.appended.notify_waiters(); // wake any live-tail subscribers
         Ok(record)
     }
 

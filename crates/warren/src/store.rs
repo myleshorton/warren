@@ -156,6 +156,15 @@ pub fn append_record(
 /// rather than as a content-addressed attachment. `line` must be exactly the bytes
 /// appended to the feed.
 pub fn append_line(data_dir: &Path, line: &str) -> std::io::Result<()> {
+    // One block per line: reject an empty or multi-line `line` so a caller can't
+    // append several blocks (or blank lines `rebuild` would skip) in one write and
+    // silently diverge the on-disk feed from the in-memory log.
+    if line.is_empty() || line.contains('\n') || line.contains('\r') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "feed line must be a single non-empty line",
+        ));
+    }
     fs::create_dir_all(data_dir)?;
     let mut f = fs::OpenOptions::new()
         .create(true)

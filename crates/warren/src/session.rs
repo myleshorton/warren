@@ -257,12 +257,19 @@ impl Session {
         // it as an error rather than silently persisting nonsense.)
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        self.log
-            .lock()
-            .expect("feed log")
-            .append(line.clone().into_bytes());
+        // Persist the blob (content-addressed, order-independent) *outside* the log
+        // lock so a large write can't block feed serving; then append the feed line
+        // and the in-memory log together *under* the lock — the same ordering + error
+        // semantics as `publish_body`: concurrent publishers can't reorder the on-disk
+        // feed against the in-memory Merkle order, and a returned `Err` means "not
+        // published". Notify only after the (best-effort) line append returns `Ok`.
+        store::write_blob(&self.data_dir, &blob_hex, &stored)?;
+        {
+            let mut log = self.log.lock().expect("feed log");
+            store::append_line(&self.data_dir, &line)?;
+            log.append(line.into_bytes());
+        }
         self.appended.notify_waiters(); // wake any live-tail subscribers
-        store::append_record(&self.data_dir, &blob_hex, &stored, &line)?;
 
         if let Some(hash) = util::bytes_from_hex::<32>(&blob_hex) {
             self.held.lock().expect("held").push(hash);
@@ -274,6 +281,56 @@ impl Session {
                 .expect("clip_keys")
                 .insert(blob_hex, enc);
         }
+        Ok(record)
+    }
+
+    /// Publish a **body-only** record (no blob) — a chat message, a comment, any small
+    /// inline payload. Fills in author + timestamp, persists the line, appends the
+    /// signed block, and fires `appended` so live subscribers are pushed it at once.
+    /// `clock`/`lamport` carry the multi-writer merge position (see [`crate::merge`]);
+    /// pass empty/`0` for content that needs no cross-writer ordering.
+    ///
+    /// The body is **not encrypted** — even in a channel with a content key. Unlike
+    /// [`Self::publish`], which seals its blob payload under the content KEK,
+    /// `publish_body` writes the body in the clear in the signed record (as record
+    /// `meta` already rides), so a blind mirror replicating the feed can read it. Keep
+    /// secrets out of it.
+    pub async fn publish_body(
+        &self,
+        content_type: String,
+        body: String,
+        meta: serde_json::Map<String, serde_json::Value>,
+        clock: std::collections::BTreeMap<String, u64>,
+        lamport: u64,
+    ) -> std::io::Result<Record> {
+        let record = Record {
+            author: util::to_hex(&self.feed_pubkey.to_bytes()),
+            created_at: util::now_secs(),
+            content_type,
+            blob: None,
+            size: 0,
+            body: Some(body),
+            meta,
+            enc: None,
+            clock,
+            lamport,
+        };
+        let line = serde_json::to_string(&record)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        // Append to the feed file and the in-memory log under the log lock, so the two
+        // stay in the *same order* even with concurrent publishers (on-disk line order
+        // == in-memory Merkle order, so the head served to subscribers is what rebuild
+        // reproduces), and so a returned `Err` (the file append failed) means "not
+        // published" — the in-memory log is touched only after the append returns `Ok`.
+        // (Best-effort persistence: `append_line` doesn't `fsync`, so it isn't durable
+        // against a crash/power loss.) It's synchronous fs (no `.await`), so this brief
+        // hold can't wedge a live-tail serve.
+        {
+            let mut log = self.log.lock().expect("feed log");
+            store::append_line(&self.data_dir, &line)?;
+            log.append(line.into_bytes());
+        }
+        self.appended.notify_waiters(); // wake any live-tail subscribers
         Ok(record)
     }
 

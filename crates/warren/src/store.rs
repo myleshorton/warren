@@ -131,18 +131,55 @@ pub fn rebuild(
     Ok((log, store, records))
 }
 
+/// A feed block is exactly one line, so reject an empty, whitespace-only, or
+/// multi-line `line`: `writeln!` would otherwise append several blocks at once, or a
+/// line `rebuild` skips (it drops lines that trim to empty) — either way the on-disk
+/// feed would diverge from the in-memory log on restart.
+fn check_feed_line(line: &str) -> std::io::Result<()> {
+    if line.trim().is_empty() || line.contains('\n') || line.contains('\r') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "feed line must be a single non-empty, non-whitespace line",
+        ));
+    }
+    Ok(())
+}
+
 /// Persist a freshly published record: write its blob bytes and append its
-/// feed-block line. `line` must be exactly the bytes appended to the feed.
+/// feed-block line. `line` is the feed-block text *without* a trailing newline — a
+/// single `\n` delimiter is added here.
 pub fn append_record(
     data_dir: &Path,
     blob_hex: &str,
     blob_bytes: &[u8],
     line: &str,
 ) -> std::io::Result<()> {
+    // Validate the line before touching the filesystem, so a bad one can't leave an
+    // orphan blob behind, then write the blob and append the feed line.
+    check_feed_line(line)?;
+    write_blob(data_dir, blob_hex, blob_bytes)?;
+    append_line(data_dir, line)
+}
+
+/// Write a blob's bytes to its content-addressed file (no feed append). Split out so
+/// a caller can persist a (possibly large) blob *outside* a lock and append the feed
+/// line separately under one — keeping on-disk feed order aligned with the in-memory
+/// log without holding that lock across a big write.
+pub fn write_blob(data_dir: &Path, blob_hex: &str, blob_bytes: &[u8]) -> std::io::Result<()> {
     let path = blob_path(data_dir, blob_hex)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid blob id"))?;
     fs::create_dir_all(blobs_dir(data_dir))?;
     fs::write(path, blob_bytes)?;
+    Ok(())
+}
+
+/// Persist a body-only record: append just its feed-block line, with no blob file.
+/// For records whose payload rides inline in `body` (a chat message, a comment)
+/// rather than as a content-addressed attachment. `line` is the feed-block text
+/// *without* a trailing newline — a single `\n` delimiter is added here.
+pub fn append_line(data_dir: &Path, line: &str) -> std::io::Result<()> {
+    check_feed_line(line)?;
+    fs::create_dir_all(data_dir)?;
     let mut f = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -213,6 +250,33 @@ mod tests {
         assert_eq!(log.len(), 2, "both feed blocks restored");
         assert_eq!(records[0].blob.as_deref(), Some("aa01"));
         assert_eq!(records[1].content_type, "application/octet-stream");
+    }
+
+    #[test]
+    fn append_line_persists_a_body_only_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let kp = crypto::Keypair::generate();
+
+        // A comment-shaped body-only record: no blob, payload inline in `body`.
+        let rec = Record {
+            author: "bb".repeat(32),
+            created_at: 7,
+            content_type: "comment".into(),
+            body: Some("nice clip".into()),
+            meta: [("reply_to".to_string(), "aa01".into())]
+                .into_iter()
+                .collect(),
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&rec).unwrap();
+        append_line(dir.path(), &line).unwrap();
+
+        let (log, _store, records) = rebuild(dir.path(), kp).unwrap();
+        assert_eq!(log.len(), 1, "the body-only line is a feed block");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].body.as_deref(), Some("nice clip"));
+        assert!(records[0].blob.is_none(), "no blob for a body-only record");
+        assert_eq!(records[0].content_type, "comment");
     }
 
     #[test]

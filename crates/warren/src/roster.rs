@@ -21,28 +21,30 @@ use std::collections::BTreeSet;
 use crate::merge::{self, Entry, WriterId};
 
 /// `content_type` of the two membership records (the record's `meta.subject` is the hex
-/// feed key being added/removed; its author is the signer).
+/// feed key being added/removed).
 pub const ADD: &str = "member.add";
 pub const REMOVE: &str = "member.remove";
 
-/// One membership change: `author` (the signing feed key) adds or removes `subject`.
-/// Decoded from a `member.add`/`member.remove` record; the merge metadata that *orders*
-/// it lives on the enclosing [`Entry`].
+/// One membership change, decoded from a record's payload: add or remove `subject`.
+///
+/// The **author is deliberately not carried here** — it is the record's authenticated feed
+/// key ([`Entry::writer`], which the feed layer verifies per block). Authorization is
+/// evaluated against that authenticated author (see [`resolve`]); a self-declared author in
+/// the payload would be forgeable and must never be trusted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Change {
-    pub author: WriterId,
     pub subject: WriterId,
     pub add: bool,
 }
 
-/// Fold `changes` — **already in causal (merge-linearized) order** — from a `founder`
-/// genesis into the current member set.
+/// Fold changes — **already in causal (merge-linearized) order**, each paired with its
+/// **authenticated author** — from a `founder` genesis into the current member set.
 ///
 /// Authorization is evaluated as we go, so it is a function of the ordered prefix alone:
 /// - the `founder` is a member from the start (the implicit genesis entry);
-/// - a change is honored only if its `author` is a member *at that point*; a change signed
-///   by a not-yet-authorized key is **inert** (dropped) — this is what stops a censor who
-///   only holds the PSK from writing themselves into the room;
+/// - a change is honored only if its author is a member *at that point*; a change by a
+///   not-yet-authorized key is **inert** — this is what stops a censor who only holds the
+///   PSK from writing themselves into the room;
 /// - `add` inserts `subject`, `remove` deletes it;
 /// - the `founder` cannot be removed (genesis is permanent) — a v1 simplification that
 ///   avoids a room bricking itself; succession/handover is future work.
@@ -52,12 +54,12 @@ pub struct Change {
 /// *last-authorized-op-per-subject wins*. True **remove-wins** on genuine concurrency
 /// (erring toward exclusion when an add and a remove are causally incomparable) needs the
 /// concurrency relation and is a tracked v1 refinement — see the design note.
-pub fn members(founder: WriterId, changes: &[Change]) -> BTreeSet<WriterId> {
+pub fn members(founder: WriterId, changes: &[(WriterId, Change)]) -> BTreeSet<WriterId> {
     let mut set = BTreeSet::new();
     set.insert(founder);
-    for c in changes {
+    for (author, c) in changes {
         // Author must be a member as of here; the founder is never removed/re-added.
-        if !set.contains(&c.author) || c.subject == founder {
+        if !set.contains(author) || c.subject == founder {
             continue;
         }
         if c.add {
@@ -72,16 +74,21 @@ pub fn members(founder: WriterId, changes: &[Change]) -> BTreeSet<WriterId> {
 /// Linearize roster `entries` (via [`merge::linearize`]) and fold them into the member
 /// set — the network-facing entry point. Hand it every [`Change`] you've decoded (each
 /// wrapped in its record's merge [`Entry`]); it computes membership in the one causal order
-/// all participants agree on. Entries whose causal ancestor hasn't arrived stay *pending*
-/// in `merge` and are simply not yet applied (you can't authorize on an unseen prefix).
-/// What grows monotonically as feeds fill in is `merge`'s **ordered record sequence** (its
-/// grow-only prefix, never reordered); the member *set* is a deterministic fold over that
-/// sequence and may grow *or* shrink as records arrive — a newly-orderable `member.remove`
+/// all participants agree on.
+///
+/// The author of each change is taken from [`Entry::writer`] — the record's authenticated
+/// feed key, verified per block by the feed layer — never from the payload, so a forged
+/// self-declared author can't bypass authorization. Entries whose causal ancestor hasn't
+/// arrived stay *pending* in `merge` and aren't applied yet (you can't authorize on an
+/// unseen prefix). What grows monotonically as feeds fill in is `merge`'s **ordered record
+/// sequence** (its grow-only prefix, never reordered); the member *set* is a deterministic
+/// fold over that sequence and may grow *or* shrink — a newly-orderable `member.remove`
 /// reduces it. What never happens is a reorder that retroactively changes an earlier
 /// membership decision.
 pub fn resolve(founder: WriterId, entries: Vec<Entry<Change>>) -> BTreeSet<WriterId> {
     let ordered = merge::linearize(entries).ordered;
-    let changes: Vec<Change> = ordered.into_iter().map(|e| e.payload).collect();
+    let changes: Vec<(WriterId, Change)> =
+        ordered.into_iter().map(|e| (e.writer, e.payload)).collect();
     members(founder, &changes)
 }
 
@@ -93,11 +100,12 @@ mod tests {
         [n; 32]
     }
 
-    fn add(author: u8, subject: u8) -> Change {
-        Change { author: id(author), subject: id(subject), add: true }
+    /// (authenticated author, change) — the shape `members` folds.
+    fn add(author: u8, subject: u8) -> (WriterId, Change) {
+        (id(author), Change { subject: id(subject), add: true })
     }
-    fn remove(author: u8, subject: u8) -> Change {
-        Change { author: id(author), subject: id(subject), add: false }
+    fn remove(author: u8, subject: u8) -> (WriterId, Change) {
+        (id(author), Change { subject: id(subject), add: false })
     }
 
     #[test]
@@ -143,26 +151,35 @@ mod tests {
         assert_eq!(set, BTreeSet::from([id(1), id(2)]));
     }
 
-    // --- resolve(): ordering is merge's job; membership converges regardless of arrival ---
+    // --- resolve(): author is the authenticated Entry::writer; ordering is merge's job ---
 
-    /// A roster record as a merge entry: `writer` authored it at `index`, having seen the
-    /// positions in `clock`; `lamport` is supplied for the tiebreak.
-    fn entry(writer: u8, index: u64, lamport: u64, clock: &[(u8, u64)], c: Change) -> Entry<Change> {
+    /// A roster record as a merge entry: feed key `writer` authored it at `index`, having
+    /// seen the positions in `clock`; `lamport` supplied for the tiebreak. The payload is
+    /// the change (subject + add) — the author is `writer`, not anything in the payload.
+    fn entry(writer: u8, index: u64, lamport: u64, clock: &[(u8, u64)], subject: u8, add: bool) -> Entry<Change> {
         Entry {
             writer: id(writer),
             index,
             lamport,
             clock: clock.iter().map(|&(w, k)| (id(w), k)).collect(),
-            payload: c,
+            payload: Change { subject: id(subject), add },
         }
+    }
+
+    #[test]
+    fn resolve_takes_the_author_from_the_authenticated_writer() {
+        // The entry is authored by feed key 1 (writer) adding 2. Authorization uses the
+        // writer, so 2 joins. (A forged payload author couldn't matter — there isn't one.)
+        let e = entry(1, 0, 0, &[], 2, true);
+        assert_eq!(resolve(id(1), vec![e]), BTreeSet::from([id(1), id(2)]));
     }
 
     #[test]
     fn resolve_folds_in_causal_order_independent_of_input_order() {
         // founder(1) adds 2 (1's feed #0); 2, having seen it, adds 3 (2's feed #0, clock
-        // {1:1} — saw 1's first record). The add(2,3) causally follows add(1,2).
-        let e_add2 = entry(1, 0, 0, &[], add(1, 2));
-        let e_add3 = entry(2, 0, 1, &[(1, 1)], add(2, 3));
+        // {1:1}). add(2->3) causally follows add(1->2).
+        let e_add2 = entry(1, 0, 0, &[], 2, true);
+        let e_add3 = entry(2, 0, 1, &[(1, 1)], 3, true);
 
         let forward = resolve(id(1), vec![e_add2.clone(), e_add3.clone()]);
         let shuffled = resolve(id(1), vec![e_add3, e_add2]);
@@ -171,10 +188,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_drops_a_change_whose_authorizing_prefix_is_missing() {
-        // add(2,3) depends on 1's record #0 (add of 2), which we don't provide → it's
-        // pending in merge, so 2 was never authorized and 3 isn't added.
-        let e_add3 = entry(2, 0, 1, &[(1, 1)], add(2, 3));
+    fn resolve_holds_a_change_pending_until_its_authorizing_prefix_arrives() {
+        // add(2->3) depends on 1's record #0 (the add of 2), which we don't provide → it
+        // stays pending in merge, so 2 was never authorized here and 3 isn't added. (It
+        // would apply once 1's record arrives — nothing is discarded.)
+        let e_add3 = entry(2, 0, 1, &[(1, 1)], 3, true);
         assert_eq!(resolve(id(1), vec![e_add3]), BTreeSet::from([id(1)]));
     }
 }

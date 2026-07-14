@@ -325,14 +325,14 @@
     <div class="head reveal">
       <span class="kicker">wire protocol</span>
       <h2>How two peers actually meet</h2>
-      <p>There is no signaling server. The same DHT that finds content also brokers the connection — peers trade candidates over it, then punch a direct path. What crosses the wire today is deliberately minimal, and honest about it: the channel is fast and serverless, but not yet an authenticated, encrypted transport (that's the next protocol step — see the limits).</p>
+      <p>There is no signaling server. The same DHT that finds content also brokers the connection — peers trade candidates over it, then punch a direct path — which a Noise handshake then turns into a forward-secret, mutually-authenticated channel bound to the peer's node id. What's left honest (see the limits): the discovery-layer signaling isn't signed yet, and the wire carries no traffic obfuscation.</p>
     </div>
 
     <div class="cards reveal">
       <div class="card"><div class="top"><span class="name">1 · signal</span><span class="role">rendezvous</span></div><p>The target <b>announces under its own id</b>; any DHT node holding that record becomes a <b>coordinator</b>, and a <code>Signal</code> relays each side's candidates + NAT type through it. No dedicated signaling service — unlike WebRTC, rendezvous <em>is</em> the DHT.</p></div>
       <div class="card"><div class="top"><span class="name">2 · candidates</span><span class="role">reachability</span></div><p>Each peer offers a few addresses — <b>local</b>, <b>reflexive</b> (a STUN-like probe to nearby peers), and an optional <b>PCP/UPnP port-map</b> — most-routable first. The coordinator sees the control address; it can't observe the data-socket candidates, so the endpoints fill those in.</p></div>
       <div class="card"><div class="top"><span class="name">3 · punch</span><span class="role">nat traversal</span></div><p>A one-byte <code>PROBE</code> / <code>ACK</code> opens a direct UDP path. For one-sided symmetric NAT it leans on the <b>birthday paradox</b> (panel below). Two peers <em>both</em> behind symmetric NAT aren't punched — no relay sits in the path, by design.</p></div>
-      <div class="card"><div class="top"><span class="name">4 · channel</span><span class="role">transport</span></div><p>One connected UDP socket carries selective-repeat framing (fragmentation + NACK repair). <b>Today that framing is plaintext</b>; confidentiality lives at the <b>content layer</b> — clips sealed with XChaCha20, named and signed by the hash of their ciphertext.</p></div>
+      <div class="card"><div class="top"><span class="name">4 · channel</span><span class="role">transport</span></div><p>The channel runs a <b>Noise <code>XX</code> handshake</b> — forward-secret, mutually authenticated, and <b>bound to the peer's node id</b> — so the selective-repeat framing is AEAD-encrypted end to end. Clips are <em>additionally</em> sealed at the <b>content layer</b> (XChaCha20, named + signed by ciphertext hash) so blind mirrors can carry bytes they can't read.</p></div>
     </div>
 
     <div class="stackdiag reveal" style="margin-top:44px;">
@@ -498,7 +498,8 @@
       <div class="cap">Multi-writer causal merge (version-vector clocks, deterministic convergent linearizer)</div><div class="st built">built</div>
       <div class="cap">Roster membership + authorship gate (founder genesis, signed vouching records)</div><div class="st built">built</div>
       <div class="cap">Blind push notifier (iOS background wake without breaking serverless)</div><div class="st design">design</div>
-      <div class="cap">Authenticated + encrypted transport handshake (bind the peer id) + capability tokens</div><div class="st planned">planned</div>
+      <div class="cap">Authenticated + encrypted transport handshake (Noise XX; binds the peer id)</div><div class="st built">built</div>
+      <div class="cap">Signed DHT signaling + capability tokens (no announcing under another's id)</div><div class="st planned">planned</div>
       <div class="cap">Obfuscated / pluggable transport, cover-DHT rendezvous</div><div class="st planned">planned</div>
     </div>
   </div>
@@ -533,7 +534,7 @@
     <div class="limits reveal">
       <div class="limit"><span class="tag">nat</span><p><b>Two symmetric-NAT peers may not punch.</b> With no relay in the path, a pair behind carrier-grade symmetric NAT can fail to connect directly. Warren leaves that pair unconnected by design rather than routing data through infrastructure; a reachable peer or a volunteer blind peer bridges availability.</p></div>
       <div class="limit"><span class="tag">real-time</span><p><b>No chat client yet.</b> The real-time substrate is complete — live-tail push, swarm-failover subscription, blind-mirror store-and-forward, and deterministic multi-writer causal merge all work and are tested over a real DHT. What's missing is an <em>application</em> on top: a chat client that drives the room view and publishes with a causal clock. The framework is ready for one; none is built.</p></div>
-      <div class="limit"><span class="tag">transport auth</span><p><b>The channel isn't authenticated or encrypted yet — only the content is.</b> Clips are sealed (XChaCha20) and signed by their ciphertext hash, so a mirror can't read them and tampering shows; but the connection itself is plaintext UDP, and a peer's identity isn't cryptographically bound during setup (a peer could announce under another's id). An authenticated, encrypted transport handshake + capability tokens are the next protocol step.</p></div>
+      <div class="limit"><span class="tag">signaling auth</span><p><b>The channel is encrypted and identity-bound now; the DHT signaling isn't signed yet.</b> A Noise handshake means you only ever <em>connect</em> to the exact node id you dialed, over a forward-secret AEAD channel — but the discovery-layer announce/signal records are still unsigned, so a peer could announce under another's id or hand a dialer a forged punch target. Signed announces + capability tokens are the next step.</p></div>
       <div class="limit"><span class="tag">transport</span><p><b>No obfuscated transport yet.</b> Discovery is blinded and identities decoupled, but deep packet inspection can still see <em>that</em> a peer speaks a P2P protocol — just not what, or with whom. A pluggable obfuscated transport is planned.</p></div>
       <div class="limit"><span class="tag">rendezvous</span><p><b>Bootstrap can still be blocked.</b> An invite carries its own live bootstrap peers, so there's no single fixed foreign address to censor — but if <em>every</em> peer in a given invite is unreachable, there's no fallback rendezvous yet. Cover-DHT and domestic/local rendezvous that degrade gracefully under active blocking are designed, not built.</p></div>
     </div>

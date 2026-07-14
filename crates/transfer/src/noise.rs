@@ -171,8 +171,11 @@ impl<T: Link> NoiseLink<T> {
         let mut wbuf = [0u8; 2048];
         let mut rbuf = [0u8; 2048];
 
-        // -> e (+ our cert). Resend until the responder's message 2 arrives.
-        let n1 = hs.write_message(&cert, &mut wbuf).map_err(noise_err)?;
+        // -> e. No payload: XX's message 1 is unencrypted, so sending our cert here
+        // would leak the dialer's node id in the clear. Our cert rides the encrypted
+        // message 3 instead (the responder reads it from there). Resend until the
+        // responder's message 2 arrives.
+        let n1 = hs.write_message(&[], &mut wbuf).map_err(noise_err)?;
         let msg1 = tagged(TAG_MSG1, &wbuf[..n1]);
         let peer_cert = 'wait: {
             for _ in 0..HS_RETRIES {
@@ -225,8 +228,8 @@ impl<T: Link> NoiseLink<T> {
         let mut rbuf = [0u8; 2048];
 
         // <- e. Wait for the initiator's message 1 (we speak second — nothing to
-        // resend yet). Its payload is the initiator's cert, but unencrypted at this
-        // point, so we ignore it and re-read the authenticated copy from message 3.
+        // resend yet). Message 1 carries no payload (it is unencrypted); the
+        // initiator's authenticated cert arrives in the encrypted message 3.
         let mut got_msg1 = false;
         for _ in 0..HS_RETRIES {
             if let Some(n) = recv_timeout(&inner, &mut rbuf).await? {

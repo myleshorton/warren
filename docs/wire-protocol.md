@@ -1,7 +1,11 @@
 # Warren wire protocol: the opening-book transport
 
-**Status:** design note (2026-07-14), not built. A plan for giving Warren a real,
-authenticated, encrypted, blend-in transport — replacing today's plaintext punched
+**Status:** design note (2026-07-14). **Phase 0 (Noise-in-core) is built** — see
+[myleshorton/warren#50](https://github.com/myleshorton/warren/pull/50): the punched channel is now a
+Noise XX channel (forward-secret, mutually authenticated, bound to the peer's node id via
+`NodeId = hash(node_pubkey)`). The rest below — the `Link`/`Transport` seam, the opening-book cover
+transports, signed signaling — remains the plan. A design for giving Warren a real,
+authenticated, encrypted, blend-in transport — replacing the (now closed) plaintext punched
 channel. Grounded in a direct read of Warren (`crates/{driver,puncher,transfer,swarm,crypto}`),
 [flint](https://github.com/getlantern/flint) (`flint-tls/{gambit,anchor,ja4,connector,profile}`),
 spark's opening-book notes, and the censorship-circumvention literature (paper ids in the
@@ -517,11 +521,17 @@ the DTLS record layer + HelloVerifyRequest cookie; the STUN/ICE opening (also `p
 
 ### 6.3 Phased plan (each phase green and shippable on its own)
 
-- **Phase 0 — Noise-in-core (baseline transport crypto).** `NoiseLink` (IK/XX via `snow`) as a second
-  `Link` over the *existing* punched socket, + `NodeId = hash(node_pubkey)` self-certifying identity +
-  Elligator KATs. The single largest security win — closes the plaintext/on-path-injection gap today —
-  with *no* cover work. Residential↔residential only (§4.4). Gate: two nodes complete an authenticated,
-  encrypted `transfer`; a wrong static key fails.
+- **Phase 0 — Noise-in-core (baseline transport crypto). ✅ Built (#50).** `NoiseLink` (Noise **XX**
+  via `snow`) as a second `Link` over the *existing* punched socket, + `NodeId = hash(node_pubkey)`
+  self-certifying identity, the per-connection X25519 static bound to the Ed25519 id by a signed
+  `NodeCert`, and the dialer pinning `hash(peer ed_pub) == target`. The single largest security win —
+  closes the plaintext/on-path-injection gap today — with *no* cover work. Residential↔residential
+  only (§4.4). Shipped deviations from this sketch: **XX only** (IK deferred — the dialer has no
+  peer static yet, that's Phase 2's signed announce); **snow *stateless* transport + an explicit
+  per-datagram nonce** so loss/reorder can't desync the cipher under selective-repeat; **Elligator
+  deferred** (residential↔residential is under the FET radar). Gate (all green): two ids complete XX
+  over a lossy link and a real `transfer` recovers byte-for-byte; a wrong-id dial fails; injected and
+  tampered datagrams are rejected by AEAD.
 - **Phase 1 — the `Link`/`Transport` seam.** Promote `transfer::Link` into `crates/link`, add
   `Transport` + `max_payload()`, generalize `puncher`'s probe bytes behind `Probe` (default unchanged).
   `PlainUdp` + `NoiseLink` are the first two. No default-path change. Gate: existing tests pass through

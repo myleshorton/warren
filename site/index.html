@@ -84,6 +84,7 @@
   .wrap{ width:100%; max-width:var(--maxw); margin-inline:auto; padding-inline:clamp(20px,5vw,44px); }
   .eyebrow{ font-family:var(--f-mono); font-weight:600; font-size:11.5px; letter-spacing:.24em; text-transform:uppercase; color:var(--blue); }
   .mono{ font-family:var(--f-mono); }
+  code{ font-family:var(--f-mono); font-size:.85em; color:var(--cyan); background:var(--panel-2); padding:1px 5px; border-radius:3px; }
 
   /* ── Theme toggle ─────────────────────────────────────────────────────── */
   .toggle{
@@ -349,13 +350,36 @@
   </div>
 </section>
 
+<!-- ── THE CHANNEL ────────────────────────────────────────────────────── -->
+<section>
+  <div class="wrap">
+    <div class="head reveal">
+      <span class="kicker">the channel</span>
+      <h2>A channel is three gates, not one key</h2>
+      <p>"A shared key" is only the first gate — the one that controls who can <b>find and read</b>. A Warren channel stacks two more independent gates on top, each enforced by different cryptography and each holding against a different adversary. The upshot: <b>seizing the key does not hand a censor the room.</b></p>
+    </div>
+
+    <div class="stackdiag reveal" role="img" aria-label="A channel's three gates: PSK for discovery, a content key for decryption, and a roster for membership">
+      <div class="layer"><div class="lname">1 · psk</div><div class="ldesc"><b>Discovery &amp; read.</b> The rotating topic is <code>H(domain ‖ psk ‖ epoch)</code> — every holder derives the same handle, and to anyone else it's noise that changes each epoch.</div><div class="ltag">who can find</div></div>
+      <div class="layer"><div class="lname">2 · content key</div><div class="ldesc"><b>Decryption.</b> A <em>separate</em> key derives the KEK that unwraps each blob's random per-item key. Withhold it and a peer becomes a <b>blind node</b> — it serves ciphertext it can never open.</div><div class="ltag">who can decrypt</div></div>
+      <div class="layer base"><div class="lname">3 · roster</div><div class="ldesc"><b>Membership &amp; authorship.</b> Signed <code>member.add</code> / <code>member.remove</code> records fold, in causal order, from a <b>founder</b> genesis — a change counts only if its author was already a member (transitive vouching). <b>Holding the PSK does not make you one.</b></div><div class="ltag">who can post</div></div>
+    </div>
+
+    <div class="cards reveal">
+      <div class="card"><div class="top"><span class="name">the psk</span><span class="role">read gate</span></div><p>A freely-shareable <b>capability</b>: possession lets you compute the topic and decrypt reads. Because it's shareable it can leak — so Warren never lets the read gate be the <em>only</em> gate.</p></div>
+      <div class="card"><div class="top"><span class="name">the content key</span><span class="role">decrypt gate</span></div><p>Splitting discovery from decryption lets an untrusted volunteer <b>host</b> a channel's bytes without being able to <b>read</b> them — availability without trust. The mirror carries ciphertext plus the signed feed, verifies every block, and opens none.</p></div>
+      <div class="card"><div class="top"><span class="name">the roster</span><span class="role">write gate</span></div><p>The write-and-identity defense against a censor who <em>has</em> the PSK. Membership is a signed, append-only log folded from the founder; a leaked key buys reading, not the ability to post, flood, or impersonate a member.</p></div>
+    </div>
+  </div>
+</section>
+
 <!-- ── POSTURE ───────────────────────────────────────────────────────── -->
 <section>
   <div class="wrap">
     <div class="head reveal">
       <span class="kicker">threat posture</span>
       <h2>What makes it hard to censor</h2>
-      <p>Warren treats opacity to a censor as the first requirement, not a feature bolted on later. Five properties do the work — and they hold whatever the payload is.</p>
+      <p>Warren treats opacity to a censor as the first requirement, not a feature bolted on later. Several independent properties do the work — and they hold whatever the payload is. The aim is to <b>raise the cost of blocking, enumerating, and de-anonymizing a swarm</b>, not to promise perfect anonymity against a global observer who can watch every link at once — that adversary is out of scope today (see the limits below).</p>
     </div>
     <div class="posture reveal">
       <div class="claim">
@@ -377,6 +401,14 @@
       <div class="claim">
         <div class="t"><svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="2.4"/><circle cx="12" cy="12" r="8.5" stroke-dasharray="2 3"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg><h3>Nothing in the data path</h3></div>
         <p>Optional volunteer <b>blind peers</b> reseed encrypted bytes they can't read. Nothing is required, nothing is central — availability without infrastructure.</p>
+      </div>
+      <div class="claim">
+        <div class="t"><svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 3l7 3v5c0 4.6-3 7.7-7 9-4-1.3-7-4.4-7-9V6z"/><path d="M9 12l2.2 2.2L15 10"/></svg><h3>Vouching, not the key, grants entry</h3></div>
+        <p>A leaked PSK lets an intruder <b>read</b> — but not join or post. Membership is a signed roster folded from a <b>founder</b>, and only a vouched-in member authors records others accept. The secret is a capability, not a seat: seizing it doesn't let a censor flood, impersonate, or take over the room.</p>
+      </div>
+      <div class="claim">
+        <div class="t"><svg class="glyph" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="2.3"/><circle cx="5" cy="5" r="1.8"/><circle cx="19" cy="5" r="1.8"/><circle cx="5" cy="19" r="1.8"/><circle cx="19" cy="19" r="1.8"/><path d="M6.4 6.4l4 4M17.6 6.4l-4 4M6.4 17.6l4-4M17.6 17.6l-4-4"/></svg><h3>No single door to bolt shut</h3></div>
+        <p>An invite is <b>self-contained</b> — it carries its own live bootstrap peers, so there's no one foreign address every newcomer must reach, and invites travel socially rather than through a directory. <em>Richer rendezvous that degrades under active blocking (cover-DHT, domestic/local fallbacks) is designed, not yet built.</em></p>
       </div>
     </div>
   </div>
@@ -442,6 +474,7 @@
       <div class="cap">Live-tail feed replication (the real-time / chat unlock)</div><div class="st built">built</div>
       <div class="cap">Swarm-failover subscription + blind-mirror store-and-forward (verified replicas)</div><div class="st built">built</div>
       <div class="cap">Multi-writer causal merge (version-vector clocks, deterministic convergent linearizer)</div><div class="st built">built</div>
+      <div class="cap">Roster membership + authorship gate (founder genesis, signed vouching records)</div><div class="st built">built</div>
       <div class="cap">Blind push notifier (iOS background wake without breaking serverless)</div><div class="st design">design</div>
       <div class="cap">Obfuscated / pluggable transport, cover-DHT rendezvous</div><div class="st planned">planned</div>
     </div>
@@ -478,6 +511,7 @@
       <div class="limit"><span class="tag">nat</span><p><b>Two symmetric-NAT peers may not punch.</b> With no relay in the path, a pair behind carrier-grade symmetric NAT can fail to connect directly. Warren leaves that pair unconnected by design rather than routing data through infrastructure; a reachable peer or a volunteer blind peer bridges availability.</p></div>
       <div class="limit"><span class="tag">real-time</span><p><b>No chat client yet.</b> The real-time substrate is complete — live-tail push, swarm-failover subscription, blind-mirror store-and-forward, and deterministic multi-writer causal merge all work and are tested over a real DHT. What's missing is an <em>application</em> on top: a chat client that drives the room view and publishes with a causal clock. The framework is ready for one; none is built.</p></div>
       <div class="limit"><span class="tag">transport</span><p><b>No obfuscated transport yet.</b> Discovery is blinded and identities decoupled, but deep packet inspection can still see <em>that</em> a peer speaks a P2P protocol — just not what, or with whom. A pluggable obfuscated transport is planned.</p></div>
+      <div class="limit"><span class="tag">rendezvous</span><p><b>Bootstrap can still be blocked.</b> An invite carries its own live bootstrap peers, so there's no single fixed foreign address to censor — but if <em>every</em> peer in a given invite is unreachable, there's no fallback rendezvous yet. Cover-DHT and domestic/local rendezvous that degrade gracefully under active blocking are designed, not built.</p></div>
     </div>
   </div>
 </section>

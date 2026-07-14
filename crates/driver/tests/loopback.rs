@@ -20,11 +20,11 @@ const T: Duration = Duration::from_secs(5);
 async fn network(n: usize, seed: u64) -> (Node, Vec<Node>) {
     let lo = LO.parse().unwrap();
     let mut rng = Rng::new(seed);
-    let boot = Node::bind(lo, rng.node_id()).await.unwrap();
+    let boot = Node::bind(lo, rng.keypair()).await.unwrap();
 
     let mut peers = Vec::new();
     for _ in 0..n {
-        let node = Node::bind(lo, rng.node_id()).await.unwrap();
+        let node = Node::bind(lo, rng.keypair()).await.unwrap();
         node.add_contact(boot.contact()).await.unwrap();
         timeout(T, node.bootstrap())
             .await

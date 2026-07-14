@@ -11,10 +11,10 @@
 //!
 //! ```no_run
 //! use driver::Node;
-//! use swarm::NodeId;
 //! # async fn ex() -> Result<(), Box<dyn std::error::Error>> {
 //! let addr = "127.0.0.1:0".parse().unwrap();
-//! let node = Node::bind(addr, NodeId::from_bytes([7u8; 32])).await?;
+//! // The node is bound to an Ed25519 identity; its DHT id is hash(public key).
+//! let node = Node::bind(addr, crypto::Keypair::generate()).await?;
 //! node.bootstrap().await?;
 //! # Ok(()) }
 //! ```
@@ -290,6 +290,10 @@ enum Command {
 #[derive(Clone)]
 pub struct Node {
     id: NodeId,
+    /// The node's long-term Ed25519 identity. The DHT [`id`](Self::id) is
+    /// `hash(identity.public())`, and the identity is what a punched channel's
+    /// Noise handshake binds to (see `transfer::NoiseLink`).
+    identity: crypto::Keypair,
     local_addr: SocketAddr,
     cmd_tx: mpsc::Sender<Command>,
     /// Whether [`Node::connect`] attempts a port mapping during discovery
@@ -319,14 +323,18 @@ impl Drop for Announcer {
 }
 
 impl Node {
-    /// Bind a UDP socket at `bind_addr` and start the node with the given id,
-    /// using default punch tuning.
-    pub async fn bind(bind_addr: SocketAddr, id: NodeId) -> io::Result<Node> {
-        Node::bind_with(bind_addr, id, PunchTuning::default()).await
+    /// Bind a UDP socket at `bind_addr` and start the node under the Ed25519
+    /// `identity`, using default punch tuning. The DHT id is `hash(public key)`.
+    pub async fn bind(bind_addr: SocketAddr, identity: crypto::Keypair) -> io::Result<Node> {
+        Node::bind_with(bind_addr, identity, PunchTuning::default()).await
     }
 
     /// Like [`Node::bind`], but with explicit punch tuning — chiefly to shrink
     /// the birthday port range for fast, reliable loopback tests.
+    ///
+    /// The node's DHT id is derived from `identity`: `NodeId = hash(public key)`,
+    /// so the id can never be claimed without the matching secret, and a punched
+    /// channel's Noise handshake can prove the peer holds it.
     ///
     /// Returns [`io::ErrorKind::InvalidInput`] if the birthday port range is
     /// invalid (`start` must satisfy `1 <= start < end`) — validated here so a
@@ -334,7 +342,7 @@ impl Node {
     /// when a `Punched` connect later invokes the spray/open primitives.
     pub async fn bind_with(
         bind_addr: SocketAddr,
-        id: NodeId,
+        identity: crypto::Keypair,
         tuning: PunchTuning,
     ) -> io::Result<Node> {
         let (lo, hi) = tuning.birthday.range;
@@ -347,6 +355,7 @@ impl Node {
                 ),
             ));
         }
+        let id = NodeId::from_bytes(crypto::hash(identity.public().as_bytes()));
         let socket = UdpSocket::bind(bind_addr).await?;
         let local_addr = socket.local_addr()?;
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
@@ -354,6 +363,7 @@ impl Node {
         tokio::spawn(run(Dht::new(id), socket, cmd_rx, incoming_tx, tuning));
         Ok(Node {
             id,
+            identity,
             local_addr,
             cmd_tx,
             port_mapping: tuning.port_mapping,
@@ -364,6 +374,13 @@ impl Node {
     /// This node's id.
     pub fn id(&self) -> NodeId {
         self.id
+    }
+
+    /// This node's long-term Ed25519 identity. The DHT id is `hash(public key)`;
+    /// a punched channel's Noise handshake (`transfer::NoiseLink`) signs its
+    /// per-connection static with this key so the peer can prove who it reached.
+    pub fn identity(&self) -> &crypto::Keypair {
+        &self.identity
     }
 
     /// The socket address this node is bound to.
@@ -1250,7 +1267,7 @@ mod tests {
     async fn reflexive_addr_learns_the_socket_address() {
         // A reflector node echoes the source it observes; on loopback that's the
         // probe socket's own address, so the discovered address equals it.
-        let reflector = Node::bind(lo(), NodeId::from_bytes([9u8; 32]))
+        let reflector = Node::bind(lo(), crypto::Keypair::from_seed(&[9u8; 32]))
             .await
             .unwrap();
         let sock = UdpSocket::bind(lo()).await.unwrap();

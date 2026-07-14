@@ -38,10 +38,10 @@ const T: Duration = Duration::from_secs(20);
 async fn network(n: usize, seed: u64) -> (Node, Vec<Node>) {
     let lo = LO.parse().unwrap();
     let mut rng = Rng::new(seed);
-    let boot = Node::bind(lo, rng.node_id()).await.unwrap();
+    let boot = Node::bind(lo, rng.keypair()).await.unwrap();
     let mut peers = Vec::new();
     for _ in 0..n {
-        let node = Node::bind(lo, rng.node_id()).await.unwrap();
+        let node = Node::bind(lo, rng.keypair()).await.unwrap();
         node.add_contact(boot.contact()).await.unwrap();
         peers.push(node);
     }
@@ -74,7 +74,9 @@ async fn publish(
 ) -> (Node, NodeId, PublicKey, Vec<Vec<u8>>) {
     let feed_kp = Keypair::from_seed(&[42u8; 32]);
     let feed_pk = feed_kp.public();
-    let node_id = Rng::new(node_seed).node_id();
+    // A random node identity; its DHT id is `hash(public key)`, independent of the feed key.
+    let node_kp = Rng::new(node_seed).keypair();
+    let node_id = NodeId::from_bytes(crypto::hash(node_kp.public().as_bytes()));
     assert_ne!(
         node_id.as_bytes(),
         &feed_pk.to_bytes(),
@@ -88,7 +90,7 @@ async fn publish(
     }
     let log = Arc::new(log);
 
-    let publisher = Node::bind(LO.parse().unwrap(), node_id).await.unwrap();
+    let publisher = Node::bind(LO.parse().unwrap(), node_kp).await.unwrap();
     publisher.add_contact(bootstrap).await.unwrap();
     timeout(T, publisher.bootstrap()).await.unwrap().unwrap();
     timeout(T, publisher.announce(node_id))
@@ -159,7 +161,7 @@ async fn discover_by_blinded_topic_and_stream_a_feed() {
     // The blinded topic is opaque — not the cleartext feed key.
     assert_ne!(topic(&feed_pk, EPOCH).as_bytes(), &feed_pk.to_bytes());
 
-    let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xF00).node_id())
+    let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xF00).keypair())
         .await
         .unwrap();
     viewer.add_contact(bootstrap).await.unwrap();
@@ -237,8 +239,9 @@ async fn keep_announced_reannounces_across_rotation_and_stops_on_drop() {
     let bootstrap = boot.contact();
 
     let feed_pk = Keypair::from_seed(&[7u8; 32]).public();
-    let node_id = Rng::new(0x9E1).node_id();
-    let provider = Node::bind(LO.parse().unwrap(), node_id).await.unwrap();
+    let node_kp = Rng::new(0x9E1).keypair();
+    let node_id = NodeId::from_bytes(crypto::hash(node_kp.public().as_bytes()));
+    let provider = Node::bind(LO.parse().unwrap(), node_kp).await.unwrap();
     provider.add_contact(bootstrap).await.unwrap();
     timeout(T, provider.bootstrap()).await.unwrap().unwrap();
 
@@ -254,7 +257,7 @@ async fn keep_announced_reannounces_across_rotation_and_stops_on_drop() {
     .await
     .expect("keep_announced initial round finishes within the deadline");
 
-    let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xF00).node_id())
+    let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xF00).keypair())
         .await
         .unwrap();
     viewer.add_contact(bootstrap).await.unwrap();
@@ -288,7 +291,7 @@ async fn discovery_survives_an_epoch_boundary() {
     const E: u64 = 100;
     let (_publisher, node_id, feed_pk, frames) = publish(bootstrap, 0xACE, &[E, E + 1]).await;
 
-    let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xBEE).node_id())
+    let viewer = Node::bind(LO.parse().unwrap(), Rng::new(0xBEE).keypair())
         .await
         .unwrap();
     viewer.add_contact(bootstrap).await.unwrap();

@@ -23,9 +23,10 @@ use std::time::Duration;
 
 use crypto::{Keypair, PublicKey};
 use driver::Node;
-use swarm::{Contact, NodeId};
+use swarm::Contact;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{timeout, Instant};
+use transfer::Link;
 use warren::session::{Keys, Session};
 
 const LO: &str = "127.0.0.1:0";
@@ -46,17 +47,18 @@ async fn network(n: usize) -> (Node, Vec<Node>) {
     (boot, peers)
 }
 
-/// A distinct, fixed node id (the DHT id is decoupled from any feed key).
-fn id(n: u8) -> NodeId {
-    let mut b = [0u8; 32];
-    b[0] = n;
-    b[1] = n.wrapping_mul(31).wrapping_add(7);
-    NodeId::from_bytes(b)
+/// A distinct, deterministic node identity. The DHT id is `hash(public key)`,
+/// decoupled from any feed key; a fixed seed keeps the tests reproducible.
+fn id(n: u8) -> Keypair {
+    let mut seed = [0u8; 32];
+    seed[0] = n;
+    seed[1] = n.wrapping_mul(31).wrapping_add(7);
+    Keypair::from_seed(&seed)
 }
 
-/// Bind a bootstrapped node with the given id.
-async fn joined(bootstrap: Contact, node_id: NodeId) -> Node {
-    let node = Node::bind(LO.parse().unwrap(), node_id).await.unwrap();
+/// Bind a bootstrapped node under the given identity.
+async fn joined(bootstrap: Contact, identity: Keypair) -> Node {
+    let node = Node::bind(LO.parse().unwrap(), identity).await.unwrap();
     node.add_contact(bootstrap).await.unwrap();
     timeout(T, node.bootstrap()).await.unwrap().unwrap();
     node
@@ -94,17 +96,23 @@ fn make_session(node: Node, feed_seed: [u8; 32]) -> (Session, PublicKey) {
 /// task handle so the caller can `abort()` it to take the node's feed service down.
 fn spawn_serve_by_key(session: Session) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Ok(mut ch) = session.node.next_incoming().await {
+        while let Ok(ch) = session.node.next_incoming().await {
             let s = session.clone();
+            let identity = session.node.identity().clone();
             tokio::spawn(async move {
+                // Upgrade the punched channel to an authenticated Noise session before
+                // reading the request — the mirror of the dialer wrap in `protocol`.
+                let Ok((mut link, _peer)) = transfer::NoiseLink::accept(ch, &identity).await else {
+                    return;
+                };
                 let mut buf = [0u8; 64];
-                let Ok(n) = ch.recv(&mut buf).await else {
+                let Ok(n) = link.recv(&mut buf).await else {
                     return;
                 };
                 if n >= 33 && buf[0] == warren::protocol::REQ_FEED_KEY {
                     if let Ok(pk) = <[u8; 32]>::try_from(&buf[1..33]) {
                         if let Ok(key) = crypto::PublicKey::from_bytes(&pk) {
-                            s.serve_by_key(&mut ch, key, &transfer::Config::default())
+                            s.serve_by_key(&mut link, key, &transfer::Config::default())
                                 .await;
                         }
                     }

@@ -69,11 +69,11 @@ async fn connect_yields_a_live_channel() {
     // no out-of-band address exchange. B receives its side via `next_incoming`.
     let lo = LO.parse().unwrap();
     let mut rng = Rng::new(0xC0FFEE);
-    let boot = Node::bind(lo, rng.node_id()).await.unwrap();
+    let boot = Node::bind(lo, rng.keypair()).await.unwrap();
 
     let mut peers = Vec::new();
     for _ in 0..6 {
-        let n = Node::bind(lo, rng.node_id()).await.unwrap();
+        let n = Node::bind(lo, rng.keypair()).await.unwrap();
         n.add_contact(boot.contact()).await.unwrap();
         timeout(T, n.bootstrap()).await.unwrap().unwrap();
         peers.push(n);
@@ -138,11 +138,11 @@ async fn connect_punches_a_channel_for_symmetric_nat() {
     };
     let lo = LO.parse().unwrap();
     let mut rng = Rng::new(0xB1D7A);
-    let boot = Node::bind_with(lo, rng.node_id(), tuning).await.unwrap();
+    let boot = Node::bind_with(lo, rng.keypair(), tuning).await.unwrap();
 
     let mut peers = Vec::new();
     for _ in 0..6 {
-        let n = Node::bind_with(lo, rng.node_id(), tuning).await.unwrap();
+        let n = Node::bind_with(lo, rng.keypair(), tuning).await.unwrap();
         n.add_contact(boot.contact()).await.unwrap();
         timeout(T, n.bootstrap()).await.unwrap().unwrap();
         peers.push(n);
@@ -194,7 +194,7 @@ async fn bind_with_rejects_an_invalid_birthday_range() {
         },
         port_mapping: false,
     };
-    let err = match Node::bind_with(LO.parse().unwrap(), Rng::new(1).node_id(), tuning).await {
+    let err = match Node::bind_with(LO.parse().unwrap(), Rng::new(1).keypair(), tuning).await {
         Ok(_) => panic!("an invalid range must be rejected"),
         Err(e) => e,
     };

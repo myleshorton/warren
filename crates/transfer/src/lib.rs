@@ -41,6 +41,7 @@
 
 mod congestion;
 mod frame;
+mod noise;
 mod plan;
 
 use std::collections::{HashMap, HashSet};
@@ -59,6 +60,7 @@ use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Instant};
 
 pub use frame::MAX_MESSAGE;
+pub use noise::NoiseLink;
 
 /// Largest datagram we'll read into the receive buffer — UDP's theoretical
 /// maximum payload on **both** IPv4 and IPv6 (65535 − 40-byte IPv6 header −
@@ -72,7 +74,10 @@ pub const MAX_DATAGRAM: usize = 65_487;
 /// minimum MTU (1280 − 40 − 8 = 1232), so a fragment is never IP-fragmented and
 /// stays well under platform caps like macOS's 9216-byte `udp.maxdgram`. A
 /// message larger than one fragment is split across several (see `frame`).
-const FRAGMENT: usize = 1200;
+///
+/// This is the plaintext [`Channel`]'s [`Link::max_payload`]; a [`NoiseLink`]
+/// reserves its per-datagram overhead below this (see `noise`).
+pub(crate) const FRAGMENT: usize = 1200;
 
 /// Smallest pause the pacer bothers to take. Sub-millisecond sleeps are below
 /// the timer's resolution, so instead of sleeping per fragment the pacer
@@ -88,26 +93,41 @@ const MIN_PACING_SLEEP: Duration = Duration::from_millis(1);
 const STEAL_BATCH: usize = 4;
 
 /// A datagram link a transfer runs over: send and receive whole datagrams to a
-/// single connected peer. [`driver::Channel`] is the real one; a test supplies a
+/// single connected peer. [`driver::Channel`] is the plaintext one, [`NoiseLink`]
+/// wraps it in an authenticated, forward-secret Noise session; a test supplies a
 /// lossy in-memory link to exercise repair deterministically.
 ///
-/// `async fn` in a trait is fine here: the only callers spawning these futures do
-/// so on concrete types (a real `Channel`), whose futures are `Send`, so there's
-/// no generic `Send` bound to express.
-#[allow(async_fn_in_trait)]
+/// The `send`/`recv` futures are declared `Send` explicitly (rather than via a
+/// bare `async fn`), because the swarm engine spawns fetch tasks over a *generic*
+/// `L: Link` onto a [`tokio::task::JoinSet`], which requires the futures be `Send` —
+/// a bound `async fn` in a trait can't express.
 pub trait Link {
     /// Send one datagram to the peer, returning the number of bytes sent.
-    async fn send(&self, data: &[u8]) -> io::Result<usize>;
+    fn send(&self, data: &[u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send;
     /// Receive one datagram from the peer into `buf`, returning its length.
-    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize>;
+    fn recv(&self, buf: &mut [u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send;
+    /// The largest plaintext payload one `send` may carry and still cross the wire
+    /// in a single un-IP-fragmented datagram. The fragmenter sizes each fragment to
+    /// this, so an authenticated link can reserve room for its per-datagram overhead
+    /// (nonce + AEAD tag).
+    fn max_payload(&self) -> usize;
+    /// Whether this link authenticates and encrypts what crosses it. A plaintext
+    /// [`Channel`] returns `false`; a [`NoiseLink`] returns `true`.
+    fn authenticated(&self) -> bool;
 }
 
 impl Link for Channel {
-    async fn send(&self, data: &[u8]) -> io::Result<usize> {
-        Channel::send(self, data).await
+    fn send(&self, data: &[u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send {
+        Channel::send(self, data)
     }
-    async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        Channel::recv(self, buf).await
+    fn recv(&self, buf: &mut [u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send {
+        Channel::recv(self, buf)
+    }
+    fn max_payload(&self) -> usize {
+        FRAGMENT
+    }
+    fn authenticated(&self) -> bool {
+        false
     }
 }
 
@@ -307,11 +327,14 @@ struct Cursor {
     accepted: Option<u64>,
 }
 
-/// A provider in a swarm download: its channel, the session `Cursor` carried
+/// A provider in a swarm download: its link, the session `Cursor` carried
 /// across rounds, and what it advertised holding (learned once up front, so
 /// chunks are assigned to providers that have them — see [`Holdings`]).
-struct Provider {
-    channel: Channel,
+///
+/// Generic over the [`Link`] so the swarm runs over either a plaintext
+/// [`Channel`] or an authenticated [`NoiseLink`].
+struct Provider<L: Link> {
+    channel: L,
     cursor: Cursor,
     holds: Holdings,
 }
@@ -322,8 +345,8 @@ struct Provider {
 /// corrupt the blob nor be trusted beyond the bytes it proves. Chunks are
 /// scheduled **rarest-first**, best for a partial-seeder swarm's health. For
 /// playback order instead, see [`download_blob_stream`].
-pub async fn download_blob_swarm(
-    channels: Vec<Channel>,
+pub async fn download_blob_swarm<L: Link + Send + Sync + 'static>(
+    channels: Vec<L>,
     id: Hash,
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
@@ -350,8 +373,8 @@ pub async fn download_blob_swarm(
 /// verified by its hash before delivery. Returns [`TransferError::Incomplete`] if
 /// the swarm can't supply the whole blob — the caller will have received a
 /// contiguous prefix.
-pub async fn download_blob_stream<F>(
-    channels: Vec<Channel>,
+pub async fn download_blob_stream<L: Link + Send + Sync + 'static, F>(
+    channels: Vec<L>,
     id: Hash,
     cfg: &Config,
     window: usize,
@@ -394,14 +417,14 @@ where
 /// through which both a bulk collector and a streaming consumer receive the data.
 /// Returns the (possibly incomplete) [`Plan`]; the caller checks
 /// [`Plan::is_complete`].
-async fn run_swarm(
-    channels: Vec<Channel>,
+async fn run_swarm<L: Link + Send + Sync + 'static>(
+    channels: Vec<L>,
     id: Hash,
     cfg: &Config,
     selection: Selection,
     mut emit: impl FnMut(usize, &[u8]),
 ) -> Result<Plan, TransferError> {
-    let providers: Vec<Provider> = channels
+    let providers: Vec<Provider<L>> = channels
         .into_iter()
         .map(|channel| Provider {
             channel,
@@ -474,7 +497,7 @@ async fn run_swarm(
     // onto whatever's still pending while the others keep running. `idle` holds
     // providers waiting for work; `in_flight` the fetch tasks currently running.
     let mut idle = providers;
-    let mut in_flight: JoinSet<(Provider, ChunkOutcome)> = JoinSet::new();
+    let mut in_flight: JoinSet<(Provider<L>, ChunkOutcome)> = JoinSet::new();
     // Each in-flight task's assignment, keyed by its task id. `assign` removed
     // these chunks from `pending`, so this is the only handle on them — it lets us
     // requeue a task's chunks even if the task dies with a `JoinError` (panic /
@@ -563,10 +586,10 @@ async fn run_swarm(
 /// Providers with nothing to do stay in `idle` — they may get work once other
 /// fetches requeue chunks. Batches are capped at [`STEAL_BATCH`] so most of the
 /// work stays in the pool for whichever provider frees up next.
-fn dispatch(
+fn dispatch<L: Link + Send + Sync + 'static>(
     plan: &mut Plan,
-    idle: &mut Vec<Provider>,
-    in_flight: &mut JoinSet<(Provider, ChunkOutcome)>,
+    idle: &mut Vec<Provider<L>>,
+    in_flight: &mut JoinSet<(Provider<L>, ChunkOutcome)>,
     tracker: &mut HashMap<tokio::task::Id, Vec<Hash>>,
     cfg: &Config,
 ) {
@@ -1042,8 +1065,8 @@ impl<'a, L: Link> Wire<'a, L> {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.paced_send(frame::fragment(id, &bytes, FRAGMENT))
-            .await?;
+        let mtu = self.link.max_payload();
+        self.paced_send(frame::fragment(id, &bytes, mtu)).await?;
         self.last_sent = Some((id, bytes));
         Ok(())
     }
@@ -1065,12 +1088,13 @@ impl<'a, L: Link> Wire<'a, L> {
             if *last_id != id {
                 return Ok(false);
             }
+            let mtu = self.link.max_payload();
             let mut seen = HashSet::new();
             indices
                 .iter()
                 .copied()
                 .filter(|i| seen.insert(*i)) // dedup, in case a NACK repeats an index
-                .filter_map(|i| frame::fragment_at(*last_id, bytes, FRAGMENT, i))
+                .filter_map(|i| frame::fragment_at(*last_id, bytes, mtu, i))
                 .collect()
         };
         let resent = !to_send.is_empty();
@@ -1169,7 +1193,9 @@ mod tests {
     use super::*;
     use crypto::Keypair;
     use feed::Log;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use swarm::NodeId;
     use tokio::sync::{mpsc, Mutex};
 
     /// An in-memory [`Link`] that drops selected datagrams, so the repair loop can
@@ -1201,6 +1227,12 @@ mod tests {
                 None => Err(io::Error::new(io::ErrorKind::UnexpectedEof, "link closed")),
             }
         }
+        fn max_payload(&self) -> usize {
+            FRAGMENT
+        }
+        fn authenticated(&self) -> bool {
+            false
+        }
     }
 
     /// A cross-wired pair of lossy links: (client, server). `server_drops` names
@@ -1230,6 +1262,204 @@ mod tests {
             idle: Duration::from_millis(200),
             initial_rtt: Duration::from_millis(5),
         }
+    }
+
+    // --- NoiseLink gate tests -------------------------------------------------
+    //
+    // The punched channel gains a real Noise XX handshake (AEAD, forward-secret,
+    // identity-bound). These run over the same in-memory `LossyLink` as the repair
+    // tests above, so the encrypted transfer is exercised under deterministic loss.
+
+    /// The DHT node id derived from an identity keypair (`hash(public key)`), the
+    /// value a dialer pins its `NoiseLink::connect` target to.
+    fn node_id_of(kp: &Keypair) -> NodeId {
+        NodeId::from_bytes(crypto::hash(kp.public().as_bytes()))
+    }
+
+    /// Run the XX handshake concurrently over a cross-wired lossy pair, returning
+    /// both authenticated links and the peer id the responder learned.
+    async fn handshaken(
+        client_link: LossyLink,
+        server_link: LossyLink,
+        client_kp: &Keypair,
+        server_kp: &Keypair,
+    ) -> io::Result<(NoiseLink<LossyLink>, NoiseLink<LossyLink>, NodeId)> {
+        let target = node_id_of(server_kp);
+        let (c, s) = tokio::join!(
+            NoiseLink::connect(client_link, client_kp, target),
+            NoiseLink::accept(server_link, server_kp),
+        );
+        let client = c?;
+        let (server, peer_id) = s?;
+        Ok((client, server, peer_id))
+    }
+
+    #[tokio::test]
+    async fn noise_feed_transfer_survives_a_lossy_link() {
+        // Two nodes with distinct identities complete an XX handshake over a lossy
+        // in-memory link, then run a real feed transfer end to end over the
+        // resulting AEAD channel — recovered to byte-equality despite dropped
+        // (encrypted) response fragments.
+        let mut log = Log::new(Keypair::from_seed(&[7u8; 32]));
+        let expected: Vec<Vec<u8>> = (0..3u8).map(|i| vec![i; 30_000]).collect();
+        for block in &expected {
+            log.append(block.clone());
+        }
+        let public_key = log.public_key();
+
+        let client_kp = Keypair::from_seed(&[0x11; 32]);
+        let server_kp = Keypair::from_seed(&[0x22; 32]);
+        // Drop a scattered handful of the server's *data* fragments. The handshake
+        // datagrams are the earliest sends (client #0/#1, server #0), so these
+        // indices only ever hit post-handshake transfer fragments.
+        let (client_link, server_link) = lossy_pair(&[], &[3, 5, 8, 13, 21]);
+        let (mut client, mut server, peer_id) =
+            handshaken(client_link, server_link, &client_kp, &server_kp)
+                .await
+                .expect("handshake completes over the lossy link");
+        assert_eq!(
+            peer_id,
+            node_id_of(&client_kp),
+            "the responder authenticates the dialer's node id"
+        );
+        assert!(client.authenticated() && server.authenticated());
+
+        let cfg = fast_cfg();
+        let (served, downloaded) = tokio::join!(
+            serve_feed(&mut server, &log, &cfg),
+            download_feed(&mut client, public_key, &cfg),
+        );
+        served.expect("server ends cleanly on idle");
+        assert_eq!(
+            downloaded.expect("download verifies"),
+            expected,
+            "the feed round-trips byte-for-byte through the encrypted channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn noise_wrong_identity_is_rejected() {
+        // The dialer targets node id X, but the responder's keypair hashes to Y ≠ X.
+        // The handshake's DH still succeeds, but the dialer's identity pin fails, so
+        // `connect` errors with PermissionDenied and yields no usable link.
+        let client_kp = Keypair::from_seed(&[0x11; 32]);
+        let server_kp = Keypair::from_seed(&[0x22; 32]);
+        let decoy = Keypair::from_seed(&[0x99; 32]);
+        let wrong_target = node_id_of(&decoy); // not the server's id
+
+        let (client_link, server_link) = lossy_pair(&[], &[]);
+        let (c, s) = tokio::join!(
+            NoiseLink::connect(client_link, &client_kp, wrong_target),
+            NoiseLink::accept(server_link, &server_kp),
+        );
+        match c {
+            Ok(_) => panic!("dialer must reject an identity mismatch"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
+        }
+        // The responder completes its side (it has no target to check); no transfer
+        // ever begins because the dialer has no link.
+        assert!(s.is_ok());
+    }
+
+    /// Build an authenticated pair whose client→server datagrams pass through a relay
+    /// task we control: it can flip a byte in the next datagram (when `tamper` is
+    /// set) and we hold a sender to inject foreign datagrams at the server. The
+    /// server→client direction is faithful. Returns both links, the tamper switch,
+    /// and the injection sender.
+    #[allow(clippy::type_complexity)]
+    async fn relayed_noise_pair() -> (
+        NoiseLink<LossyLink>,
+        NoiseLink<LossyLink>,
+        Arc<AtomicBool>,
+        mpsc::UnboundedSender<Vec<u8>>,
+    ) {
+        let client_kp = Keypair::from_seed(&[0x11; 32]);
+        let server_kp = Keypair::from_seed(&[0x22; 32]);
+        let (c_tx, mut c_rx) = mpsc::unbounded_channel::<Vec<u8>>(); // client → relay
+        let (s_tx, s_rx) = mpsc::unbounded_channel::<Vec<u8>>(); // relay/inject → server
+        let (sc_tx, sc_rx) = mpsc::unbounded_channel::<Vec<u8>>(); // server → client (faithful)
+        let client_link = LossyLink {
+            tx: c_tx,
+            rx: Mutex::new(sc_rx),
+            sent: AtomicUsize::new(0),
+            drop: HashSet::new(),
+        };
+        let server_link = LossyLink {
+            tx: sc_tx,
+            rx: Mutex::new(s_rx),
+            sent: AtomicUsize::new(0),
+            drop: HashSet::new(),
+        };
+        let tamper = Arc::new(AtomicBool::new(false));
+        let inject = s_tx.clone();
+        {
+            let tamper = tamper.clone();
+            tokio::spawn(async move {
+                while let Some(mut d) = c_rx.recv().await {
+                    // Flip the last byte (an AEAD tag byte) of the next datagram once
+                    // armed — corrupting exactly one ciphertext.
+                    if tamper.swap(false, Ordering::SeqCst) && d.len() > 8 {
+                        let last = d.len() - 1;
+                        d[last] ^= 0x01;
+                    }
+                    if s_tx.send(d).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        let target = node_id_of(&server_kp);
+        let (c, s) = tokio::join!(
+            NoiseLink::connect(client_link, &client_kp, target),
+            NoiseLink::accept(server_link, &server_kp),
+        );
+        (c.expect("dialer"), s.expect("responder").0, tamper, inject)
+    }
+
+    #[tokio::test]
+    async fn noise_rejects_a_tampered_datagram() {
+        let (client, server, tamper, _inject) = relayed_noise_pair().await;
+        let mut buf = [0u8; 256];
+
+        client.send(b"hello").await.unwrap();
+        let n = server.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+
+        // Flip one ciphertext byte in flight → the AEAD tag fails, recv errors.
+        tamper.store(true, Ordering::SeqCst);
+        client.send(b"world").await.unwrap();
+        assert!(
+            server.recv(&mut buf).await.is_err(),
+            "a flipped ciphertext byte must fail decryption"
+        );
+
+        // The stream is not corrupted: a later genuine datagram still decodes.
+        client.send(b"again").await.unwrap();
+        let n = server.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"again");
+    }
+
+    #[tokio::test]
+    async fn noise_rejects_an_injected_datagram() {
+        let (client, server, _tamper, inject) = relayed_noise_pair().await;
+        let mut buf = [0u8; 256];
+
+        client.send(b"one").await.unwrap();
+        let n = server.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"one");
+
+        // A datagram that wasn't produced by the peer's cipher (random bytes behind a
+        // plausible nonce) fails to decrypt and is rejected mid-session.
+        inject.send(vec![0u8; 48]).unwrap();
+        assert!(
+            server.recv(&mut buf).await.is_err(),
+            "an injected datagram must be rejected"
+        );
+
+        // …and the session continues: the next genuine datagram decodes.
+        client.send(b"two").await.unwrap();
+        let n = server.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"two");
     }
 
     #[tokio::test]

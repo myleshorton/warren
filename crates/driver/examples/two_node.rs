@@ -12,20 +12,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut rng = Rng::new(0xD00D);
 
     // A small backbone the two peers bootstrap off.
-    let boot = Node::bind(lo, rng.node_id()).await?;
+    let boot = Node::bind(lo, rng.keypair()).await?;
     println!("bootstrap node at {}", boot.local_addr());
 
     // Held for the rest of the run so the backbone stays up.
     let mut backbone = Vec::new();
     for _ in 0..5 {
-        let n = Node::bind(lo, rng.node_id()).await?;
+        let n = Node::bind(lo, rng.keypair()).await?;
         n.add_contact(boot.contact()).await?;
         n.bootstrap().await?;
         backbone.push(n);
     }
 
     // Server announces under its own id.
-    let server = Node::bind(lo, rng.node_id()).await?;
+    let server = Node::bind(lo, rng.keypair()).await?;
     server.add_contact(boot.contact()).await?;
     server.bootstrap().await?;
     server.announce(server.id()).await?;
@@ -36,7 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Client discovers and connects to the server by id.
-    let client = Node::bind(lo, rng.node_id()).await?;
+    let client = Node::bind(lo, rng.keypair()).await?;
     client.add_contact(boot.contact()).await?;
     client.bootstrap().await?;
 

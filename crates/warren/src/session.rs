@@ -385,9 +385,9 @@ impl Session {
     /// our own log if `feed_key` is ours, or a [`feed::Replica`] if we mirror it (see
     /// [`Self::mirror_feed`]); either way it live-tails (holds the connection open and
     /// pushes new blocks). `false` if we serve neither.
-    pub async fn serve_by_key(
+    pub async fn serve_by_key<L: transfer::Link>(
         &self,
-        channel: &mut driver::Channel,
+        channel: &mut L,
         feed_key: crypto::PublicKey,
         cfg: &transfer::Config,
     ) -> bool {

@@ -17,9 +17,10 @@ use std::time::Duration;
 
 use crypto::{Keypair, PublicKey};
 use driver::Node;
-use swarm::{Contact, NodeId};
+use swarm::Contact;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{timeout, Instant};
+use transfer::Link;
 use warren::record::Record;
 use warren::room::Room;
 use warren::session::{Keys, Session};
@@ -40,15 +41,16 @@ async fn network(n: usize) -> (Node, Vec<Node>) {
     (boot, peers)
 }
 
-fn id(n: u8) -> NodeId {
-    let mut b = [0u8; 32];
-    b[0] = n;
-    b[1] = n.wrapping_mul(31).wrapping_add(7);
-    NodeId::from_bytes(b)
+/// A distinct, deterministic node identity (DHT id is `hash(public key)`).
+fn id(n: u8) -> Keypair {
+    let mut seed = [0u8; 32];
+    seed[0] = n;
+    seed[1] = n.wrapping_mul(31).wrapping_add(7);
+    Keypair::from_seed(&seed)
 }
 
-async fn joined(bootstrap: Contact, node_id: NodeId) -> Node {
-    let node = Node::bind(LO.parse().unwrap(), node_id).await.unwrap();
+async fn joined(bootstrap: Contact, identity: Keypair) -> Node {
+    let node = Node::bind(LO.parse().unwrap(), identity).await.unwrap();
     node.add_contact(bootstrap).await.unwrap();
     timeout(T, node.bootstrap()).await.unwrap().unwrap();
     node
@@ -81,17 +83,22 @@ fn make_session(node: Node, feed_seed: [u8; 32]) -> (Session, PublicKey) {
 /// Answer feed-by-key requests via `serve_by_key` (as Murmur's accept loop does).
 fn spawn_serve_by_key(session: Session) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        while let Ok(mut ch) = session.node.next_incoming().await {
+        while let Ok(ch) = session.node.next_incoming().await {
             let s = session.clone();
+            let identity = session.node.identity().clone();
             tokio::spawn(async move {
+                // Upgrade to an authenticated Noise session before reading the request.
+                let Ok((mut link, _peer)) = transfer::NoiseLink::accept(ch, &identity).await else {
+                    return;
+                };
                 let mut buf = [0u8; 64];
-                let Ok(n) = ch.recv(&mut buf).await else {
+                let Ok(n) = link.recv(&mut buf).await else {
                     return;
                 };
                 if n >= 33 && buf[0] == warren::protocol::REQ_FEED_KEY {
                     if let Ok(pk) = <[u8; 32]>::try_from(&buf[1..33]) {
                         if let Ok(key) = crypto::PublicKey::from_bytes(&pk) {
-                            s.serve_by_key(&mut ch, key, &transfer::Config::default())
+                            s.serve_by_key(&mut link, key, &transfer::Config::default())
                                 .await;
                         }
                     }

@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 swarm = { path = "../swarm" }
+crypto = { path = "../crypto" }
 puncher = { path = "../puncher" }
 portmap = { path = "../portmap" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }

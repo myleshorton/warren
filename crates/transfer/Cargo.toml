@@ -13,12 +13,16 @@ feed = { path = "../feed" }
 blob = { path = "../blob" }
 sync = { path = "../sync" }
 driver = { path = "../driver" }
+swarm = { path = "../swarm" }
 wire = { path = "../wire" }
 tokio = { version = "1", features = ["time", "rt", "sync"] }
+# Noise XX handshake + AEAD transport for the punched channel (NoiseLink). The
+# stateless transport mode lets us carry an explicit per-datagram nonce so the
+# cipher survives the unreliable, reorder-prone UDP channel.
+snow = "0.10"
 thiserror.workspace = true
 
 [dev-dependencies]
-swarm = { path = "../swarm" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync"] }
 
 [[example]]

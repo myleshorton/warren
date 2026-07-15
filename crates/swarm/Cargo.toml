@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 wire = { path = "../wire" }
+crypto = { path = "../crypto" }
 thiserror.workspace = true
 
 [dev-dependencies]

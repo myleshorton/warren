@@ -22,7 +22,7 @@
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crypto::{epoch, Keypair};
+use crypto::{epoch, hash, Keypair};
 use driver::Node;
 use feed::Log;
 use swarm::sim::Rng;
@@ -52,10 +52,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- A small DHT backbone -------------------------------------------------
     print!("[network] bringing up a 7-node DHT on loopback (1 bootstrap + 6 peers)... ");
     let mut rng = Rng::new(0x5EED);
-    let boot = Node::bind(lo, rng.node_id()).await?;
+    let boot = Node::bind(lo, rng.keypair()).await?;
     let mut backbone = Vec::new();
     for _ in 0..6 {
-        let n = Node::bind(lo, rng.node_id()).await?;
+        let n = Node::bind(lo, rng.keypair()).await?;
         n.add_contact(boot.contact()).await?;
         timeout(T, n.bootstrap()).await??;
         backbone.push(n);
@@ -68,8 +68,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let feed_pk = feed_kp.public();
     // The feed key is the content id and the key you verify against. The node id is
     // random — the key is not the publisher's node id. Content is discovered under
-    // a blinded topic that rotates with the epoch, not the key.
-    let node_id = rng.node_id();
+    // a blinded topic that rotates with the epoch, not the key. The publisher's
+    // node identity is a fresh keypair; its DHT id is `hash(public key)`.
+    let node_kp = rng.keypair();
+    let node_id = NodeId::from_bytes(hash(node_kp.public().as_bytes()));
     assert_ne!(
         node_id.as_bytes(),
         &feed_pk.to_bytes(),
@@ -119,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_bytes / blocks.len() / 1024,
     );
 
-    let publisher = Node::bind(lo, node_id).await?;
+    let publisher = Node::bind(lo, node_kp).await?;
     publisher.add_contact(bootstrap).await?;
     timeout(T, publisher.bootstrap()).await??;
     // Keep re-announcing rather than announcing once: the node id (reachability,
@@ -161,7 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Reader ---------------------------------------------------------------
     println!("\n[reader]  knows only the feed key. Joining the DHT...");
-    let reader = Node::bind(lo, rng.node_id()).await?;
+    let reader = Node::bind(lo, rng.keypair()).await?;
     reader.add_contact(bootstrap).await?;
     timeout(T, reader.bootstrap()).await??;
 

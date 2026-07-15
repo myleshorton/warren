@@ -10,6 +10,28 @@
 
 use driver::{Channel, Node};
 use swarm::NodeId;
+use transfer::{Link, NoiseLink};
+
+/// A punched channel upgraded to an authenticated, encrypted Noise session — what
+/// every peer request now runs over, so a coordinator or on-path observer sees only
+/// ciphertext and a peer is cryptographically bound to the node id it claims.
+type Secure = NoiseLink<Channel>;
+
+/// Connect to `target` over the DHT and upgrade the punched channel to an
+/// authenticated, encrypted Noise session pinned to `target`'s node id (see
+/// [`NoiseLink::connect`]). `Err` if the peer is unreachable, yields no data
+/// channel, or the handshake fails — including a peer whose identity does not hash
+/// to `target` (then the error is `PermissionDenied`).
+async fn secure_dial(node: &Node, target: NodeId) -> Result<Secure, String> {
+    let conn = node
+        .connect(target)
+        .await
+        .map_err(|e| format!("connect: {e:?}"))?;
+    let ch = conn.channel.ok_or("no data channel")?;
+    NoiseLink::connect(ch, node.identity(), target)
+        .await
+        .map_err(|e| format!("noise handshake: {e}"))
+}
 
 /// Request the peer's signed feed. The peer replies with its 32-byte feed public
 /// key, then serves the feed.
@@ -24,8 +46,12 @@ pub const REQ_FEED_KEY: u8 = 3;
 
 /// Serve our feed to a peer that asked for it: send our feed public key (the trust
 /// anchor) first, then stream the log. Returns `false` on a broken channel.
-pub async fn serve_feed(
-    channel: &mut Channel,
+///
+/// Generic over the [`Link`] the caller hands in — always a [`NoiseLink`] in
+/// practice (the accept loop wraps each incoming channel), so the whole exchange is
+/// authenticated and encrypted.
+pub async fn serve_feed<L: Link>(
+    channel: &mut L,
     feed_pubkey: &crypto::PublicKey,
     log: &feed::Log,
     cfg: &transfer::Config,
@@ -41,8 +67,8 @@ pub async fn serve_feed(
 /// [`transfer::serve_feed_tail`]). A superset of [`serve_feed`] — a batch client
 /// that never polls with `Tail` is served identically — so an accept loop can use
 /// this for every feed request. Signal `appended` on each append to `log`.
-pub async fn serve_feed_tail(
-    channel: &mut Channel,
+pub async fn serve_feed_tail<L: Link>(
+    channel: &mut L,
     feed_pubkey: &crypto::PublicKey,
     log: &std::sync::Mutex<feed::Log>,
     appended: &tokio::sync::Notify,
@@ -57,8 +83,8 @@ pub async fn serve_feed_tail(
 }
 
 /// Serve a blob to a peer that asked for it.
-pub async fn serve_blob(
-    channel: &mut Channel,
+pub async fn serve_blob<L: Link>(
+    channel: &mut L,
     store: &blob::Store,
     cfg: &transfer::Config,
 ) -> bool {
@@ -81,11 +107,7 @@ pub async fn subscribe_feed<F>(
 where
     F: FnMut(u64, Vec<u8>),
 {
-    let conn = node
-        .connect(peer)
-        .await
-        .map_err(|e| format!("connect: {e:?}"))?;
-    let mut ch = conn.channel.ok_or("no data channel")?;
+    let mut ch = secure_dial(node, peer).await?;
     ch.send(&[req]).await.map_err(|e| format!("send: {e}"))?;
 
     let mut buf = [0u8; 64];
@@ -124,11 +146,7 @@ pub async fn subscribe_feed_by_key<F>(
 where
     F: FnMut(u64, Vec<u8>),
 {
-    let conn = node
-        .connect(provider)
-        .await
-        .map_err(|e| format!("connect: {e:?}"))?;
-    let mut ch = conn.channel.ok_or("no data channel")?;
+    let mut ch = secure_dial(node, provider).await?;
     let key_bytes = feed_key.to_bytes();
     let mut req = Vec::with_capacity(1 + key_bytes.len());
     req.push(REQ_FEED_KEY);
@@ -166,11 +184,7 @@ pub async fn replicate_feed_by_key(
     appended: &tokio::sync::Notify,
     cfg: &transfer::Config,
 ) -> Result<(), String> {
-    let conn = node
-        .connect(provider)
-        .await
-        .map_err(|e| format!("connect: {e:?}"))?;
-    let mut ch = conn.channel.ok_or("no data channel")?;
+    let mut ch = secure_dial(node, provider).await?;
     let key_bytes = feed_key.to_bytes();
     let mut req = Vec::with_capacity(1 + key_bytes.len());
     req.push(REQ_FEED_KEY);
@@ -206,8 +220,7 @@ pub async fn fetch_replica(
     feed_key: crypto::PublicKey,
     cfg: &transfer::Config,
 ) -> Option<feed::Replica> {
-    let conn = node.connect(provider).await.ok()?;
-    let mut ch = conn.channel?;
+    let mut ch = secure_dial(node, provider).await.ok()?;
     let key_bytes = feed_key.to_bytes();
     let mut req = Vec::with_capacity(1 + key_bytes.len());
     req.push(REQ_FEED_KEY);
@@ -239,8 +252,7 @@ pub async fn fetch_feed(
     req: u8,
     cfg: &transfer::Config,
 ) -> Option<(Vec<Vec<u8>>, crypto::PublicKey)> {
-    let conn = node.connect(peer).await.ok()?;
-    let mut ch = conn.channel?;
+    let mut ch = secure_dial(node, peer).await.ok()?;
     ch.send(&[req]).await.ok()?;
 
     // Bound the handshake reply so a reachable-but-silent peer can't stall discovery
@@ -259,15 +271,17 @@ pub async fn fetch_feed(
     Some((blocks, pubkey))
 }
 
-/// Open blob channels to several providers of `blob_hash` for a swarm download:
-/// the known feed provider plus everyone announcing `content_topic`. Each returned
-/// channel has already sent the [`REQ_BLOB`] header, ready to hand to `transfer`.
+/// Open authenticated blob channels to several providers of `blob_hash` for a swarm
+/// download: the known feed provider plus everyone announcing `content_topic`. Each
+/// returned [`NoiseLink`] has completed its Noise handshake (so the provider is
+/// bound to the node id we dialed) and already sent the [`REQ_BLOB`] header, ready
+/// to hand to `transfer`.
 pub async fn gather_blob_channels(
     node: &Node,
     content_topic: NodeId,
     feed_provider: Option<NodeId>,
     max: usize,
-) -> Vec<Channel> {
+) -> Vec<Secure> {
     let me = node.id();
     let mut ids: Vec<NodeId> = Vec::new();
     if let Some(p) = feed_provider {
@@ -284,11 +298,9 @@ pub async fn gather_blob_channels(
     }
     let mut channels = Vec::new();
     for id in ids.into_iter().take(max) {
-        if let Ok(conn) = node.connect(id).await {
-            if let Some(ch) = conn.channel {
-                if ch.send(&[REQ_BLOB]).await.is_ok() {
-                    channels.push(ch);
-                }
+        if let Ok(ch) = secure_dial(node, id).await {
+            if ch.send(&[REQ_BLOB]).await.is_ok() {
+                channels.push(ch);
             }
         }
     }

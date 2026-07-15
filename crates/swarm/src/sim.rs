@@ -35,12 +35,25 @@ impl Rng {
 
     /// A random node id.
     pub fn node_id(&mut self) -> NodeId {
+        NodeId::from_bytes(self.fill32())
+    }
+
+    /// A random 32-byte buffer, drawn deterministically from the PRNG — the seed
+    /// material for a node id or a [`crypto::Keypair`].
+    pub fn fill32(&mut self) -> [u8; ID_LEN] {
         let mut b = [0u8; ID_LEN];
         for chunk in b.chunks_mut(8) {
             let v = self.next_u64().to_le_bytes();
             chunk.copy_from_slice(&v[..chunk.len()]);
         }
-        NodeId::from_bytes(b)
+        b
+    }
+
+    /// A deterministic Ed25519 identity keypair, so tests that now bind a node
+    /// with a [`crypto::Keypair`] (rather than a bare [`NodeId`]) stay reproducible.
+    /// The node's id is derived from this keypair's public key (see `driver::Node`).
+    pub fn keypair(&mut self) -> crypto::Keypair {
+        crypto::Keypair::from_seed(&self.fill32())
     }
 
     /// A float in `[0, 1)`.

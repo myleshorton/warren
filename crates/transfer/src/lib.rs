@@ -109,7 +109,7 @@ pub trait Link {
     /// The largest plaintext payload one `send` may carry and still cross the wire
     /// in a single un-IP-fragmented datagram. The fragmenter sizes each fragment to
     /// this, so an authenticated link can reserve room for its per-datagram overhead
-    /// (nonce + AEAD tag).
+    /// (record type + nonce + AEAD tag).
     fn max_payload(&self) -> usize;
     /// Whether this link authenticates and encrypts what crosses it. A plaintext
     /// [`Channel`] returns `false`; a [`NoiseLink`] returns `true`.
@@ -1194,7 +1194,7 @@ mod tests {
     use crypto::Keypair;
     use feed::Log;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
     use swarm::NodeId;
     use tokio::sync::{mpsc, Mutex};
 
@@ -1294,6 +1294,106 @@ mod tests {
         Ok((client, server, peer_id))
     }
 
+    struct DuplicateFirstSend {
+        inner: LossyLink,
+        duplicated: AtomicBool,
+    }
+
+    impl Link for DuplicateFirstSend {
+        async fn send(&self, data: &[u8]) -> io::Result<usize> {
+            let n = self.inner.send(data).await?;
+            if !self.duplicated.swap(true, Ordering::SeqCst) {
+                self.inner.send(data).await?;
+            }
+            Ok(n)
+        }
+
+        async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.recv(buf).await
+        }
+
+        fn max_payload(&self) -> usize {
+            self.inner.max_payload()
+        }
+
+        fn authenticated(&self) -> bool {
+            self.inner.authenticated()
+        }
+    }
+
+    #[tokio::test]
+    async fn noise_handshake_recovers_when_message_2_is_lost() {
+        let client_kp = Keypair::from_seed(&[0x11; 32]);
+        let server_kp = Keypair::from_seed(&[0x22; 32]);
+        // The responder sends message 2 once, then only repeats it when the
+        // initiator's next message 1 demonstrates that the prior reply was lost.
+        let (client_link, server_link) = lossy_pair(&[], &[0]);
+        handshaken(client_link, server_link, &client_kp, &server_kp)
+            .await
+            .expect("a repeated message 1 recovers a lost message 2");
+    }
+
+    #[tokio::test]
+    async fn noise_handshake_recovers_when_message_3_is_lost() {
+        let client_kp = Keypair::from_seed(&[0x11; 32]);
+        let server_kp = Keypair::from_seed(&[0x22; 32]);
+        // Client send #0 is message 1; sends #1 and #2 are the first two message-3
+        // attempts. The authenticated completion ACK makes the dialer retry both.
+        let (client_link, server_link) = lossy_pair(&[1, 2], &[]);
+        handshaken(client_link, server_link, &client_kp, &server_kp)
+            .await
+            .expect("message 3 is retransmitted until acknowledged");
+    }
+
+    #[tokio::test]
+    async fn noise_handshake_recovers_when_completion_ack_is_lost() {
+        let client_kp = Keypair::from_seed(&[0x11; 32]);
+        let server_kp = Keypair::from_seed(&[0x22; 32]);
+        let target = node_id_of(&server_kp);
+        // Server send #0 is message 2 and #1 is the first completion ACK. Once
+        // accept returns, its first transport receive recognizes a repeated message
+        // 3 and replays the cached ACK before delivering the application request.
+        let (client_link, server_link) = lossy_pair(&[], &[1]);
+        let (client, server) = tokio::join!(
+            async {
+                let client = NoiseLink::connect(client_link, &client_kp, target).await?;
+                client.send(b"hello").await?;
+                Ok::<_, io::Error>(())
+            },
+            async {
+                let (server, _) = NoiseLink::accept(server_link, &server_kp).await?;
+                let mut buf = [0u8; 32];
+                let n = server.recv(&mut buf).await?;
+                Ok::<_, io::Error>(buf[..n].to_vec())
+            },
+        );
+        client.expect("dialer recovers the ACK");
+        assert_eq!(server.expect("responder receives the request"), b"hello");
+    }
+
+    #[tokio::test]
+    async fn duplicate_handshake_datagram_does_not_poison_transport() {
+        let client_kp = Keypair::from_seed(&[0x11; 32]);
+        let server_kp = Keypair::from_seed(&[0x22; 32]);
+        let target = node_id_of(&server_kp);
+        let (client_link, server_link) = lossy_pair(&[], &[]);
+        let server_link = DuplicateFirstSend {
+            inner: server_link,
+            duplicated: AtomicBool::new(false),
+        };
+        let (client, server) = tokio::join!(
+            NoiseLink::connect(client_link, &client_kp, target),
+            NoiseLink::accept(server_link, &server_kp),
+        );
+        let client = client.expect("dialer");
+        let server = server.expect("responder").0;
+
+        server.send(b"hello").await.unwrap();
+        let mut buf = [0u8; 32];
+        let n = client.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"hello");
+    }
+
     #[tokio::test]
     async fn noise_feed_transfer_survives_a_lossy_link() {
         // Two nodes with distinct identities complete an XX handshake over a lossy
@@ -1310,7 +1410,7 @@ mod tests {
         let client_kp = Keypair::from_seed(&[0x11; 32]);
         let server_kp = Keypair::from_seed(&[0x22; 32]);
         // Drop a scattered handful of the server's *data* fragments. The handshake
-        // datagrams are the earliest sends (client #0/#1, server #0), so these
+        // datagrams are the earliest sends (client #0/#1, server #0/#1), so these
         // indices only ever hit post-handshake transfer fragments.
         let (client_link, server_link) = lossy_pair(&[], &[3, 5, 8, 13, 21]);
         let (mut client, mut server, peer_id) =
@@ -1356,9 +1456,9 @@ mod tests {
             Ok(_) => panic!("dialer must reject an identity mismatch"),
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::PermissionDenied),
         }
-        // The responder completes its side (it has no target to check); no transfer
-        // ever begins because the dialer has no link.
-        assert!(s.is_ok());
+        // The dialer verifies the responder before sending message 3, so the wrong
+        // endpoint never receives the dialer's identity certificate.
+        assert!(s.is_err());
     }
 
     /// Build an authenticated pair whose client→server datagrams pass through a relay
@@ -1372,6 +1472,7 @@ mod tests {
         NoiseLink<LossyLink>,
         Arc<AtomicBool>,
         mpsc::UnboundedSender<Vec<u8>>,
+        Arc<StdMutex<Option<Vec<u8>>>>,
     ) {
         let client_kp = Keypair::from_seed(&[0x11; 32]);
         let server_kp = Keypair::from_seed(&[0x22; 32]);
@@ -1392,10 +1493,13 @@ mod tests {
         };
         let tamper = Arc::new(AtomicBool::new(false));
         let inject = s_tx.clone();
+        let captured = Arc::new(StdMutex::new(None));
         {
             let tamper = tamper.clone();
+            let captured = captured.clone();
             tokio::spawn(async move {
                 while let Some(mut d) = c_rx.recv().await {
+                    *captured.lock().expect("captured") = Some(d.clone());
                     // Flip the last byte (an AEAD tag byte) of the next datagram once
                     // armed — corrupting exactly one ciphertext.
                     if tamper.swap(false, Ordering::SeqCst) && d.len() > 8 {
@@ -1413,27 +1517,28 @@ mod tests {
             NoiseLink::connect(client_link, &client_kp, target),
             NoiseLink::accept(server_link, &server_kp),
         );
-        (c.expect("dialer"), s.expect("responder").0, tamper, inject)
+        (
+            c.expect("dialer"),
+            s.expect("responder").0,
+            tamper,
+            inject,
+            captured,
+        )
     }
 
     #[tokio::test]
     async fn noise_rejects_a_tampered_datagram() {
-        let (client, server, tamper, _inject) = relayed_noise_pair().await;
+        let (client, server, tamper, _inject, _captured) = relayed_noise_pair().await;
         let mut buf = [0u8; 256];
 
         client.send(b"hello").await.unwrap();
         let n = server.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"hello");
 
-        // Flip one ciphertext byte in flight → the AEAD tag fails, recv errors.
+        // Flip one ciphertext byte in flight. The bad datagram is treated as loss,
+        // and the next genuine one still arrives without surfacing a socket error.
         tamper.store(true, Ordering::SeqCst);
         client.send(b"world").await.unwrap();
-        assert!(
-            server.recv(&mut buf).await.is_err(),
-            "a flipped ciphertext byte must fail decryption"
-        );
-
-        // The stream is not corrupted: a later genuine datagram still decodes.
         client.send(b"again").await.unwrap();
         let n = server.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"again");
@@ -1441,7 +1546,7 @@ mod tests {
 
     #[tokio::test]
     async fn noise_rejects_an_injected_datagram() {
-        let (client, server, _tamper, inject) = relayed_noise_pair().await;
+        let (client, server, _tamper, inject, _captured) = relayed_noise_pair().await;
         let mut buf = [0u8; 256];
 
         client.send(b"one").await.unwrap();
@@ -1449,14 +1554,28 @@ mod tests {
         assert_eq!(&buf[..n], b"one");
 
         // A datagram that wasn't produced by the peer's cipher (random bytes behind a
-        // plausible nonce) fails to decrypt and is rejected mid-session.
+        // plausible nonce) fails to decrypt and is discarded mid-session.
         inject.send(vec![0u8; 48]).unwrap();
-        assert!(
-            server.recv(&mut buf).await.is_err(),
-            "an injected datagram must be rejected"
-        );
+        client.send(b"two").await.unwrap();
+        let n = server.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"two");
+    }
 
-        // …and the session continues: the next genuine datagram decodes.
+    #[tokio::test]
+    async fn noise_rejects_a_replayed_datagram() {
+        let (client, server, _tamper, inject, captured) = relayed_noise_pair().await;
+        let mut buf = [0u8; 256];
+
+        client.send(b"one").await.unwrap();
+        let n = server.recv(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"one");
+
+        let replay = captured
+            .lock()
+            .expect("captured")
+            .clone()
+            .expect("captured transport datagram");
+        inject.send(replay).unwrap();
         client.send(b"two").await.unwrap();
         let n = server.recv(&mut buf).await.unwrap();
         assert_eq!(&buf[..n], b"two");

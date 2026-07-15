@@ -332,7 +332,7 @@
       <div class="card"><div class="top"><span class="name">1 · signal</span><span class="role">rendezvous</span></div><p>The target <b>announces under its own id</b>; any DHT node holding that record becomes a <b>coordinator</b>, and a <code>Signal</code> relays each side's candidates + NAT type through it. No dedicated signaling service — unlike WebRTC, rendezvous <em>is</em> the DHT.</p></div>
       <div class="card"><div class="top"><span class="name">2 · candidates</span><span class="role">reachability</span></div><p>Each peer offers a few addresses — <b>local</b>, <b>reflexive</b> (a STUN-like probe to nearby peers), and an optional <b>PCP/UPnP port-map</b> — most-routable first. The coordinator sees the control address; it can't observe the data-socket candidates, so the endpoints fill those in.</p></div>
       <div class="card"><div class="top"><span class="name">3 · punch</span><span class="role">nat traversal</span></div><p>A one-byte <code>PROBE</code> / <code>ACK</code> opens a direct UDP path. For one-sided symmetric NAT it leans on the <b>birthday paradox</b> (panel below). Two peers <em>both</em> behind symmetric NAT aren't punched — no relay sits in the path, by design.</p></div>
-      <div class="card"><div class="top"><span class="name">4 · channel</span><span class="role">transport</span></div><p>The channel runs a <b>Noise <code>XX</code> handshake</b> — forward-secret, mutually authenticated, and <b>bound to the peer's node id</b> — so the selective-repeat framing is AEAD-encrypted end to end. Clips are <em>additionally</em> sealed at the <b>content layer</b> (XChaCha20, named + signed by ciphertext hash) so blind mirrors can carry bytes they can't read.</p></div>
+      <div class="card"><div class="top"><span class="name">4 · channel</span><span class="role">transport</span></div><p>The channel runs a <b>Noise <code>XX</code> handshake</b> — forward-secret, mutually authenticated, and <b>bound to the peer's node id</b> — so the selective-repeat framing is AEAD-encrypted end to end. Every datagram carries its own nonce behind a <b>sliding replay window</b>, so forged, tampered, or replayed packets are dropped as loss rather than breaking the stream. Clips are <em>additionally</em> sealed at the <b>content layer</b> (XChaCha20, named + signed by ciphertext hash) so blind mirrors can carry bytes they can't read.</p></div>
     </div>
 
     <div class="stackdiag reveal" style="margin-top:44px;">
@@ -498,7 +498,7 @@
       <div class="cap">Multi-writer causal merge (version-vector clocks, deterministic convergent linearizer)</div><div class="st built">built</div>
       <div class="cap">Roster membership + authorship gate (founder genesis, signed vouching records)</div><div class="st built">built</div>
       <div class="cap">Blind push notifier (iOS background wake without breaking serverless)</div><div class="st design">design</div>
-      <div class="cap">Authenticated + encrypted transport handshake (Noise XX; binds the peer id)</div><div class="st built">built</div>
+      <div class="cap">Authenticated, encrypted, replay-protected transport (Noise XX; binds the peer id)</div><div class="st built">built</div>
       <div class="cap">Signed DHT signaling + capability tokens (no announcing under another's id)</div><div class="st planned">planned</div>
       <div class="cap">Obfuscated / pluggable transport, cover-DHT rendezvous</div><div class="st planned">planned</div>
     </div>

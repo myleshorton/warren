@@ -1322,6 +1322,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn noise_handshake_recovers_when_message_2_is_lost() {
+        let client_kp = Keypair::from_seed(&[0x11; 32]);
+        let server_kp = Keypair::from_seed(&[0x22; 32]);
+        // The responder sends message 2 once, then only repeats it when the
+        // initiator's next message 1 demonstrates that the prior reply was lost.
+        let (client_link, server_link) = lossy_pair(&[], &[0]);
+        handshaken(client_link, server_link, &client_kp, &server_kp)
+            .await
+            .expect("a repeated message 1 recovers a lost message 2");
+    }
+
+    #[tokio::test]
     async fn noise_handshake_recovers_when_message_3_is_lost() {
         let client_kp = Keypair::from_seed(&[0x11; 32]);
         let server_kp = Keypair::from_seed(&[0x22; 32]);
@@ -1398,7 +1410,7 @@ mod tests {
         let client_kp = Keypair::from_seed(&[0x11; 32]);
         let server_kp = Keypair::from_seed(&[0x22; 32]);
         // Drop a scattered handful of the server's *data* fragments. The handshake
-        // datagrams are the earliest sends (client #0/#1, server #0), so these
+        // datagrams are the earliest sends (client #0/#1, server #0/#1), so these
         // indices only ever hit post-handshake transfer fragments.
         let (client_link, server_link) = lossy_pair(&[], &[3, 5, 8, 13, 21]);
         let (mut client, mut server, peer_id) =

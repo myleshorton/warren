@@ -47,6 +47,17 @@
 //! while the application waits for its first request. Handshake and transport
 //! datagrams carry distinct one-byte type tags, so delayed handshake traffic never
 //! enters the transport cipher.
+//!
+//! Warren's dialer always speaks first after connecting, so the responder promptly
+//! enters [`Link::recv`] and can answer a repeated message 3 if the completion ACK
+//! was lost. A future responder-first protocol must likewise drive `recv` while the
+//! dialer is awaiting that ACK, or move completion replay into a background task.
+//!
+//! Handshake authentication failures are intentionally fatal, unlike invalid
+//! transport datagrams: snow's handshake state is not safely resumable after a
+//! failed message read. An active attacker able to inject on the punched 5-tuple can
+//! therefore force a fresh handshake, but cannot authenticate or disclose either
+//! peer's identity through that failure.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,6 +90,7 @@ const TAG_TRANSPORT: u8 = 4;
 const NONCE_LEN: usize = 8;
 /// ChaCha20-Poly1305 authentication tag length, reserved in every transport datagram.
 const TAG_LEN: usize = 16;
+/// Record type + nonce + AEAD tag: 25 bytes, leaving 1175 over a 1200-byte channel.
 const TRANSPORT_OVERHEAD: usize = 1 + NONCE_LEN + TAG_LEN;
 
 const ACK: &[u8] = b"warren-noise-ack-v1";
@@ -376,9 +388,9 @@ impl<T: Link> NoiseLink<T> {
         // a duplicate message 1 means our message 2 was lost, so the loop resends it.
         let n2 = hs.write_message(&cert, &mut wbuf).map_err(noise_err)?;
         let msg2 = tagged(TAG_MSG2, &wbuf[..n2]);
+        inner.send(&msg2).await?;
         let (peer_cert, msg3) = 'wait: {
             for _ in 0..HS_RETRIES {
-                inner.send(&msg2).await?;
                 if let Some(n) = recv_timeout(&inner, &mut rbuf).await? {
                     if n >= 1 && rbuf[0] == TAG_MSG3 {
                         let mut payload = [0u8; 256];
@@ -386,6 +398,8 @@ impl<T: Link> NoiseLink<T> {
                             .read_message(&rbuf[1..n], &mut payload)
                             .map_err(noise_err)?;
                         break 'wait (NodeCert::decode(&payload[..plen])?, rbuf[..n].to_vec());
+                    } else if n >= 1 && rbuf[0] == TAG_MSG1 {
+                        inner.send(&msg2).await?;
                     }
                 }
             }

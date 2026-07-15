@@ -325,14 +325,14 @@
     <div class="head reveal">
       <span class="kicker">wire protocol</span>
       <h2>How two peers actually meet</h2>
-      <p>There is no signaling server. The same DHT that finds content also brokers the connection — peers trade candidates over it, then punch a direct path — which a Noise handshake then turns into a forward-secret, mutually-authenticated channel bound to the peer's node id. What's left honest (see the limits): the discovery-layer signaling isn't signed yet, and the wire carries no traffic obfuscation.</p>
+      <p>There is no signaling server. The same DHT that finds content also brokers the connection — peers trade candidates over it, then punch a direct path — which a Noise handshake then turns into a forward-secret, mutually authenticated channel bound to the peer's node id. What's left honest (see the limits): the discovery-layer signaling isn't signed yet, and the wire carries no traffic obfuscation.</p>
     </div>
 
     <div class="cards reveal">
       <div class="card"><div class="top"><span class="name">1 · signal</span><span class="role">rendezvous</span></div><p>The target <b>announces under its own id</b>; any DHT node holding that record becomes a <b>coordinator</b>, and a <code>Signal</code> relays each side's candidates + NAT type through it. No dedicated signaling service — unlike WebRTC, rendezvous <em>is</em> the DHT.</p></div>
       <div class="card"><div class="top"><span class="name">2 · candidates</span><span class="role">reachability</span></div><p>Each peer offers a few addresses — <b>local</b>, <b>reflexive</b> (a STUN-like probe to nearby peers), and an optional <b>PCP/UPnP port-map</b> — most-routable first. The coordinator sees the control address; it can't observe the data-socket candidates, so the endpoints fill those in.</p></div>
       <div class="card"><div class="top"><span class="name">3 · punch</span><span class="role">nat traversal</span></div><p>A one-byte <code>PROBE</code> / <code>ACK</code> opens a direct UDP path. For one-sided symmetric NAT it leans on the <b>birthday paradox</b> (panel below). Two peers <em>both</em> behind symmetric NAT aren't punched — no relay sits in the path, by design.</p></div>
-      <div class="card"><div class="top"><span class="name">4 · channel</span><span class="role">transport</span></div><p>The channel runs a <b>Noise <code>XX</code> handshake</b> — forward-secret, mutually authenticated, and <b>bound to the peer's node id</b> — so the selective-repeat framing is AEAD-encrypted end to end. Every datagram carries its own nonce behind a <b>sliding replay window</b>, so forged, tampered, or replayed packets are dropped as loss rather than breaking the stream. Clips are <em>additionally</em> sealed at the <b>content layer</b> (XChaCha20, named + signed by ciphertext hash) so blind mirrors can carry bytes they can't read.</p></div>
+      <div class="card"><div class="top"><span class="name">4 · channel</span><span class="role">transport</span></div><p>The channel runs a <b>Noise <code>XX</code> handshake</b> — forward-secret, mutually authenticated, and <b>bound to the peer's node id</b> — so the selective-repeat framing is AEAD-encrypted end to end. Every datagram is individually nonced and checked against a <b>sliding replay window</b>, so forged, tampered, or replayed packets are dropped as loss rather than breaking the stream. Clips are <em>additionally</em> sealed at the <b>content layer</b> (XChaCha20, named + signed by ciphertext hash) so blind mirrors can carry bytes they can't read.</p></div>
     </div>
 
     <div class="stackdiag reveal" style="margin-top:44px;">
@@ -482,7 +482,7 @@
     <div class="head reveal">
       <span class="kicker">status</span>
       <h2>What's built, what's designed</h2>
-      <p>Warren is a research prototype under active development. The connectivity, data, sync, and real-time layers are built — including live-tail replication with swarm failover, blind-mirror store-and-forward, and multi-writer causal merge (the group-chat substrate); transport hardening is designed or planned.</p>
+      <p>Warren is a research prototype under active development. The connectivity, data, sync, and real-time layers are built — including live-tail replication with swarm failover, blind-mirror store-and-forward, and multi-writer causal merge (the group-chat substrate); the authenticated, encrypted transport is built too, and further hardening — traffic obfuscation and signed signaling — is designed or planned.</p>
     </div>
     <div class="status reveal">
       <div class="cap">DHT discovery + NAT hole-punching (birthday punch, ICE-style candidates)</div><div class="st built">built</div>

@@ -15,8 +15,9 @@
 //! authenticates a *per-connection X25519 static* by DH, which says nothing about
 //! that node id on its own. To bind the two, each side sends a [`NodeCert`] in its
 //! handshake payload: its Ed25519 public key, the X25519 static it is using for
-//! *this* connection, and an Ed25519 signature over that static. After the
-//! handshake both sides check the signature and that the signed static equals the
+//! *this* connection, and a role- and protocol-domain-separated Ed25519 signature
+//! over that static. After the handshake both sides check the signature and that the
+//! signed static equals the
 //! one Noise authenticated by DH (`get_remote_static`) — so a peer proves it holds
 //! the Ed25519 secret behind its node id *and* controls the Noise static, with no
 //! way to relay someone else's identity. The **dialer additionally** pins the
@@ -27,26 +28,29 @@
 //! # Unreliable transport
 //!
 //! The channel is lossy, unordered UDP, so the transport cipher runs in snow's
-//! **stateless** mode: every datagram carries an explicit 8-byte little-endian
-//! nonce, and the sender counts its own sends from zero. A lost, reordered,
-//! duplicated, or injected datagram therefore never desynchronizes the cipher — the
-//! recipient decrypts each datagram independently by the nonce on the wire — which
-//! is exactly what lets the transfer layer's selective-repeat repair run *over*
-//! encryption. A forged or tampered datagram simply fails the AEAD tag and is
-//! rejected.
+//! **stateless** mode: every transport datagram carries a type byte and an explicit
+//! 8-byte little-endian nonce, and the sender counts its own sends from zero. A
+//! lost, reordered, duplicated, or injected datagram therefore never desynchronizes
+//! the cipher — the recipient decrypts each datagram independently by the nonce on
+//! the wire — which is exactly what lets the transfer layer's selective-repeat
+//! repair run *over* encryption. A 65,536-packet sliding replay window discards a
+//! nonce already accepted (while preserving wide UDP reordering), and forged or
+//! malformed datagrams are treated as packet loss rather than fatal socket errors.
 //!
 //! The three-message handshake is made reliable by a retransmit loop: the initiator
 //! resends message 1 until message 2 arrives, and the responder resends message 2
 //! until message 3 arrives (a stray duplicate of an earlier message is a lost-reply
-//! signal that triggers an immediate resend). Message 3 is terminal — `XX` has no
-//! reply that could acknowledge it — so it is sent once; if it is lost the connect
-//! fails cleanly and the caller (Warren's subscribe/mirror failover) retries the
-//! whole connect. Handshake datagrams carry a one-byte type tag so a duplicate is
-//! recognized and dropped without being fed to the handshake state machine (which a
-//! wrong-message read would corrupt).
+//! signal that triggers an immediate resend). Because bare `XX` has no fourth
+//! message, the responder sends an authenticated transport acknowledgment;
+//! the initiator retransmits its cached message 3 until that arrives. The responder
+//! retains the message-3/ACK pair so a duplicate message 3 can recover a lost ACK
+//! while the application waits for its first request. Handshake and transport
+//! datagrams carry distinct one-byte type tags, so delayed handshake traffic never
+//! enters the transport cipher.
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 
 use swarm::NodeId;
@@ -57,6 +61,8 @@ use crate::Link;
 /// of static keys with forward secrecy; the ciphersuite matches the stack's
 /// BLAKE-family hashing and a ChaCha20-Poly1305 AEAD.
 const PARAMS: &str = "Noise_XX_25519_ChaChaPoly_BLAKE2s";
+const PROLOGUE: &[u8] = b"warren/noise/v1";
+const CERT_DOMAIN: &[u8] = b"warren/noise/node-cert/v1";
 
 /// Serialized [`NodeCert`] length: `ed_pub(32) ‖ noise_static_pub(32) ‖ sig(64)`.
 const CERT_LEN: usize = 32 + 32 + 64;
@@ -67,11 +73,18 @@ const CERT_LEN: usize = 32 + 32 + 64;
 const TAG_MSG1: u8 = 1;
 const TAG_MSG2: u8 = 2;
 const TAG_MSG3: u8 = 3;
+const TAG_TRANSPORT: u8 = 4;
 
 /// Bytes of explicit per-datagram nonce prepended to every transport ciphertext.
 const NONCE_LEN: usize = 8;
 /// ChaCha20-Poly1305 authentication tag length, reserved in every transport datagram.
 const TAG_LEN: usize = 16;
+const TRANSPORT_OVERHEAD: usize = 1 + NONCE_LEN + TAG_LEN;
+
+const ACK: &[u8] = b"warren-noise-ack-v1";
+
+const REPLAY_WINDOW: usize = 1 << 16;
+const REPLAY_WORDS: usize = REPLAY_WINDOW / u64::BITS as usize;
 
 /// Per-handshake-message resend interval and attempt budget over the lossy channel.
 const HS_TIMEOUT: Duration = Duration::from_millis(500);
@@ -86,14 +99,22 @@ struct NodeCert {
     sig: [u8; 64],
 }
 
+#[derive(Clone, Copy)]
+enum Role {
+    Initiator = 1,
+    Responder = 2,
+}
+
 impl NodeCert {
     /// Build our cert: sign the per-connection Noise static with the long-term
     /// Ed25519 identity, so the peer can bind our node id to this Noise session.
-    fn create(identity: &crypto::Keypair, noise_static_pub: &[u8]) -> io::Result<Self> {
+    fn create(identity: &crypto::Keypair, noise_static_pub: &[u8], role: Role) -> io::Result<Self> {
         let noise_static_pub: [u8; 32] = noise_static_pub
             .try_into()
             .map_err(|_| bad("noise static key is not 32 bytes"))?;
-        let sig = identity.sign(&noise_static_pub).to_bytes();
+        let sig = identity
+            .sign(&cert_message(role, &noise_static_pub))
+            .to_bytes();
         Ok(Self {
             ed_pub: identity.public().to_bytes(),
             noise_static_pub,
@@ -123,7 +144,7 @@ impl NodeCert {
     /// Verify the cert against the static key Noise authenticated by DH: the signed
     /// static must equal `remote_static`, and the signature must verify under the
     /// claimed Ed25519 key. On success the peer's node id is `hash(ed_pub)`.
-    fn verify(&self, remote_static: &[u8]) -> io::Result<()> {
+    fn verify(&self, remote_static: &[u8], role: Role) -> io::Result<()> {
         if self.noise_static_pub.as_slice() != remote_static {
             return Err(denied(
                 "node cert static key does not match the Noise-authenticated key",
@@ -132,12 +153,20 @@ impl NodeCert {
         let pk = crypto::PublicKey::from_bytes(&self.ed_pub)
             .map_err(|_| denied("node cert has an invalid Ed25519 public key"))?;
         pk.verify(
-            &self.noise_static_pub,
+            &cert_message(role, &self.noise_static_pub),
             &crypto::Signature::from_bytes(self.sig),
         )
         .map_err(|_| denied("node cert signature verification failed"))?;
         Ok(())
     }
+}
+
+fn cert_message(role: Role, noise_static_pub: &[u8; 32]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(CERT_DOMAIN.len() + 1 + noise_static_pub.len());
+    message.extend_from_slice(CERT_DOMAIN);
+    message.push(role as u8);
+    message.extend_from_slice(noise_static_pub);
+    message
 }
 
 /// A punched [`Link`] wrapped in an authenticated, forward-secret Noise session.
@@ -152,6 +181,80 @@ pub struct NoiseLink<T: Link> {
     noise: snow::StatelessTransportState,
     /// Our monotonic send counter — the explicit nonce for each transport datagram.
     send_nonce: AtomicU64,
+    recv_replay: Mutex<ReplayWindow>,
+    finish_replay: Mutex<Option<FinishReplay>>,
+    recv_buf: tokio::sync::Mutex<Box<[u8]>>,
+}
+
+struct FinishReplay {
+    msg3: Vec<u8>,
+    ack: Vec<u8>,
+}
+
+struct ReplayWindow {
+    highest: Option<u64>,
+    bits: Box<[u64]>,
+}
+
+impl ReplayWindow {
+    fn new() -> Self {
+        Self {
+            highest: None,
+            bits: vec![0; REPLAY_WORDS].into_boxed_slice(),
+        }
+    }
+
+    fn rejects(&self, nonce: u64) -> bool {
+        if nonce == u64::MAX {
+            return true;
+        }
+        let Some(highest) = self.highest else {
+            return false;
+        };
+        if nonce > highest {
+            return false;
+        }
+        highest - nonce >= REPLAY_WINDOW as u64 || self.is_set(nonce)
+    }
+
+    fn record(&mut self, nonce: u64) {
+        if let Some(highest) = self.highest {
+            if nonce > highest {
+                let advance = nonce - highest;
+                if advance >= REPLAY_WINDOW as u64 {
+                    self.bits.fill(0);
+                } else {
+                    for expired in highest + 1..=nonce {
+                        self.clear(expired);
+                    }
+                }
+                self.highest = Some(nonce);
+            }
+        } else {
+            self.highest = Some(nonce);
+        }
+        self.set(nonce);
+    }
+
+    fn position(nonce: u64) -> (usize, u32) {
+        let bit = nonce as usize % REPLAY_WINDOW;
+        (bit / u64::BITS as usize, (bit % u64::BITS as usize) as u32)
+    }
+
+    fn is_set(&self, nonce: u64) -> bool {
+        let (word, bit) = Self::position(nonce);
+        self.bits[word] & (1 << bit) != 0
+    }
+
+    fn set(&mut self, nonce: u64) {
+        let (word, bit) = Self::position(nonce);
+        self.bits[word] |= 1 << bit;
+    }
+
+    fn clear(&mut self, nonce: u64) {
+        let (word, bit) = Self::position(nonce);
+        self.bits[word] &= !(1 << bit);
+    }
 }
 
 impl<T: Link> NoiseLink<T> {
@@ -166,7 +269,7 @@ impl<T: Link> NoiseLink<T> {
     ) -> io::Result<NoiseLink<T>> {
         let statik = gen_static()?;
         let mut hs = build(&statik.private, true)?;
-        let cert = NodeCert::create(identity, &statik.public)?.encode();
+        let cert = NodeCert::create(identity, &statik.public, Role::Initiator)?.encode();
 
         let mut wbuf = [0u8; 2048];
         let mut rbuf = [0u8; 2048];
@@ -193,24 +296,47 @@ impl<T: Link> NoiseLink<T> {
             return Err(timed_out("Noise handshake: no response (message 2)"));
         };
 
-        // -> s, se (+ our cert). Terminal message: XX has no reply to acknowledge it,
-        // so send it once; a loss surfaces as a failed connect the caller retries.
-        let n3 = hs.write_message(&cert, &mut wbuf).map_err(noise_err)?;
-        inner.send(&tagged(TAG_MSG3, &wbuf[..n3])).await?;
-
+        // Authenticate and pin the responder before disclosing our identity in message 3.
+        // This preserves XX's active identity hiding even if unsigned DHT signaling sends
+        // us to the wrong punched endpoint.
         let remote_static = remote_static(&hs)?;
-        let noise = hs.into_stateless_transport_mode().map_err(noise_err)?;
-
-        peer_cert.verify(&remote_static)?;
+        peer_cert.verify(&remote_static, Role::Responder)?;
         if crypto::hash(&peer_cert.ed_pub) != *target.as_bytes() {
             return Err(denied(
                 "Noise handshake: reached peer's identity does not match the dialed node id",
             ));
         }
+
+        // -> s, se (+ our cert). Cache the exact message and retransmit it until the
+        // responder confirms handshake completion with an authenticated transport ACK.
+        let n3 = hs.write_message(&cert, &mut wbuf).map_err(noise_err)?;
+        let msg3 = tagged(TAG_MSG3, &wbuf[..n3]);
+        let noise = hs.into_stateless_transport_mode().map_err(noise_err)?;
+        let mut recv_replay = ReplayWindow::new();
+        let mut acked = false;
+        for _ in 0..HS_RETRIES {
+            inner.send(&msg3).await?;
+            if let Some(n) = recv_timeout(&inner, &mut rbuf).await? {
+                if let Some((nonce, payload)) = decrypt_transport(&noise, &rbuf[..n]) {
+                    if nonce == 0 && payload == ACK {
+                        recv_replay.record(nonce);
+                        acked = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if !acked {
+            return Err(timed_out("Noise handshake: no completion acknowledgment"));
+        }
+        let recv_buf = receive_buffer(&inner);
         Ok(NoiseLink {
             inner,
             noise,
             send_nonce: AtomicU64::new(0),
+            recv_replay: Mutex::new(recv_replay),
+            finish_replay: Mutex::new(None),
+            recv_buf,
         })
     }
 
@@ -222,7 +348,7 @@ impl<T: Link> NoiseLink<T> {
     ) -> io::Result<(NoiseLink<T>, NodeId)> {
         let statik = gen_static()?;
         let mut hs = build(&statik.private, false)?;
-        let cert = NodeCert::create(identity, &statik.public)?.encode();
+        let cert = NodeCert::create(identity, &statik.public, Role::Responder)?.encode();
 
         let mut wbuf = [0u8; 2048];
         let mut rbuf = [0u8; 2048];
@@ -250,7 +376,7 @@ impl<T: Link> NoiseLink<T> {
         // a duplicate message 1 means our message 2 was lost, so the loop resends it.
         let n2 = hs.write_message(&cert, &mut wbuf).map_err(noise_err)?;
         let msg2 = tagged(TAG_MSG2, &wbuf[..n2]);
-        let peer_cert = 'wait: {
+        let (peer_cert, msg3) = 'wait: {
             for _ in 0..HS_RETRIES {
                 inner.send(&msg2).await?;
                 if let Some(n) = recv_timeout(&inner, &mut rbuf).await? {
@@ -259,7 +385,7 @@ impl<T: Link> NoiseLink<T> {
                         let plen = hs
                             .read_message(&rbuf[1..n], &mut payload)
                             .map_err(noise_err)?;
-                        break 'wait NodeCert::decode(&payload[..plen])?;
+                        break 'wait (NodeCert::decode(&payload[..plen])?, rbuf[..n].to_vec());
                     }
                 }
             }
@@ -269,13 +395,19 @@ impl<T: Link> NoiseLink<T> {
         let remote_static = remote_static(&hs)?;
         let noise = hs.into_stateless_transport_mode().map_err(noise_err)?;
 
-        peer_cert.verify(&remote_static)?;
+        peer_cert.verify(&remote_static, Role::Initiator)?;
         let peer_id = NodeId::from_bytes(crypto::hash(&peer_cert.ed_pub));
+        let ack = encrypt_transport(&noise, 0, ACK)?;
+        inner.send(&ack).await?;
+        let recv_buf = receive_buffer(&inner);
         Ok((
             NoiseLink {
                 inner,
                 noise,
-                send_nonce: AtomicU64::new(0),
+                send_nonce: AtomicU64::new(1),
+                recv_replay: Mutex::new(ReplayWindow::new()),
+                finish_replay: Mutex::new(Some(FinishReplay { msg3, ack })),
+                recv_buf,
             },
             peer_id,
         ))
@@ -284,39 +416,108 @@ impl<T: Link> NoiseLink<T> {
 
 impl<T: Link + Send + Sync> Link for NoiseLink<T> {
     async fn send(&self, data: &[u8]) -> io::Result<usize> {
-        // Explicit, monotonic nonce per datagram (see the module docs): survives
-        // loss/reorder because each datagram is decryptable on its own.
-        let nonce = self.send_nonce.fetch_add(1, Ordering::Relaxed);
-        let mut out = [0u8; crate::FRAGMENT + NONCE_LEN + TAG_LEN + 16];
-        out[..NONCE_LEN].copy_from_slice(&nonce.to_le_bytes());
-        let n = self
-            .noise
-            .write_message(nonce, data, &mut out[NONCE_LEN..])
-            .map_err(noise_err)?;
-        self.inner.send(&out[..NONCE_LEN + n]).await
+        if self.inner.max_payload() < TRANSPORT_OVERHEAD || data.len() > self.max_payload() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Noise transport payload exceeds the inner link MTU",
+            ));
+        }
+        let nonce = self
+            .send_nonce
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |nonce| {
+                nonce.checked_add(1)
+            })
+            .map_err(|_| bad("Noise transport send nonce exhausted"))?;
+        let out = encrypt_transport(&self.noise, nonce, data)?;
+        self.inner.send(&out).await
     }
 
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut ct = [0u8; crate::FRAGMENT + NONCE_LEN + TAG_LEN + 16];
-        let n = self.inner.recv(&mut ct).await?;
-        if n < NONCE_LEN {
-            return Err(bad("Noise transport datagram too short for a nonce"));
+        let mut datagram = self.recv_buf.lock().await;
+        loop {
+            let n = self.inner.recv(&mut datagram).await?;
+            let packet = &datagram[..n];
+
+            let finish_ack = self
+                .finish_replay
+                .lock()
+                .expect("finish replay")
+                .as_ref()
+                .filter(|finish| packet == finish.msg3)
+                .map(|finish| finish.ack.clone());
+            if let Some(ack) = finish_ack {
+                self.inner.send(&ack).await?;
+                continue;
+            }
+
+            if packet.first() != Some(&TAG_TRANSPORT) || n < TRANSPORT_OVERHEAD {
+                continue;
+            }
+            let nonce = u64::from_le_bytes(
+                packet[1..1 + NONCE_LEN]
+                    .try_into()
+                    .expect("nonce length checked"),
+            );
+            let mut replay = self.recv_replay.lock().expect("replay window");
+            if replay.rejects(nonce) {
+                continue;
+            }
+            let Ok(plaintext) = self
+                .noise
+                .read_message(nonce, &packet[1 + NONCE_LEN..], buf)
+            else {
+                continue;
+            };
+            replay.record(nonce);
+            drop(replay);
+            self.finish_replay.lock().expect("finish replay").take();
+            return Ok(plaintext);
         }
-        let nonce = u64::from_le_bytes(ct[..NONCE_LEN].try_into().unwrap());
-        // A forged, tampered, or truncated datagram fails the AEAD tag here and is
-        // rejected — it never reaches the transfer layer as data.
-        self.noise
-            .read_message(nonce, &ct[NONCE_LEN..n], buf)
-            .map_err(noise_err)
     }
 
     fn max_payload(&self) -> usize {
-        crate::FRAGMENT - NONCE_LEN - TAG_LEN
+        self.inner.max_payload().saturating_sub(TRANSPORT_OVERHEAD)
     }
 
     fn authenticated(&self) -> bool {
         true
     }
+}
+
+fn receive_buffer<T: Link>(inner: &T) -> tokio::sync::Mutex<Box<[u8]>> {
+    let len = inner.max_payload().max(TRANSPORT_OVERHEAD);
+    tokio::sync::Mutex::new(vec![0u8; len].into_boxed_slice())
+}
+
+fn encrypt_transport(
+    noise: &snow::StatelessTransportState,
+    nonce: u64,
+    payload: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut out = vec![0u8; TRANSPORT_OVERHEAD + payload.len()];
+    out[0] = TAG_TRANSPORT;
+    out[1..1 + NONCE_LEN].copy_from_slice(&nonce.to_le_bytes());
+    let n = noise
+        .write_message(nonce, payload, &mut out[1 + NONCE_LEN..])
+        .map_err(noise_err)?;
+    out.truncate(1 + NONCE_LEN + n);
+    Ok(out)
+}
+
+fn decrypt_transport(
+    noise: &snow::StatelessTransportState,
+    datagram: &[u8],
+) -> Option<(u64, Vec<u8>)> {
+    if datagram.first() != Some(&TAG_TRANSPORT) || datagram.len() < TRANSPORT_OVERHEAD {
+        return None;
+    }
+    let nonce = u64::from_le_bytes(datagram[1..1 + NONCE_LEN].try_into().ok()?);
+    let mut payload = vec![0u8; datagram.len() - TRANSPORT_OVERHEAD];
+    let n = noise
+        .read_message(nonce, &datagram[1 + NONCE_LEN..], &mut payload)
+        .ok()?;
+    payload.truncate(n);
+    Some((nonce, payload))
 }
 
 /// Generate a fresh per-connection X25519 static keypair for the handshake.
@@ -332,6 +533,8 @@ fn build(private: &[u8], initiator: bool) -> io::Result<snow::HandshakeState> {
     let params = PARAMS.parse().map_err(noise_err)?;
     let builder = snow::Builder::new(params)
         .local_private_key(private)
+        .map_err(noise_err)?
+        .prologue(PROLOGUE)
         .map_err(noise_err)?;
     if initiator {
         builder.build_initiator()
@@ -344,7 +547,7 @@ fn build(private: &[u8], initiator: bool) -> io::Result<snow::HandshakeState> {
 /// Copy out the peer's DH-authenticated static key before the handshake is consumed.
 fn remote_static(hs: &snow::HandshakeState) -> io::Result<[u8; 32]> {
     hs.get_remote_static()
-        .ok_or_else(|| bad("Noise handshake completed without a remote static key"))?
+        .ok_or_else(|| bad("Noise handshake does not expose a remote static key"))?
         .try_into()
         .map_err(|_| bad("Noise remote static key is not 32 bytes"))
 }
@@ -380,4 +583,31 @@ fn denied(msg: &'static str) -> io::Error {
 
 fn timed_out(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replay_window_accepts_reordering_once() {
+        let mut replay = ReplayWindow::new();
+        for nonce in [10, 8, 9, 12, 11] {
+            assert!(!replay.rejects(nonce));
+            replay.record(nonce);
+            assert!(replay.rejects(nonce));
+        }
+    }
+
+    #[test]
+    fn replay_window_expires_only_packets_outside_the_window() {
+        let mut replay = ReplayWindow::new();
+        replay.record(0);
+        replay.record(REPLAY_WINDOW as u64);
+
+        assert!(replay.rejects(0));
+        assert!(!replay.rejects(1));
+        replay.record(1);
+        assert!(replay.rejects(1));
+    }
 }

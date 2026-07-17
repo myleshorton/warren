@@ -303,6 +303,10 @@ pub struct Node {
     /// Shared behind a mutex so cloned handles share the single stream (accept is
     /// naturally one consumer); [`Node::next_incoming`] drains it.
     incoming: Arc<Mutex<mpsc::Receiver<Channel>>>,
+    /// Diagnostic: count of datagrams received on the DHT socket. Lets a caller tell
+    /// "the node sends but never receives" (a one-way network path) apart from a
+    /// subtler discovery fault.
+    rx: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A running periodic re-announce started by [`Node::keep_announced`]. Hold it
@@ -360,7 +364,15 @@ impl Node {
         let local_addr = socket.local_addr()?;
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (incoming_tx, incoming_rx) = mpsc::channel(16);
-        tokio::spawn(run(Dht::new(id), socket, cmd_rx, incoming_tx, tuning));
+        let rx = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        tokio::spawn(run(
+            Dht::new(id),
+            socket,
+            cmd_rx,
+            incoming_tx,
+            tuning,
+            rx.clone(),
+        ));
         Ok(Node {
             id,
             identity,
@@ -368,7 +380,15 @@ impl Node {
             cmd_tx,
             port_mapping: tuning.port_mapping,
             incoming: Arc::new(Mutex::new(incoming_rx)),
+            rx,
         })
+    }
+
+    /// Diagnostic: total datagrams received on the DHT socket since bind. A node that
+    /// is clearly sending (announces land on peers) but whose count stays at 0 has a
+    /// one-way inbound path — the network/OS is dropping return traffic.
+    pub fn inbound_datagrams(&self) -> u64 {
+        self.rx.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// This node's id.
@@ -544,6 +564,7 @@ async fn run(
     mut cmd_rx: mpsc::Receiver<Command>,
     incoming_tx: mpsc::Sender<Channel>,
     tuning: PunchTuning,
+    rx_count: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
@@ -745,7 +766,10 @@ async fn run(
             }
             recv = socket.recv_from(&mut buf) => {
                 match recv {
-                    Ok((n, from)) => dht.handle_input(from, &buf[..n], now()),
+                    Ok((n, from)) => {
+                        rx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        dht.handle_input(from, &buf[..n], now());
+                    }
                     // Transient, e.g. an ICMP error surfaced from a prior send;
                     // the datagram is lost but the socket is fine — keep going.
                     Err(e) if matches!(

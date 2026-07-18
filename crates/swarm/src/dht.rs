@@ -18,7 +18,7 @@ use crate::nat::{Firewall, NatSampler};
 use crate::punch::{plan, Strategy};
 use crate::routing::{Contact, RoutingTable, K};
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Peers to probe when sampling the local NAT.
 pub const NAT_SAMPLE_COUNT: usize = 5;
@@ -123,6 +123,10 @@ pub enum Event {
         /// or open birthday sockets. `None` when there is no peer to punch to
         /// (`NotFound`/`TimedOut`).
         strategy: Option<Strategy>,
+        /// The peer's advertised firewall class, learned from the connect reply.
+        /// `None` when the connect never reached a reply (`NotFound`/`TimedOut`).
+        /// Diagnostic only — does not affect the outcome.
+        peer_firewall: Option<Firewall>,
     },
     /// A peer wants to connect to us (we are the target). The caller stands up a
     /// data socket, calls [`Dht::accept_connect`] with its candidate address(es)
@@ -137,6 +141,20 @@ pub enum Event {
         initiator_data_addrs: Vec<SocketAddr>,
         /// Our punch role toward the initiator (from the two firewalls).
         strategy: Strategy,
+        /// The initiator's advertised firewall class (diagnostic).
+        initiator_firewall: Firewall,
+    },
+    /// A `sample_nat` round has fully resolved (every probe answered or timed
+    /// out). Carries the resulting classification, how many observations backed
+    /// it, and the majority-observed external host. Purely for diagnostics — the
+    /// classification is already folded into signaling via [`Dht::firewall`].
+    NatSampleFinished {
+        /// The classification, or `None` if fewer than `MIN_SAMPLES` arrived.
+        firewall: Option<Firewall>,
+        /// Number of observations collected in this (and prior) rounds.
+        samples: usize,
+        /// The majority-observed external host, if any.
+        observed_host: Option<IpAddr>,
     },
 }
 
@@ -255,6 +273,14 @@ pub struct Dht {
     self_reachable: bool,
     /// This node's own firewall type, shared with peers during connect signaling.
     local_firewall: Firewall,
+    /// A firewall class pinned by the embedder (e.g. a provably-open VPS node).
+    /// Consulted *before* the sampled/derived classification in signaling, so a
+    /// node we know is reachable advertises Open even though runtime sampling
+    /// cannot prove the Open-vs-Consistent distinction on its own.
+    pinned: Option<Firewall>,
+    /// Whether a `sample_nat` round is in flight, so `NatSampleFinished` is emitted
+    /// exactly once when its probes have all resolved (answered or timed out).
+    nat_round_active: bool,
     /// topic -> peers that have announced under it (records this node stores).
     announces: HashMap<NodeId, Vec<AnnounceRecord>>,
     /// Earliest announcement expiry, cached so ordinary packet/timer handling can
@@ -290,6 +316,8 @@ impl Dht {
             nat_pending: HashMap::new(),
             self_reachable: false,
             local_firewall: Firewall::Open,
+            pinned: None,
+            nat_round_active: false,
             announces: HashMap::new(),
             next_announce_expiry: None,
             connecting: HashMap::new(),
@@ -329,6 +357,7 @@ impl Dht {
     /// is the outbound half of NAT detection; reachability (Open vs Consistent)
     /// comes from a separate inbound probe fed via [`Dht::note_reachable`].
     pub fn sample_nat(&mut self, now: Millis, count: usize) {
+        self.nat_round_active = true;
         let peers = self.table.closest(&self.id, count);
         for peer in peers {
             let rid = self.next_rid;
@@ -343,6 +372,35 @@ impl Dht {
             );
             self.send(peer.addr, rid, Message::Ping);
         }
+        // No known peers to probe (empty routing table): the round is already
+        // "done" with whatever we have — resolve it now rather than hang.
+        self.maybe_finish_nat_round();
+    }
+
+    /// Emit [`Event::NatSampleFinished`] once, when an in-flight sample round has
+    /// no probes left outstanding. Called after a probe resolves (Pong) or expires.
+    fn maybe_finish_nat_round(&mut self) {
+        if self.nat_round_active && self.nat_pending.is_empty() {
+            self.nat_round_active = false;
+            self.events.push_back(Event::NatSampleFinished {
+                firewall: self.firewall(),
+                samples: self.nat.len(),
+                observed_host: self.nat.host(),
+            });
+        }
+    }
+
+    /// The majority-observed external host across NAT samples, if any.
+    pub fn nat_observed_host(&self) -> Option<IpAddr> {
+        self.nat.host()
+    }
+
+    /// Pin the firewall class advertised in signaling, overriding sampled/derived
+    /// classification. For a node the embedder knows is reachable (a public VPS):
+    /// runtime sampling can't distinguish Open from Consistent, so pin `Open` to
+    /// keep its fast Direct path. Phones never pin — they advertise what they sample.
+    pub fn pin_firewall(&mut self, fw: Firewall) {
+        self.pinned = Some(fw);
     }
 
     /// Record whether an inbound reachability probe succeeded (drives the
@@ -497,6 +555,7 @@ impl Dht {
                 if matches_probe {
                     self.nat_pending.remove(&packet.rid);
                     self.nat.add(observed);
+                    self.maybe_finish_nat_round();
                 }
             }
             Message::FindNode { target } => {
@@ -574,6 +633,7 @@ impl Dht {
 
         // Expire NAT probes; a lost Pong simply yields one fewer sample.
         self.nat_pending.retain(|_, pending| pending.deadline > now);
+        self.maybe_finish_nat_round();
 
         // Provider announcements are leases, not permanent reservations. Remove
         // expired records and their now-empty topic entries so departed providers
@@ -597,6 +657,7 @@ impl Dht {
                 outcome: ConnectOutcome::TimedOut,
                 peer_data_addrs: Vec::new(),
                 strategy: None,
+                peer_firewall: None,
             });
         }
 
@@ -708,7 +769,9 @@ impl Dht {
     /// node that has sampled its NAT reports the right type without every caller
     /// having to remember to sync it.
     fn signaling_firewall(&self) -> Firewall {
-        self.firewall().unwrap_or(self.local_firewall)
+        self.pinned
+            .or_else(|| self.firewall())
+            .unwrap_or(self.local_firewall)
     }
 
     fn store_announce(&mut self, topic: NodeId, announcer: Contact, now: Millis) {
@@ -942,6 +1005,7 @@ impl Dht {
                         outcome: ConnectOutcome::NotFound,
                         peer_data_addrs: Vec::new(),
                         strategy: None,
+                        peer_firewall: None,
                     });
                 }
             },
@@ -1003,6 +1067,7 @@ impl Dht {
                         initiator,
                         initiator_data_addrs: data_addrs,
                         strategy,
+                        initiator_firewall: nat,
                     });
                 }
             } else if let Some(target_addr) = self
@@ -1050,6 +1115,7 @@ impl Dht {
                     outcome: outcome_for(strategy),
                     peer_data_addrs: data_addrs,
                     strategy: Some(strategy),
+                    peer_firewall: Some(nat),
                 });
             }
         } else if self.seen_initiators.contains(&(target, initiator_addr))

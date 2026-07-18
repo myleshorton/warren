@@ -8,7 +8,7 @@
 //! the trust anchor every downloaded block is verified against — then stream the
 //! log; blob requests stream the (content-addressed, self-verifying) blob.
 
-use driver::{Channel, Node};
+use driver::{Channel, Node, NodeEvent};
 use swarm::NodeId;
 use transfer::{Link, NoiseLink};
 
@@ -27,10 +27,24 @@ async fn secure_dial(node: &Node, target: NodeId) -> Result<Secure, String> {
         .connect(target)
         .await
         .map_err(|e| format!("connect: {e:?}"))?;
-    let ch = conn.channel.ok_or("no data channel")?;
-    NoiseLink::connect(ch, node.identity(), target)
-        .await
-        .map_err(|e| format!("noise handshake: {e}"))
+    // The driver already emitted a `ConnectResolved` telemetry event carrying the
+    // funnel stats; surface the outcome in the error so even the string path is
+    // legible ("unreachable: TimedOut") instead of a bare "no data channel".
+    let outcome = conn.outcome;
+    let ch = conn
+        .channel
+        .ok_or_else(|| format!("no data channel (unreachable: {outcome:?})"))?;
+    // Time the Noise handshake and report it on the node's telemetry sink (no-op
+    // when no sink is attached), so the embedder can see handshake latency + failures.
+    let started = std::time::Instant::now();
+    let res = NoiseLink::connect(ch, node.identity(), target).await;
+    node.emit_event(NodeEvent::NoiseHandshake {
+        peer: target,
+        initiator: true,
+        ok: res.is_ok(),
+        dur_ms: started.elapsed().as_millis() as u64,
+    });
+    res.map_err(|e| format!("noise handshake: {e}"))
 }
 
 /// Request the peer's signed feed. The peer replies with its 32-byte feed public

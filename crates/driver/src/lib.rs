@@ -209,12 +209,109 @@ pub type Result<T> = std::result::Result<T, Closed>;
 /// no direct path is possible, and a relay data path is intentionally not built,
 /// as it would load relays too heavily for a serverless model), or the punch to
 /// a reachable peer didn't complete in time.
+/// Where a candidate address came from — for telemetry, so we can see which
+/// candidate kind actually carried a successful punch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateKind {
+    /// An explicit PCP/UPnP port mapping.
+    Mapped,
+    /// A reflexive/STUN-observed external mapping.
+    Reflexive,
+    /// The socket's local (LAN) address.
+    Local,
+}
+
+/// Per-connect funnel measurements, carried on [`Connection`] and in
+/// [`NodeEvent::ConnectResolved`]. Purely diagnostic; never affects behaviour.
+///
+/// Populated in two places: the connect-side fields (`gather_ms`,
+/// `reflexive_rtt_ms`, `mapped`, `local_candidates`, `local_firewall`, `total_ms`)
+/// by [`Node::connect`], which owns those; the actor-side fields (`dht_ms`,
+/// `punch_ms`, `strategy`, `peer_firewall`, `peer_candidates`) by the punch task,
+/// which owns those. Fields not yet known are left at their `Default`.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectStats {
+    /// Candidate-gathering time (reflexive probe + optional port mapping).
+    pub gather_ms: u64,
+    /// RTT of the reflexive probe, if a reflector answered.
+    pub reflexive_rtt_ms: Option<u64>,
+    /// Whether a PCP/UPnP-mapped candidate was advertised.
+    pub mapped: bool,
+    /// Our advertised candidates (post prioritize-and-cap), with their kind.
+    pub local_candidates: Vec<(SocketAddr, CandidateKind)>,
+    /// Our sampled/pinned firewall class at connect time, if known.
+    pub local_firewall: Option<Firewall>,
+    /// `Command::Connect` enqueue → `Event::Connected` (DHT discovery + signaling).
+    pub dht_ms: u64,
+    /// Punch-primitive duration; `None` when no punch ran (Relayed/NotFound/TimedOut).
+    pub punch_ms: Option<u64>,
+    /// Whole `connect()` → `Connection` wall time.
+    pub total_ms: u64,
+    /// The punch role planned from the two firewalls.
+    pub strategy: Option<Strategy>,
+    /// The peer's advertised firewall class, from the connect reply.
+    pub peer_firewall: Option<Firewall>,
+    /// The peer's candidate addresses we actually probed (post-cap).
+    pub peer_candidates: Vec<SocketAddr>,
+}
+
 #[derive(Debug)]
 pub struct Connection {
     /// How the DHT resolved the connection.
     pub outcome: ConnectOutcome,
     /// The established data channel, if one was punched.
     pub channel: Option<Channel>,
+    /// Funnel timings + classification for this connect (diagnostic).
+    pub stats: ConnectStats,
+}
+
+/// Out-of-band node events for embedder telemetry — everything that never returns
+/// through [`Node::connect`]: accept-side punches, inbound connects, NAT
+/// classification, and (emitted by higher layers via [`Node::emit_event`]) the
+/// Noise handshake. Delivered on the optional sink passed to
+/// [`Node::bind_with_events`], mirroring the `incoming` channel: best-effort
+/// `try_send`, dropped if the embedder isn't draining. Non-exhaustive so more
+/// event kinds can be added without breaking matchers.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum NodeEvent {
+    /// This node's NAT sampling finished (see [`Node::sample_nat`]).
+    NatClassified {
+        firewall: Option<Firewall>,
+        samples: u32,
+        observed_host: Option<IpAddr>,
+    },
+    /// A peer asked to connect to us; we're about to accept + punch.
+    IncomingConnect {
+        initiator: NodeId,
+        strategy: Strategy,
+        initiator_firewall: Firewall,
+        peer_candidates: u8,
+    },
+    /// An accept-side punch finished.
+    AcceptPunch {
+        initiator: NodeId,
+        strategy: Strategy,
+        ok: bool,
+        punch_ms: u64,
+        /// The channel was punched but dropped because the incoming queue was full.
+        shed: bool,
+    },
+    /// An initiator-side connect fully resolved (mirrors the `connect()` return, so
+    /// background dials that discard the return value still surface).
+    ConnectResolved {
+        target: NodeId,
+        outcome: ConnectOutcome,
+        ok: bool,
+        stats: ConnectStats,
+    },
+    /// A Noise handshake over a punched channel completed (emitted by the embedder).
+    NoiseHandshake {
+        peer: NodeId,
+        initiator: bool,
+        ok: bool,
+        dur_ms: u64,
+    },
 }
 
 /// Why a [`Node::connect`] could not even reach a [`Connection`] outcome.
@@ -277,10 +374,25 @@ enum Command {
         NodeId,
         UdpSocket,
         Vec<SocketAddr>,
+        ConnectStats,
         oneshot::Sender<ConnectReply>,
     ),
     SetFirewall(Firewall),
+    PinFirewall(Firewall),
+    SampleNat(usize, oneshot::Sender<NatReport>),
+    NatReport(oneshot::Sender<NatReport>),
     Reflectors(oneshot::Sender<Vec<SocketAddr>>),
+}
+
+/// The result of a NAT self-classification round (see [`Node::sample_nat`]).
+#[derive(Debug, Clone, Copy)]
+pub struct NatReport {
+    /// The classification, or `None` if fewer than `MIN_SAMPLES` observations.
+    pub firewall: Option<Firewall>,
+    /// How many observations backed it.
+    pub samples: u32,
+    /// The majority-observed external host, if any.
+    pub observed_host: Option<IpAddr>,
 }
 
 /// A handle to a running DHT node backed by a real UDP socket.
@@ -307,6 +419,10 @@ pub struct Node {
     /// "the node sends but never receives" (a one-way network path) apart from a
     /// subtler discovery fault.
     rx: Arc<std::sync::atomic::AtomicU64>,
+    /// Optional embedder telemetry sink for out-of-band [`NodeEvent`]s (accept-side
+    /// punches, inbound connects, NAT classification, Noise handshakes). `None`
+    /// unless the node was built with [`Node::bind_with_events`].
+    events: Option<mpsc::Sender<NodeEvent>>,
 }
 
 /// A running periodic re-announce started by [`Node::keep_announced`]. Hold it
@@ -349,6 +465,29 @@ impl Node {
         identity: crypto::Keypair,
         tuning: PunchTuning,
     ) -> io::Result<Node> {
+        Node::bind_inner(bind_addr, identity, tuning, None).await
+    }
+
+    /// Like [`Node::bind_with`], but also attaches a telemetry sink that receives
+    /// out-of-band [`NodeEvent`]s (accept-side punches, inbound connects, NAT
+    /// classification, and Noise handshakes emitted by higher layers). Best-effort:
+    /// events are `try_send` and dropped if the receiver isn't drained, so telemetry
+    /// can never back-pressure the node.
+    pub async fn bind_with_events(
+        bind_addr: SocketAddr,
+        identity: crypto::Keypair,
+        tuning: PunchTuning,
+        events: mpsc::Sender<NodeEvent>,
+    ) -> io::Result<Node> {
+        Node::bind_inner(bind_addr, identity, tuning, Some(events)).await
+    }
+
+    async fn bind_inner(
+        bind_addr: SocketAddr,
+        identity: crypto::Keypair,
+        tuning: PunchTuning,
+        events: Option<mpsc::Sender<NodeEvent>>,
+    ) -> io::Result<Node> {
         let (lo, hi) = tuning.birthday.range;
         if !(lo >= 1 && lo < hi) {
             return Err(io::Error::new(
@@ -372,6 +511,7 @@ impl Node {
             incoming_tx,
             tuning,
             rx.clone(),
+            events.clone(),
         ));
         Ok(Node {
             id,
@@ -381,7 +521,17 @@ impl Node {
             port_mapping: tuning.port_mapping,
             incoming: Arc::new(Mutex::new(incoming_rx)),
             rx,
+            events,
         })
+    }
+
+    /// Emit an out-of-band [`NodeEvent`] to the embedder's telemetry sink, if one
+    /// was attached ([`Node::bind_with_events`]). Best-effort and non-blocking —
+    /// used by higher layers (e.g. `warren::protocol` for Noise-handshake timing).
+    pub fn emit_event(&self, ev: NodeEvent) {
+        if let Some(tx) = &self.events {
+            let _ = tx.try_send(ev);
+        }
     }
 
     /// Diagnostic: total datagrams received on the DHT socket since bind. A node that
@@ -429,6 +579,32 @@ impl Node {
             .send(Command::SetFirewall(firewall))
             .await
             .map_err(|_| Closed)
+    }
+
+    /// Pin the firewall class advertised in connect signaling, overriding sampled
+    /// classification. Use for a node the embedder knows is publicly reachable (a
+    /// VPS): runtime sampling can't prove Open vs Consistent, so pinning `Open`
+    /// keeps its fast Direct path. Phones should not pin — let them advertise what
+    /// [`Node::sample_nat`] finds.
+    pub async fn pin_firewall(&self, firewall: Firewall) -> Result<()> {
+        self.cmd_tx
+            .send(Command::PinFirewall(firewall))
+            .await
+            .map_err(|_| Closed)
+    }
+
+    /// Sample this node's NAT class: probe up to `count` known peers and wait for
+    /// the round to resolve, returning the classification (`None` until enough
+    /// samples), the sample count, and the majority-observed external host. Feeds
+    /// the class advertised in subsequent connect signaling. An empty routing table
+    /// resolves immediately with zero samples.
+    pub async fn sample_nat(&self, count: usize) -> Result<NatReport> {
+        self.request(|tx| Command::SampleNat(count, tx)).await
+    }
+
+    /// The current NAT classification without starting a new sample round.
+    pub async fn nat_report(&self) -> Result<NatReport> {
+        self.request(Command::NatReport).await
     }
 
     /// Bootstrap (self-lookup) and wait for it to settle.
@@ -520,16 +696,31 @@ impl Node {
         // targets: the reflexive probe, an optional explicit UPnP mapping, and the
         // local address. Always includes `local`, so it's non-empty (correct on an
         // unNATed host).
+        let t0 = Instant::now();
         let reflectors = self.reflectors().await.map_err(|_| ConnectError::Closed)?;
-        let candidates =
+        let gather_start = Instant::now();
+        let cands =
             gather_candidates(&data_sock, self.id, local, &reflectors, self.port_mapping).await;
+        // Connect-side funnel stats, threaded through so the actor can fold in the
+        // DHT/punch fields and emit a complete `ConnectResolved`.
+        let stats = ConnectStats {
+            gather_ms: gather_start.elapsed().as_millis() as u64,
+            reflexive_rtt_ms: cands.reflexive_rtt.map(|d| d.as_millis() as u64),
+            mapped: cands.mapped,
+            local_candidates: cands.kinds,
+            ..Default::default()
+        };
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(Command::Connect(target, data_sock, candidates, tx))
+            .send(Command::Connect(target, data_sock, cands.addrs, stats, tx))
             .await
             .map_err(|_| ConnectError::Closed)?;
         match rx.await {
-            Ok(Ok(conn)) => Ok(conn),
+            Ok(Ok(mut conn)) => {
+                // Exact end-to-end wall time (supersedes the punch task's estimate).
+                conn.stats.total_ms = t0.elapsed().as_millis() as u64;
+                Ok(conn)
+            }
             Ok(Err(())) => Err(ConnectError::InProgress),
             Err(_) => Err(ConnectError::Closed),
         }
@@ -557,6 +748,13 @@ impl Node {
     }
 }
 
+/// Best-effort emit to the optional embedder telemetry sink; dropped if absent or full.
+fn emit(events: &Option<mpsc::Sender<NodeEvent>>, ev: NodeEvent) {
+    if let Some(tx) = events {
+        let _ = tx.try_send(ev);
+    }
+}
+
 /// The node's event loop: owns the `Dht`, the socket, and the pending-op maps.
 async fn run(
     mut dht: Dht,
@@ -565,6 +763,7 @@ async fn run(
     incoming_tx: mpsc::Sender<Channel>,
     tuning: PunchTuning,
     rx_count: Arc<std::sync::atomic::AtomicU64>,
+    events: Option<mpsc::Sender<NodeEvent>>,
 ) {
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
@@ -593,8 +792,13 @@ async fn run(
     // peer) until reachability resolves, then punches on it. One connect per
     // target at a time: a second is rejected with `InProgress`, leaving the
     // in-flight one untouched.
-    let mut pending_connect: HashMap<NodeId, (UdpSocket, oneshot::Sender<ConnectReply>)> =
-        HashMap::new();
+    let mut pending_connect: HashMap<
+        NodeId,
+        (UdpSocket, u64, ConnectStats, oneshot::Sender<ConnectReply>),
+    > = HashMap::new();
+    // Callers awaiting a NAT sample round; resolved together on the next
+    // `Event::NatSampleFinished`.
+    let mut pending_nat_sample: Vec<oneshot::Sender<NatReport>> = Vec::new();
     // Accept-side reflexive probes run off the actor (they'd block it) and feed
     // their result back here; the actor then replies with the discovered address
     // and starts the punch. The actor keeps `reflexive_tx` so the channel stays
@@ -628,8 +832,10 @@ async fn run(
                     outcome,
                     mut peer_data_addrs,
                     strategy,
+                    peer_firewall,
                 } => {
-                    if let Some((data_sock, tx)) = pending_connect.remove(&target) {
+                    if let Some((data_sock, cmd_ms, mut stats, tx)) = pending_connect.remove(&target)
+                    {
                         // The peer's candidate set is untrusted (from a Signal, so
                         // only buffer-bounded); prioritize and cap what we actually
                         // probe, so a peer can't make us spray hundreds of packets
@@ -637,6 +843,13 @@ async fn run(
                         // vector) and its routable candidate survives the cap even
                         // if it front-loaded junk.
                         prioritize_and_cap(&mut peer_data_addrs);
+                        // Fold the actor-side funnel fields into the connect-side
+                        // stats the caller threaded in.
+                        stats.dht_ms = now().saturating_sub(cmd_ms);
+                        stats.strategy = strategy;
+                        stats.peer_firewall = peer_firewall;
+                        stats.peer_candidates = peer_data_addrs.clone();
+                        stats.local_firewall = dht.firewall();
                         // Seed the birthday RNG from the pre-bound socket's port so
                         // concurrent connects don't spray identical port sequences.
                         let seed = data_sock.local_addr().map(|a| a.port()).unwrap_or(0) as u64;
@@ -650,13 +863,36 @@ async fn run(
                             birthday,
                             seed,
                             tx,
+                            target,
+                            stats,
+                            events: events.clone(),
                         });
                     }
+                }
+                Event::NatSampleFinished {
+                    firewall,
+                    samples,
+                    observed_host,
+                } => {
+                    let report = NatReport {
+                        firewall,
+                        samples: samples as u32,
+                        observed_host,
+                    };
+                    for tx in pending_nat_sample.drain(..) {
+                        let _ = tx.send(report);
+                    }
+                    emit(&events, NodeEvent::NatClassified {
+                        firewall,
+                        samples: samples as u32,
+                        observed_host,
+                    });
                 }
                 Event::IncomingConnect {
                     initiator,
                     mut initiator_data_addrs,
                     strategy,
+                    initiator_firewall,
                 } => {
                     // Stand up a data socket and gather its candidate addresses via
                     // a reflexive probe — off the actor (it awaits a round-trip),
@@ -672,6 +908,12 @@ async fn run(
                     // spray fan-out, and keeps its routable hosts.
                     prioritize_and_cap(&mut initiator_data_addrs);
                     let peer_hosts = candidate_hosts(&initiator_data_addrs);
+                    emit(&events, NodeEvent::IncomingConnect {
+                        initiator,
+                        strategy,
+                        initiator_firewall,
+                        peer_candidates: initiator_data_addrs.len().min(255) as u8,
+                    });
                     if !data_ip.is_unspecified() && !peer_hosts.is_empty() {
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
                             if let Ok(local) = data_sock.local_addr() {
@@ -742,7 +984,7 @@ async fn run(
                             dht.lookup(topic, now());
                         }
                     }
-                    Some(Command::Connect(target, data_sock, data_addrs, tx)) => {
+                    Some(Command::Connect(target, data_sock, data_addrs, stats, tx)) => {
                         // The socket is already bound by `Node::connect`. Only one
                         // connect per target at a time; reject a second rather than
                         // displace the in-flight one's waiter.
@@ -751,12 +993,24 @@ async fn run(
                                 let _ = tx.send(Err(()));
                             }
                             Entry::Vacant(slot) => {
-                                slot.insert((data_sock, tx));
+                                slot.insert((data_sock, now(), stats, tx));
                                 dht.connect(target, data_addrs, now());
                             }
                         }
                     }
                     Some(Command::SetFirewall(fw)) => dht.set_firewall(fw),
+                    Some(Command::PinFirewall(fw)) => dht.pin_firewall(fw),
+                    Some(Command::SampleNat(count, tx)) => {
+                        dht.sample_nat(now(), count);
+                        pending_nat_sample.push(tx);
+                    }
+                    Some(Command::NatReport(tx)) => {
+                        let _ = tx.send(NatReport {
+                            firewall: dht.firewall(),
+                            samples: dht.nat_samples() as u32,
+                            observed_host: dht.nat_observed_host(),
+                        });
+                    }
                     Some(Command::Reflectors(tx)) => {
                         let id = dht.id();
                         let addrs = dht.closest(&id, REFLECTORS).into_iter().map(|c| c.addr).collect();
@@ -796,6 +1050,8 @@ async fn run(
                         birthday,
                         seed: done.seed,
                         incoming_tx: incoming_tx.clone(),
+                        initiator: done.initiator,
+                        events: events.clone(),
                     });
                 }
             }
@@ -825,6 +1081,11 @@ struct PunchJob {
     birthday: BirthdayParams,
     seed: u64,
     tx: oneshot::Sender<ConnectReply>,
+    /// Telemetry: the peer id, the funnel stats gathered so far (the punch task
+    /// fills `punch_ms`/`total_ms`), and the embedder sink for `ConnectResolved`.
+    target: NodeId,
+    stats: ConnectStats,
+    events: Option<mpsc::Sender<NodeEvent>>,
 }
 
 /// The reachable side of a punch after an `IncomingConnect`.
@@ -839,6 +1100,9 @@ struct AcceptJob {
     birthday: BirthdayParams,
     seed: u64,
     incoming_tx: mpsc::Sender<Channel>,
+    /// Telemetry: the initiating peer and the embedder sink for `AcceptPunch`.
+    initiator: NodeId,
+    events: Option<mpsc::Sender<NodeEvent>>,
 }
 
 /// Inputs to an accept-side reflexive probe task.
@@ -873,7 +1137,9 @@ struct ReflexiveDone {
 fn spawn_reflexive_probe(p: ReflexiveProbe) {
     tokio::spawn(async move {
         let external_addrs =
-            gather_candidates(&p.data_sock, p.id, p.local, &p.reflectors, p.port_mapping).await;
+            gather_candidates(&p.data_sock, p.id, p.local, &p.reflectors, p.port_mapping)
+                .await
+                .addrs;
         let _ = p
             .done
             .send(ReflexiveDone {
@@ -904,13 +1170,21 @@ fn spawn_connect_punch(job: PunchJob) {
         birthday,
         seed,
         tx,
+        target,
+        mut stats,
+        events,
     } = job;
     tokio::spawn(async move {
         let hosts = candidate_hosts(&peers);
+        let punch_start = Instant::now();
+        // `ran` marks whether a punch primitive actually executed (so `punch_ms`
+        // is `None` for Relay/no-strategy, distinguishing "no path" from "0 ms").
+        let mut ran = true;
         let channel = match strategy {
             // No candidate to punch to (should not happen post-`on_signal` guard).
             _ if peers.is_empty() => {
                 drop(data_sock);
+                ran = false;
                 None
             }
             Some(Strategy::Direct) => punch_direct(data_sock, &peers, &cfg).await,
@@ -928,10 +1202,25 @@ fn spawn_connect_punch(job: PunchJob) {
             // built by design) / no strategy.
             _ => {
                 drop(data_sock);
+                ran = false;
                 None
             }
         };
-        let _ = tx.send(Ok(Connection { outcome, channel }));
+        stats.punch_ms = ran.then(|| punch_start.elapsed().as_millis() as u64);
+        // Event-side total (the return path overwrites this with the exact wall
+        // time in `Node::connect`): the funnel phases we can see from here.
+        stats.total_ms = stats.gather_ms + stats.dht_ms + stats.punch_ms.unwrap_or(0);
+        emit(&events, NodeEvent::ConnectResolved {
+            target,
+            outcome,
+            ok: channel.is_some(),
+            stats: stats.clone(),
+        });
+        let _ = tx.send(Ok(Connection {
+            outcome,
+            channel,
+            stats,
+        }));
     });
 }
 
@@ -948,8 +1237,11 @@ fn spawn_accept_punch(job: AcceptJob) {
         birthday,
         seed,
         incoming_tx,
+        initiator,
+        events,
     } = job;
     tokio::spawn(async move {
+        let punch_start = Instant::now();
         let channel = match strategy {
             Strategy::Direct => punch_accept(data_sock, &peer_hosts, &cfg).await,
             Strategy::SprayRandomPorts => {
@@ -966,13 +1258,23 @@ fn spawn_accept_punch(job: AcceptJob) {
                 None
             }
         };
+        let punch_ms = punch_start.elapsed().as_millis() as u64;
+        let ok = channel.is_some();
+        let mut shed = false;
         if let Some(channel) = channel {
             // Non-blocking: if the application isn't draining `next_incoming`
             // (queue full), drop this channel rather than park the task holding
             // its socket. A flood of inbound connects is shed at the queue bound
             // instead of accumulating blocked tasks; the peer can retry.
-            let _ = incoming_tx.try_send(channel);
+            shed = incoming_tx.try_send(channel).is_err();
         }
+        emit(&events, NodeEvent::AcceptPunch {
+            initiator,
+            strategy,
+            ok,
+            punch_ms,
+            shed,
+        });
     });
 }
 
@@ -1002,18 +1304,31 @@ const MAX_CANDIDATES: usize = 4;
 /// the local address. Always non-empty — the local address is the floor — and
 /// capped at [`MAX_CANDIDATES`]. The peer tries them in order, so a wrong guess (a
 /// stale reflexive mapping, a CGNAT external IP, a multi-homed host) costs nothing.
+/// The advertised candidate set plus the telemetry the connect funnel records
+/// about how it was gathered.
+struct Candidates {
+    /// The addresses to advertise, most-preferred first, capped.
+    addrs: Vec<SocketAddr>,
+    /// Each advertised address paired with where it came from.
+    kinds: Vec<(SocketAddr, CandidateKind)>,
+    /// RTT of the reflexive probe, if a reflector answered.
+    reflexive_rtt: Option<Duration>,
+    /// Whether a routable port mapping was obtained and advertised.
+    mapped: bool,
+}
+
 async fn gather_candidates(
     sock: &UdpSocket,
     id: NodeId,
     local: SocketAddr,
     reflectors: &[SocketAddr],
     port_mapping: bool,
-) -> Vec<SocketAddr> {
+) -> Candidates {
     let reflexive_fut = reflexive_addr(sock, id, local, reflectors);
     // Port mapping is discovered via SSDP and (for PCP) an IPv4 gateway, and yields
     // an IPv4 external address, so skip it for a v6 socket. When enabled it runs
     // concurrently with the reflexive probe — they touch different sockets.
-    let (reflexive, mapped) = if port_mapping && local.is_ipv4() {
+    let ((reflexive, reflexive_rtt), mapped) = if port_mapping && local.is_ipv4() {
         // PCP first, UPnP fallback, in one call.
         let mapped_fut = timeout(
             MAP_TIMEOUT,
@@ -1032,14 +1347,44 @@ async fn gather_candidates(
         (reflexive_fut.await, None)
     };
 
-    let mut candidates = Vec::with_capacity(MAX_CANDIDATES);
-    for addr in mapped.into_iter().chain([reflexive, local]) {
-        if !candidates.contains(&addr) {
-            candidates.push(addr);
+    // Tag each source address with its kind before dedup/cap, so the surviving
+    // advertised set can report where each candidate came from.
+    let mut kind_of: Vec<(SocketAddr, CandidateKind)> = Vec::with_capacity(3);
+    if let Some(m) = mapped {
+        kind_of.push((m, CandidateKind::Mapped));
+    }
+    // Only a reflector that actually answered (RTT present) yields a genuine
+    // reflexive candidate; otherwise `reflexive` is just the `local` fallback and
+    // `local` below already covers it — don't mislabel it Reflexive.
+    if reflexive_rtt.is_some() {
+        kind_of.push((reflexive, CandidateKind::Reflexive));
+    }
+    kind_of.push((local, CandidateKind::Local));
+
+    let mut addrs = Vec::with_capacity(MAX_CANDIDATES);
+    for (addr, _) in &kind_of {
+        if !addrs.contains(addr) {
+            addrs.push(*addr);
         }
     }
-    prioritize_and_cap(&mut candidates);
-    candidates
+    prioritize_and_cap(&mut addrs);
+    let kinds = addrs
+        .iter()
+        .map(|a| {
+            let kind = kind_of
+                .iter()
+                .find(|(x, _)| x == a)
+                .map(|(_, k)| *k)
+                .unwrap_or(CandidateKind::Local);
+            (*a, kind)
+        })
+        .collect();
+    Candidates {
+        addrs,
+        kinds,
+        reflexive_rtt,
+        mapped: mapped.is_some(),
+    }
 }
 
 /// Keep the most-useful [`MAX_CANDIDATES`], best priority first, preserving order
@@ -1176,7 +1521,7 @@ async fn reflexive_addr(
     id: NodeId,
     local: SocketAddr,
     reflectors: &[SocketAddr],
-) -> SocketAddr {
+) -> (SocketAddr, Option<Duration>) {
     let mut buf = [0u8; 128];
     // Distinct per-probe request id (based on this socket's port, so it also
     // differs across concurrent connects). The reflector echoes it in the reply,
@@ -1190,12 +1535,13 @@ async fn reflexive_addr(
             msg: Message::Reflect,
         }
         .encode();
+        let sent = Instant::now();
         if sock.send_to(&probe, reflector).await.is_err() {
             continue;
         }
         // Read until this reflector's window elapses, ignoring stray datagrams,
         // so an unrelated packet arriving first can't cause a false fallback.
-        let deadline = Instant::now() + REFLECT_TIMEOUT;
+        let deadline = sent + REFLECT_TIMEOUT;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
@@ -1211,7 +1557,7 @@ async fn reflexive_addr(
                     }) = Packet::decode(&buf[..n])
                     {
                         if got == rid {
-                            return observed;
+                            return (observed, Some(sent.elapsed()));
                         }
                     }
                     // Wrong rid or not a Reflected: keep reading this window.
@@ -1222,7 +1568,7 @@ async fn reflexive_addr(
             }
         }
     }
-    local
+    (local, None)
 }
 
 /// Dial a peer's candidate addresses on the pre-bound socket, locking onto the
@@ -1297,7 +1643,7 @@ mod tests {
         let sock = UdpSocket::bind(lo()).await.unwrap();
         let local = sock.local_addr().unwrap();
 
-        let observed = reflexive_addr(
+        let (observed, _rtt) = reflexive_addr(
             &sock,
             NodeId::from_bytes([1u8; 32]),
             local,
@@ -1315,8 +1661,9 @@ mod tests {
         // No reflector to ask: fall back to the local address.
         let sock = UdpSocket::bind(lo()).await.unwrap();
         let local = sock.local_addr().unwrap();
-        let observed = reflexive_addr(&sock, NodeId::from_bytes([1u8; 32]), local, &[]).await;
+        let (observed, rtt) = reflexive_addr(&sock, NodeId::from_bytes([1u8; 32]), local, &[]).await;
         assert_eq!(observed, local);
+        assert_eq!(rtt, None, "no reflector answered, so there's no RTT");
     }
 
     #[test]
@@ -1423,7 +1770,10 @@ mod tests {
         let local = sock.local_addr().unwrap();
         let candidates =
             gather_candidates(&sock, NodeId::from_bytes([1u8; 32]), local, &[], false).await;
-        assert_eq!(candidates, vec![local]);
+        assert_eq!(candidates.addrs, vec![local]);
+        assert_eq!(candidates.kinds, vec![(local, CandidateKind::Local)]);
+        assert!(!candidates.mapped);
+        assert_eq!(candidates.reflexive_rtt, None);
     }
 
     #[tokio::test]
@@ -1437,6 +1787,6 @@ mod tests {
         let local = sock.local_addr().unwrap();
         let candidates =
             gather_candidates(&sock, NodeId::from_bytes([1u8; 32]), local, &[], true).await;
-        assert_eq!(candidates, vec![local]);
+        assert_eq!(candidates.addrs, vec![local]);
     }
 }

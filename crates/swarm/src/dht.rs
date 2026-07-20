@@ -558,11 +558,16 @@ impl Dht {
         let Ok(packet) = Packet::decode(data) else {
             return;
         };
-        // Most packets are direct evidence the sender is reachable at `from`, so
-        // fold it into the routing table. A `Reflect` is the exception: it comes
-        // from a transient data socket (a reflexive probe), not a routable peer,
-        // so inserting it would poison routing with an ephemeral address.
-        if packet.sender != self.id && !matches!(&packet.msg, Message::Reflect) {
+        // Fold the sender into the routing table only if it advertises itself as a
+        // routable ("server") node — directly reachable for a cold query. A NAT'd
+        // "client" (reachable=false) can send us announces/signals/pings while its
+        // mapping is open, but a later cold FindNode won't reach it; adding it would
+        // poison routing with a dead contact that stalls every lookup on a
+        // REQUEST_TIMEOUT (the client/server split). Clients stay discoverable via
+        // announce records. A `Reflect` is never routing evidence (it comes from a
+        // transient reflexive-probe socket, not a routable endpoint).
+        if packet.sender != self.id && packet.reachable && !matches!(&packet.msg, Message::Reflect)
+        {
             self.table.insert(Contact::new(packet.sender, from));
         }
 
@@ -720,10 +725,21 @@ impl Dht {
         let data = Packet {
             sender: self.id,
             rid,
+            reachable: self.is_server(),
             msg,
         }
         .encode();
         self.outbox.push_back(Transmit { to, data });
+    }
+
+    /// Whether we advertise ourselves as a routable ("server") node — one a peer
+    /// can add to its routing table and reach with a cold query. True only with
+    /// POSITIVE evidence of being directly reachable: a pinned-Open firewall (a
+    /// public node like the VPS) or a sampled-Open classification. "Unknown"
+    /// (the default before classification) counts as a client, so a NAT'd node
+    /// doesn't leak into peers' routing tables during its pre-sample window.
+    fn is_server(&self) -> bool {
+        self.pinned == Some(Firewall::Open) || self.firewall() == Some(Firewall::Open)
     }
 
     fn on_nodes_response(
@@ -1220,6 +1236,7 @@ mod tests {
         Packet {
             sender: id(9),
             rid: 1,
+            reachable: true,
             msg: Message::Signal {
                 target,
                 initiator,
@@ -1344,6 +1361,7 @@ mod tests {
             Packet {
                 sender,
                 rid,
+                reachable: true,
                 msg: Message::Nodes {
                     contacts: vec![],
                     peers: vec![],
@@ -1387,6 +1405,7 @@ mod tests {
             Packet {
                 sender,
                 rid,
+                reachable: true,
                 msg: Message::Pong {
                     observed: addr("203.0.113.1:40000"),
                 },
@@ -1458,6 +1477,7 @@ mod tests {
         let request = Packet {
             sender: id(9),
             rid: 1,
+            reachable: true,
             msg: Message::Signal {
                 target: me,
                 initiator,
@@ -1498,6 +1518,7 @@ mod tests {
         let reflect = Packet {
             sender: id(2),
             rid: 5,
+            reachable: true,
             msg: Message::Reflect,
         }
         .encode();
@@ -1521,10 +1542,58 @@ mod tests {
         let ping = Packet {
             sender: id(2),
             rid: 6,
+            reachable: true,
             msg: Message::Ping,
         }
         .encode();
         dht.handle_input(prober, &ping, 0);
-        assert_eq!(dht.routing_len(), 1, "a Ping is routing evidence");
+        assert_eq!(
+            dht.routing_len(),
+            1,
+            "a reachable node's Ping is routing evidence"
+        );
+    }
+
+    #[test]
+    fn client_packets_do_not_pollute_routing() {
+        // The client/server split: a packet from a node that advertises itself as
+        // reachable (a server) earns a routing slot; the same packet from a NAT'd
+        // client (reachable = false) does not — so departed/unreachable clients
+        // can't fill the table and stall lookups on their timeouts.
+        let mut dht = Dht::new(id(1));
+        let client = addr("198.51.100.9:7777");
+        let server = addr("203.0.113.9:8888");
+
+        // A client's announce/ping must NOT add it to routing.
+        for msg in [Message::Ping, Message::Announce { topic: id(1) }] {
+            let pkt = Packet {
+                sender: id(2),
+                rid: 1,
+                reachable: false,
+                msg,
+            }
+            .encode();
+            dht.handle_input(client, &pkt, 0);
+        }
+        assert_eq!(
+            dht.routing_len(),
+            0,
+            "a NAT'd client must not enter the routing table"
+        );
+
+        // A server's ping DOES add it.
+        let pkt = Packet {
+            sender: id(3),
+            rid: 2,
+            reachable: true,
+            msg: Message::Ping,
+        }
+        .encode();
+        dht.handle_input(server, &pkt, 0);
+        assert_eq!(
+            dht.routing_len(),
+            1,
+            "a reachable server must enter the routing table"
+        );
     }
 }

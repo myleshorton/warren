@@ -1546,6 +1546,10 @@ async fn reflexive_addr(
         let probe = Packet {
             sender: id,
             rid,
+            // A reflexive probe comes from a transient data socket, not a routable
+            // endpoint — never a routing "server". (A Reflect is excluded from
+            // routing on the receiver regardless.)
+            reachable: false,
             msg: Message::Reflect,
         }
         .encode();

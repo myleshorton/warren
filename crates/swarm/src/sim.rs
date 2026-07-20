@@ -182,8 +182,13 @@ impl Sim {
             Ipv4Addr::new(10, 0, 0, 1),
             10_000 + index as u16,
         ));
+        let mut dht = Dht::new(id);
+        // Nodes default to Open (directly reachable) in the sim, so they advertise
+        // as routable servers — otherwise the client/server split would keep every
+        // node out of every routing table. `set_nat` re-pins for NAT'd nodes.
+        dht.pin_firewall(Firewall::Open);
         self.nodes.push(Node {
-            dht: Dht::new(id),
+            dht,
             addr,
             nat: NatKind::Open,
         });
@@ -202,7 +207,10 @@ impl Sim {
             NatKind::Consistent => Firewall::Consistent,
             NatKind::Random => Firewall::Random,
         };
-        self.nodes[i].dht.set_firewall(fw);
+        // Pin the declared firewall so it drives both connect signaling and the
+        // routing-table client/server split (only a pinned-Open node advertises
+        // itself as a routable server).
+        self.nodes[i].dht.pin_firewall(fw);
     }
 
     /// Announce node `i` under `topic`.

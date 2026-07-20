@@ -127,6 +127,12 @@ pub enum Event {
         /// `None` when the connect never reached a reply (`NotFound`/`TimedOut`).
         /// Diagnostic only — does not affect the outcome.
         peer_firewall: Option<Firewall>,
+        /// Duration of the iterative-lookup phase (connect start → coordinator
+        /// found), so the caller can split the total DHT cost into lookup vs.
+        /// coordinator-brokered signaling. `None` if the connect timed out or found
+        /// nobody before a coordinator was chosen (i.e. still in the lookup phase).
+        /// Diagnostic only.
+        lookup_ms: Option<u64>,
     },
     /// A peer wants to connect to us (we are the target). The caller stands up a
     /// data socket, calls [`Dht::accept_connect`] with its candidate address(es)
@@ -182,6 +188,9 @@ struct QueryContact {
 struct Query {
     target: NodeId,
     kind: QueryKind,
+    /// When the query started, to time the iterative-lookup phase (diagnostic:
+    /// splits a connect's DHT cost into lookup vs. coordinator-brokered signaling).
+    started: Millis,
     contacts: Vec<QueryContact>,
     /// Nodes that returned an announce record for the target (potential
     /// coordinators for a connect).
@@ -241,6 +250,11 @@ struct ConnectState {
     /// Our own data-socket candidate addresses, sent in the request so the target
     /// learns where to punch back.
     data_addrs: Vec<SocketAddr>,
+    /// Duration of the iterative-lookup phase (connect start → a coordinator found),
+    /// set when the query finishes and the broker request goes out. `None` while the
+    /// lookup is still running (so a lookup-phase timeout reports it as unknown).
+    /// Diagnostic only.
+    lookup_ms: Option<u64>,
 }
 
 /// The target side of an in-flight connect: a request arrived for us, and we
@@ -466,6 +480,7 @@ impl Dht {
                 deadline: now + CONNECT_TIMEOUT_MS,
                 coordinator: None,
                 data_addrs,
+                lookup_ms: None,
             },
         );
         self.start_query(target, QueryKind::Connect, now)
@@ -516,6 +531,7 @@ impl Dht {
         let mut query = Query {
             target,
             kind,
+            started: now,
             contacts: Vec::new(),
             coordinators: Vec::new(),
             peers: Vec::new(),
@@ -648,7 +664,9 @@ impl Dht {
             .map(|(target, _)| *target)
             .collect();
         for target in stale {
-            self.connecting.remove(&target);
+            // Carry the lookup timing if we got as far as brokering (Some) vs. timed
+            // out still looking (None) — so the caller can tell which phase stalled.
+            let lookup_ms = self.connecting.remove(&target).and_then(|cs| cs.lookup_ms);
             // Stop any still-running discovery for this target so it can't emit
             // a late Signal after we've already reported TimedOut.
             self.cancel_connect_queries(&target);
@@ -658,6 +676,7 @@ impl Dht {
                 peer_data_addrs: Vec::new(),
                 strategy: None,
                 peer_firewall: None,
+                lookup_ms,
             });
         }
 
@@ -932,8 +951,15 @@ impl Dht {
         }
 
         if let Some((kind, target, closest, coordinators, peers)) = done {
+            // Time the lookup phase (query start → now) before dropping the query, so
+            // a connect can split its DHT cost into lookup vs. broker signaling.
+            let lookup_ms = self
+                .queries
+                .get(&qid)
+                .map(|q| now.saturating_sub(q.started))
+                .unwrap_or(0);
             self.queries.remove(&qid);
-            self.finish_query(qid, kind, target, closest, coordinators, peers);
+            self.finish_query(qid, kind, target, closest, coordinators, peers, lookup_ms);
         }
     }
 
@@ -946,6 +972,7 @@ impl Dht {
         closest: Vec<Contact>,
         coordinators: Vec<Contact>,
         peers: Vec<Contact>,
+        lookup_ms: u64,
     ) {
         match kind {
             QueryKind::FindNode => {
@@ -979,6 +1006,7 @@ impl Dht {
                     let data_addrs = match self.connecting.get_mut(&target) {
                         Some(cs) => {
                             cs.coordinator = Some(coord.addr);
+                            cs.lookup_ms = Some(lookup_ms); // lookup done; broker begins
                             cs.data_addrs.clone()
                         }
                         None => return, // connect already resolved/expired
@@ -1000,12 +1028,15 @@ impl Dht {
                 }
                 None => {
                     self.connecting.remove(&target);
+                    // The lookup ran to completion but turned up no coordinator, so
+                    // the whole DHT cost so far was lookup; there was no broker phase.
                     self.events.push_back(Event::Connected {
                         target,
                         outcome: ConnectOutcome::NotFound,
                         peer_data_addrs: Vec::new(),
                         strategy: None,
                         peer_firewall: None,
+                        lookup_ms: Some(lookup_ms),
                     });
                 }
             },
@@ -1108,7 +1139,7 @@ impl Dht {
                 .get(&target)
                 .is_some_and(|cs| cs.coordinator == Some(from));
             if from_coordinator {
-                self.connecting.remove(&target);
+                let lookup_ms = self.connecting.remove(&target).and_then(|cs| cs.lookup_ms);
                 let strategy = plan(self.signaling_firewall(), nat);
                 self.events.push_back(Event::Connected {
                     target,
@@ -1116,6 +1147,7 @@ impl Dht {
                     peer_data_addrs: data_addrs,
                     strategy: Some(strategy),
                     peer_firewall: Some(nat),
+                    lookup_ms,
                 });
             }
         } else if self.seen_initiators.contains(&(target, initiator_addr))

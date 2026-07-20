@@ -243,6 +243,13 @@ pub struct ConnectStats {
     pub local_firewall: Option<Firewall>,
     /// `Command::Connect` enqueue → `Event::Connected` (DHT discovery + signaling).
     pub dht_ms: u64,
+    /// Sub-split of `dht_ms`: the Kademlia iterative-lookup phase (connect start →
+    /// a coordinator found). A same-LAN connect that spends seconds here points at
+    /// discovery (routing/announce-propagation), not the punch.
+    pub dht_lookup_ms: u64,
+    /// Sub-split of `dht_ms`: the coordinator-brokered signaling round-trip (lookup
+    /// done → the peer's reply). `dht_lookup_ms + dht_broker_ms == dht_ms`.
+    pub dht_broker_ms: u64,
     /// Punch-primitive duration; `None` when no punch ran (Relayed/NotFound/TimedOut).
     pub punch_ms: Option<u64>,
     /// Whole `connect()` → `Connection` wall time.
@@ -833,6 +840,7 @@ async fn run(
                     mut peer_data_addrs,
                     strategy,
                     peer_firewall,
+                    lookup_ms,
                 } => {
                     if let Some((data_sock, cmd_ms, mut stats, tx)) = pending_connect.remove(&target)
                     {
@@ -846,6 +854,12 @@ async fn run(
                         // Fold the actor-side funnel fields into the connect-side
                         // stats the caller threaded in.
                         stats.dht_ms = now().saturating_sub(cmd_ms);
+                        // Split the DHT cost into lookup vs. broker. swarm reports the
+                        // lookup duration when it finds a coordinator; `None` means the
+                        // connect never got past the lookup (timed out / found nobody),
+                        // so attribute the whole cost to lookup.
+                        stats.dht_lookup_ms = lookup_ms.unwrap_or(stats.dht_ms).min(stats.dht_ms);
+                        stats.dht_broker_ms = stats.dht_ms.saturating_sub(stats.dht_lookup_ms);
                         stats.strategy = strategy;
                         stats.peer_firewall = peer_firewall;
                         stats.peer_candidates = peer_data_addrs.clone();

@@ -45,7 +45,16 @@ pub const ANNOUNCE_TTL_MS: Millis = 60 * 60 * 1_000;
 pub const ALPHA: usize = 3;
 
 /// How long (ms) to wait for a response before treating a request as failed.
-pub const REQUEST_TIMEOUT_MS: u64 = 1_000;
+///
+/// This bounds how long an *unreachable* contact stalls a lookup: with `ALPHA`
+/// requests in flight, N dead contacts cost ~ceil(N/ALPHA) × this. Lowered from
+/// 1000 to 500 as an interim mitigation for the ~5s find_node stall on a routing
+/// table full of departed clients — a ~2× win. It's a floor, not a cure: the real
+/// fix is to keep unreachable clients out of routing (client/server split). Kept
+/// generous enough (2× the ~270ms RTTs seen in the field) that a slow-but-live
+/// node — a distant/cellular peer — isn't prematurely marked dead, which would
+/// drop it from the lookup and can fail a connect outright.
+pub const REQUEST_TIMEOUT_MS: u64 = 500;
 
 /// Overall deadline (ms) for a connect — covering both discovery and the
 /// coordinator-brokered signaling — after which it gives up.

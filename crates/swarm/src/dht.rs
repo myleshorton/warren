@@ -657,6 +657,12 @@ impl Dht {
                         c.status = Status::Failed;
                     }
                 }
+                // A FindNode we sent went unanswered: count it against the
+                // contact in the routing table. Sustained silence evicts a
+                // departed server so later lookups stop burning a REQUEST_TIMEOUT
+                // on it; any inbound packet (handle_input's insert) resets the
+                // count, so a live-but-lossy peer is never dropped.
+                self.table.record_failure(&p.contact);
                 self.drive_query(p.query, now);
             }
         }

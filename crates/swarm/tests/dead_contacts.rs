@@ -11,6 +11,7 @@
 //! curve; the deterministic sim makes the numbers stable.
 
 use swarm::dht::Event;
+use swarm::routing::EVICTION_THRESHOLD;
 use swarm::sim::Sim;
 
 /// Virtual-time (ms) a `find_node` takes on a searcher whose routing table holds
@@ -42,11 +43,13 @@ fn find_node_ms(dead: usize, seed: u64) -> u64 {
     let start = sim.now();
     let q = sim.find_node(searcher, target);
     sim.run(10_000_000);
-    let finished = sim
-        .take_events()
-        .into_iter()
-        .any(|(n, ev)| matches!(ev, Event::QueryFinished { query, .. } if n == searcher && query == q));
-    assert!(finished, "find_node with {dead} dead contacts never finished");
+    let finished = sim.take_events().into_iter().any(
+        |(n, ev)| matches!(ev, Event::QueryFinished { query, .. } if n == searcher && query == q),
+    );
+    assert!(
+        finished,
+        "find_node with {dead} dead contacts never finished"
+    );
     sim.now() - start
 }
 
@@ -138,4 +141,77 @@ fn connect_stalls_on_dead_contacts_too() {
         c15 > c0 + 2_000,
         "connect stalls on dead contacts too (c0={c0}ms, c15={c15}ms)"
     );
+}
+
+/// The fix, end-to-end: dead contacts don't stall *forever*. A searcher that
+/// keeps looking up (reusing one routing table, unlike `find_node_ms` above)
+/// counts each unanswered FindNode against the contact; after `EVICTION_THRESHOLD`
+/// silent rounds the departed servers are evicted, and lookups return to baseline.
+#[test]
+fn repeated_lookups_evict_dead_contacts() {
+    let mut sim = Sim::new(10, 0xE0E0);
+
+    let searcher_id = sim.rng().node_id();
+    let (searcher, _) = sim.add_node(searcher_id);
+
+    // One reachable VPS the searcher will always be able to reach.
+    let vps_id = sim.rng().node_id();
+    let (vps, _) = sim.add_node(vps_id);
+    let vps_contact = sim.contact(vps);
+    sim.dht_mut(searcher).add_contact(vps_contact);
+
+    // Six departed servers buried in the table — every lookup queries them
+    // (7 contacts < K), so each round times out on all six.
+    let dead = 6usize;
+    for _ in 0..dead {
+        let id = sim.rng().node_id();
+        let (d, _) = sim.add_node(id);
+        let c = sim.contact(d);
+        sim.disable_node(d);
+        sim.dht_mut(searcher).add_contact(c);
+    }
+    assert_eq!(sim.dht(searcher).routing_len(), dead + 1);
+
+    // Run one lookup against a fresh random target and return its latency.
+    let run_lookup = |sim: &mut Sim| -> u64 {
+        let target = sim.rng().node_id();
+        let start = sim.now();
+        let q = sim.find_node(searcher, target);
+        sim.run(10_000_000);
+        let finished = sim.take_events().into_iter().any(
+            |(n, ev)| matches!(ev, Event::QueryFinished { query, .. } if n == searcher && query == q),
+        );
+        assert!(finished, "lookup never finished");
+        sim.now() - start
+    };
+
+    // The first lookup stalls: the dead contacts are still in the table (a
+    // contact isn't evicted until its threshold-th consecutive failure).
+    let first = run_lookup(&mut sim);
+    assert!(
+        first > 500,
+        "the first lookup should stall on the dead contacts, got {first} ms"
+    );
+
+    // Drive the remaining rounds needed to reach the eviction threshold.
+    for _ in 1..EVICTION_THRESHOLD {
+        run_lookup(&mut sim);
+    }
+
+    // The departed servers have now failed EVICTION_THRESHOLD lookups each and
+    // been evicted; only the reachable VPS remains.
+    assert_eq!(
+        sim.dht(searcher).routing_len(),
+        1,
+        "dead contacts should be evicted after {EVICTION_THRESHOLD} silent rounds"
+    );
+
+    // With the table cleaned up, a lookup is a single round-trip again.
+    let after = run_lookup(&mut sim);
+    println!("\neviction: first lookup {first} ms → post-eviction {after} ms\n");
+    assert!(
+        after < 500,
+        "post-eviction lookup should be fast again, got {after} ms"
+    );
+    assert!(after < first, "eviction should reduce lookup latency");
 }

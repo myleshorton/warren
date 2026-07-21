@@ -447,6 +447,22 @@ impl Session {
         Some(entry)
     }
 
+    /// A snapshot of every mirrored feed's blocks, each paired with its author's feed
+    /// key — so an app can render content we hold on an author's behalf even while the
+    /// author is offline (the durability [`Self::mirror_feed`] + [`Self::run_mirror`]
+    /// buy). Blocks are opaque here; the caller decodes them into its record type.
+    pub fn mirrored_records(&self) -> Vec<(Vec<u8>, crypto::PublicKey)> {
+        let mut out = Vec::new();
+        for (replica, _notify) in self.mirrored.lock().expect("mirrored").values() {
+            let r = replica.lock().expect("replica");
+            let key = r.public_key();
+            for block in r.blocks() {
+                out.push((block.clone(), key));
+            }
+        }
+        out
+    }
+
     /// Keep a mirrored feed current, forever: fail over across the feed's providers
     /// (author + other mirrors), live-tailing new blocks into `replica` and firing
     /// `appended` so our own downstream subscribers are pushed at once. Spawn this

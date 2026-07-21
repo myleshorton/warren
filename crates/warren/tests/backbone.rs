@@ -173,6 +173,24 @@ async fn a_mirror_keeps_a_feed_tailable_after_its_author_goes_offline() {
     author_serve.abort();
     drop(author);
 
+    // With the author gone, the mirror still exposes its records to an app — this is what
+    // Murmur's refresh_feed reads to keep an offline author's posts in the feed. Every
+    // block, in order, tagged with the author's feed key.
+    let records = mirror.mirrored_records();
+    assert_eq!(
+        records.len(),
+        5,
+        "mirrored_records exposes the whole mirrored feed while the author is offline"
+    );
+    for (i, (block, key)) in records.iter().enumerate() {
+        assert_eq!(block.as_slice(), format!("msg {i}").as_bytes());
+        assert_eq!(
+            key.to_bytes(),
+            author_key.to_bytes(),
+            "each mirrored record is tagged with its author's feed key"
+        );
+    }
+
     // --- Subscriber: tail the author's feed by key. The author is gone, so the DHT
     // failover in Session::subscribe must fall through to the mirror. ---
     let subscriber = make_session(joined(bootstrap, id(3)).await, [0xCC; 32]).0;

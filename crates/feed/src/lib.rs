@@ -231,6 +231,13 @@ impl Replica {
         self.blocks.is_empty()
     }
 
+    /// All held blocks, in feed order. The payloads are opaque to the feed layer —
+    /// a holder (e.g. a mirror) reads them to serve or render the author's content
+    /// on its behalf, even while the author is offline.
+    pub fn blocks(&self) -> &[Vec<u8>] {
+        &self.blocks
+    }
+
     /// Advance to a newer signed `head` by appending `new_blocks` — the blocks from
     /// the current length up to `head.len`, in order. Returns `false` and leaves the
     /// replica **unchanged** unless the result is provably faithful: `head` verifies

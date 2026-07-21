@@ -842,7 +842,8 @@ async fn run(
                     peer_firewall,
                     lookup_ms,
                 } => {
-                    if let Some((data_sock, cmd_ms, mut stats, tx)) = pending_connect.remove(&target)
+                    if let Some((data_sock, cmd_ms, mut stats, tx)) =
+                        pending_connect.remove(&target)
                     {
                         // The peer's candidate set is untrusted (from a Signal, so
                         // only buffer-bounded); prioritize and cap what we actually
@@ -896,11 +897,14 @@ async fn run(
                     for tx in pending_nat_sample.drain(..) {
                         let _ = tx.send(report);
                     }
-                    emit(&events, NodeEvent::NatClassified {
-                        firewall,
-                        samples: samples as u32,
-                        observed_host,
-                    });
+                    emit(
+                        &events,
+                        NodeEvent::NatClassified {
+                            firewall,
+                            samples: samples as u32,
+                            observed_host,
+                        },
+                    );
                 }
                 Event::IncomingConnect {
                     initiator,
@@ -922,12 +926,15 @@ async fn run(
                     // spray fan-out, and keeps its routable hosts.
                     prioritize_and_cap(&mut initiator_data_addrs);
                     let peer_hosts = candidate_hosts(&initiator_data_addrs);
-                    emit(&events, NodeEvent::IncomingConnect {
-                        initiator,
-                        strategy,
-                        initiator_firewall,
-                        peer_candidates: initiator_data_addrs.len().min(255) as u8,
-                    });
+                    emit(
+                        &events,
+                        NodeEvent::IncomingConnect {
+                            initiator,
+                            strategy,
+                            initiator_firewall,
+                            peer_candidates: initiator_data_addrs.len().min(255) as u8,
+                        },
+                    );
                     if !data_ip.is_unspecified() && !peer_hosts.is_empty() {
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
                             if let Ok(local) = data_sock.local_addr() {
@@ -1224,12 +1231,15 @@ fn spawn_connect_punch(job: PunchJob) {
         // Event-side total (the return path overwrites this with the exact wall
         // time in `Node::connect`): the funnel phases we can see from here.
         stats.total_ms = stats.gather_ms + stats.dht_ms + stats.punch_ms.unwrap_or(0);
-        emit(&events, NodeEvent::ConnectResolved {
-            target,
-            outcome,
-            ok: channel.is_some(),
-            stats: stats.clone(),
-        });
+        emit(
+            &events,
+            NodeEvent::ConnectResolved {
+                target,
+                outcome,
+                ok: channel.is_some(),
+                stats: stats.clone(),
+            },
+        );
         let _ = tx.send(Ok(Connection {
             outcome,
             channel,
@@ -1282,13 +1292,16 @@ fn spawn_accept_punch(job: AcceptJob) {
             // instead of accumulating blocked tasks; the peer can retry.
             shed = incoming_tx.try_send(channel).is_err();
         }
-        emit(&events, NodeEvent::AcceptPunch {
-            initiator,
-            strategy,
-            ok,
-            punch_ms,
-            shed,
-        });
+        emit(
+            &events,
+            NodeEvent::AcceptPunch {
+                initiator,
+                strategy,
+                ok,
+                punch_ms,
+                shed,
+            },
+        );
     });
 }
 
@@ -1679,7 +1692,8 @@ mod tests {
         // No reflector to ask: fall back to the local address.
         let sock = UdpSocket::bind(lo()).await.unwrap();
         let local = sock.local_addr().unwrap();
-        let (observed, rtt) = reflexive_addr(&sock, NodeId::from_bytes([1u8; 32]), local, &[]).await;
+        let (observed, rtt) =
+            reflexive_addr(&sock, NodeId::from_bytes([1u8; 32]), local, &[]).await;
         assert_eq!(observed, local);
         assert_eq!(rtt, None, "no reflector answered, so there's no RTT");
     }

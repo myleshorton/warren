@@ -13,7 +13,7 @@
 
 use crate::Head;
 use crypto::Hash;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 use thiserror::Error;
 
@@ -56,6 +56,18 @@ pub struct Batch {
 pub trait FeedStore: Send + Sync {
     /// Apply `batch` to `feed` atomically — all of it becomes durable, or none of it.
     fn commit(&self, feed: &FeedKey, batch: Batch) -> StoreResult<()>;
+    /// Prune `feed` to a suffix window, atomically: drop every block with index
+    /// `< retain_from`, and every Merkle node whose index is **not** in `retain_nodes`.
+    /// The caller ([`Replica::prune`](crate::Replica::prune)) sets `retain_nodes` to the
+    /// peaks plus every retained block's audit path, so kept blocks stay provable while the
+    /// rest is reclaimed. The head and length are untouched — the feed still knows its shape.
+    /// A no-op for a feed the store doesn't hold.
+    fn prune(
+        &self,
+        feed: &FeedKey,
+        retain_from: u64,
+        retain_nodes: &BTreeSet<u64>,
+    ) -> StoreResult<()>;
     /// The block at `index`, if held.
     fn block(&self, feed: &FeedKey, index: u64) -> StoreResult<Option<Vec<u8>>>;
     /// The Merkle node at `index`, if held.
@@ -113,6 +125,20 @@ impl FeedStore for MemStore {
         }
         if let Some(head) = batch.head {
             data.head = Some(head);
+        }
+        Ok(())
+    }
+
+    fn prune(
+        &self,
+        feed: &FeedKey,
+        retain_from: u64,
+        retain_nodes: &BTreeSet<u64>,
+    ) -> StoreResult<()> {
+        let mut map = self.lock()?;
+        if let Some(data) = map.get_mut(feed) {
+            data.blocks.retain(|&k, _| k >= retain_from);
+            data.nodes.retain(|&k, _| retain_nodes.contains(&k));
         }
         Ok(())
     }

@@ -463,6 +463,19 @@ impl Replica {
             .is_ok()
     }
 
+    /// Prune to a suffix window: drop every held block below `below` and every Merkle node
+    /// no longer needed to prove a retained block, keeping only `[below, len)` servable. The
+    /// head, length, and peaks are untouched — the replica still knows the feed's full shape
+    /// and root; it just no longer holds (or can prove) the pruned prefix. This is the
+    /// bounded-footprint primitive a windowed seeder calls as the author's feed grows.
+    /// Idempotent, and a no-op for `below == 0`.
+    pub fn prune(&self, below: u64) {
+        let retain = tree::retained_node_indices(self.head.len, below);
+        // Best-effort: a store failure here only leaves extra data on disk, never corrupts
+        // what's retained (the kept set is a strict superset of what proofs need).
+        let _ = self.store.prune(&self.feed, below, &retain);
+    }
+
     /// The replicated feed's owner (the key its head is verified against).
     pub fn public_key(&self) -> PublicKey {
         self.public_key
@@ -1012,6 +1025,54 @@ mod tests {
         let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
         let pk = Keypair::from_seed(&[0x33; 32]).public();
         assert!(Replica::open(pk, store).unwrap().is_none());
+    }
+
+    #[test]
+    fn pruning_drops_the_prefix_but_keeps_the_suffix_provable() {
+        // A mirror prunes to a suffix window: the pruned prefix is gone (unservable,
+        // unprovable) while every retained block still serves and proves against the
+        // unchanged signed head. The feed's length/shape is untouched.
+        let src = log_with(20);
+        let pk = src.public_key();
+        let head = src.head();
+        let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
+        let blocks: Vec<Vec<u8>> = (0..20).map(|i| src.get(i).unwrap()).collect();
+        let mirror = Replica::with_store(pk, head.clone(), blocks, store).unwrap();
+
+        mirror.prune(12); // keep the tail window [12, 20)
+
+        assert_eq!(
+            mirror.len(),
+            20,
+            "length is unchanged — it still knows the shape"
+        );
+        assert_eq!(
+            mirror.held_ranges(),
+            vec![(12, 20)],
+            "only the suffix window is held now"
+        );
+        for i in 0..12 {
+            assert!(mirror.block(i).is_none(), "pruned block {i} is gone");
+            assert!(
+                Source::proof(&mirror, i).is_none(),
+                "a pruned block can't be proved"
+            );
+        }
+        for i in 12..20 {
+            assert_eq!(
+                mirror.block(i),
+                src.get(i),
+                "retained block {i} still served"
+            );
+            let proof = Source::proof(&mirror, i).expect("retained block still proves");
+            assert!(
+                verify_block(&pk, &head, i as u64, &mirror.block(i).unwrap(), &proof),
+                "retained block {i} verifies against the original head"
+            );
+        }
+        // Idempotent + monotonic: re-pruning at or below the window is a no-op for the tail.
+        mirror.prune(12);
+        assert_eq!(mirror.held_ranges(), vec![(12, 20)]);
     }
 
     #[test]

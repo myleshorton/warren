@@ -21,6 +21,7 @@
 use crypto::Hash;
 use feed::{Batch, FeedKey, FeedStore, Head, StoreError, StoreResult};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -41,6 +42,13 @@ fn composite(feed: &FeedKey, index: u64) -> [u8; 40] {
     key[..32].copy_from_slice(feed);
     key[32..].copy_from_slice(&index.to_be_bytes());
     key
+}
+
+/// The index parsed back out of a [`composite`] key (its trailing 8 big-endian bytes).
+fn index_of(key: &[u8]) -> u64 {
+    let mut idx = [0u8; 8];
+    idx.copy_from_slice(&key[32..40]);
+    u64::from_be_bytes(idx)
 }
 
 /// A [`FeedStore`] backed by a single redb database file.
@@ -85,6 +93,36 @@ impl FeedStore for RedbStore {
                 t.insert(feed.as_slice(), head.encode().as_slice())
                     .map_err(be)?;
             }
+        }
+        txn.commit().map_err(be)?;
+        Ok(())
+    }
+
+    fn prune(
+        &self,
+        feed: &FeedKey,
+        retain_from: u64,
+        retain_nodes: &BTreeSet<u64>,
+    ) -> StoreResult<()> {
+        // This feed's whole key span: feed‖0 .. feed‖u64::MAX. `retain_in` only touches
+        // keys in the range, so other feeds are untouched, and it drops entries whose
+        // predicate returns false — all in one atomic write transaction.
+        let lo = composite(feed, 0);
+        let hi = composite(feed, u64::MAX);
+        let txn = self.db.begin_write().map_err(be)?;
+        {
+            let mut blocks = txn.open_table(BLOCKS).map_err(be)?;
+            blocks
+                .retain_in(lo.as_slice()..=hi.as_slice(), |key, _| {
+                    index_of(key) >= retain_from
+                })
+                .map_err(be)?;
+            let mut nodes = txn.open_table(NODES).map_err(be)?;
+            nodes
+                .retain_in(lo.as_slice()..=hi.as_slice(), |key, _| {
+                    retain_nodes.contains(&index_of(key))
+                })
+                .map_err(be)?;
         }
         txn.commit().map_err(be)?;
         Ok(())
@@ -264,6 +302,51 @@ mod tests {
             redb_head, mem_head,
             "a redb-backed log produces the same head as a mem-backed one"
         );
+    }
+
+    #[test]
+    fn prune_reclaims_the_prefix_and_survives_reopen() {
+        use feed::{Replica, Source};
+        let db = temp();
+        let store: Arc<dyn FeedStore> = Arc::new(db.0.clone());
+
+        // Author a 20-block feed and mirror it into redb.
+        let mut src = Log::new(crypto::Keypair::from_seed(&[0x44; 32]));
+        for i in 0..20u8 {
+            src.append(vec![i; i as usize + 1]);
+        }
+        let pk = src.public_key();
+        let head = src.head();
+        let blocks: Vec<Vec<u8>> = (0..20).map(|i| src.get(i).unwrap()).collect();
+        let mirror = Replica::with_store(pk, head.clone(), blocks, store.clone()).unwrap();
+
+        mirror.prune(15); // keep the tail window [15, 20)
+        assert_eq!(mirror.held_ranges(), vec![(15, 20)]);
+
+        // Reopen from the same redb file: the pruned prefix stays gone on disk, and the
+        // retained window still proves against the original head.
+        let reopened = Replica::open(pk, store)
+            .unwrap()
+            .expect("the feed is still present");
+        assert_eq!(reopened.len(), 20, "the feed still knows its full length");
+        assert_eq!(reopened.held_ranges(), vec![(15, 20)]);
+        for i in 0..15 {
+            assert!(
+                reopened.block(i).is_none(),
+                "pruned block {i} gone after reopen"
+            );
+        }
+        for i in 15..20 {
+            assert_eq!(reopened.block(i).as_deref(), src.get(i).as_deref());
+            let proof = Source::proof(&reopened, i).expect("retained block proves");
+            assert!(feed::verify_block(
+                &pk,
+                &head,
+                i as u64,
+                &reopened.block(i).unwrap(),
+                &proof
+            ));
+        }
     }
 
     #[test]

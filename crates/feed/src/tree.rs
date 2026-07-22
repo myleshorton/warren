@@ -17,6 +17,7 @@
 //! definition doubles as the oracle the property tests check against.
 
 use crypto::{hash, hash_parts, Hash};
+use std::collections::BTreeSet;
 
 /// Domain-separation prefix for a leaf hash.
 const LEAF_PREFIX: u8 = 0x00;
@@ -76,6 +77,41 @@ pub fn proof_nodes(len: u64, index: u64, proof: &[Hash]) -> Vec<(u64, Hash)> {
         .enumerate()
         .map(|(d, hash)| (node_index(d as u32, (index >> d) ^ 1), *hash))
         .collect()
+}
+
+/// The flat indices of the **within-peak** audit-path nodes for leaf `index` in a feed of
+/// `len` leaves — the frozen sibling nodes a holder must keep to re-serve this block's proof
+/// (the bagging siblings come from the peaks, so they're never persisted). The index-only
+/// twin of [`proof_nodes`]: same `node_index(d, (index >> d) ^ 1)` walk, without the hashes.
+/// Used by GC to decide which nodes a retained block still needs.
+fn within_peak_indices(len: u64, index: u64) -> impl Iterator<Item = u64> {
+    let within = peak_height(len, index);
+    (0..within).map(move |d| node_index(d, (index >> d) ^ 1))
+}
+
+/// The flat indices of every node a feed of `len` leaves must keep to still serve and prove
+/// blocks `[below, len)` after pruning the rest: the **peaks** (needed to seed the
+/// accumulator and bag every proof) plus, for each retained block, its **within-peak audit
+/// path**. Any node absent from this set covers only pruned leaves — dropping it can't harm
+/// a retained block's proof. Note a pruned block's *leaf-hash* node is still kept when it is
+/// the sibling of a retained block (that's how the retained block proves without the pruned
+/// bytes) — the union over `[below, len)` audit paths captures exactly those.
+pub fn retained_node_indices(len: u64, below: u64) -> BTreeSet<u64> {
+    let below = below.min(len);
+    let mut keep = BTreeSet::new();
+    // The peaks: one per set bit of `len`, at their stable flat indices.
+    let mut base = 0u64;
+    for height in (0..u64::BITS).rev() {
+        if (len >> height) & 1 == 1 {
+            keep.insert(node_index(height, base >> height));
+            base += 1u64 << height;
+        }
+    }
+    // Each retained block's within-peak audit path.
+    for j in below..len {
+        keep.extend(within_peak_indices(len, j));
+    }
+    keep
 }
 
 /// The largest power of two strictly less than `n` (for `n >= 2`).
@@ -463,6 +499,57 @@ mod tests {
                     Some(root),
                     "re-emitted proof fails to verify at n={n} i={i}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn retained_nodes_keep_the_suffix_provable_and_drop_the_rest() {
+        // GC acceptance: for every length and every prune boundary `below`, keeping ONLY
+        // the retain-set nodes must still prove every block in `[below, n)` against the
+        // original root — and must genuinely shrink (drop nodes) once anything is pruned.
+        use std::collections::HashMap;
+        for n in 1..=128u64 {
+            let mut acc = Accumulator::new();
+            let mut all: HashMap<u64, Hash> = HashMap::new();
+            let mut ls: Vec<Hash> = Vec::new();
+            for i in 0..n {
+                let leaf = leaf_hash(&i.to_le_bytes());
+                for (idx, h) in acc.push(leaf) {
+                    all.insert(idx, h);
+                }
+                ls.push(leaf);
+            }
+            let root = merkle_root(&ls);
+            for below in 0..=n {
+                let keep = retained_node_indices(n, below);
+                // Keeping only the retain-set nodes, every retained block still proves.
+                let kept: HashMap<u64, Hash> = all
+                    .iter()
+                    .filter(|(k, _)| keep.contains(k))
+                    .map(|(k, v)| (*k, *v))
+                    .collect();
+                let seeded = Accumulator::from_peaks(n, |idx| kept.get(&idx).copied())
+                    .expect("peaks are always retained");
+                for j in below..n {
+                    let proof = seeded
+                        .proof(j, |idx| kept.get(&idx).copied())
+                        .expect("a retained block still proves from kept nodes");
+                    assert_eq!(
+                        root_from_path(ls[j as usize], j as usize, n as usize, &proof),
+                        Some(root),
+                        "retained block {j} fails to verify after pruning below {below} (n={n})"
+                    );
+                }
+                // Nothing wasted: the retain set never exceeds the full node set, and it
+                // strictly shrinks once we prune into a feed with prunable interior nodes.
+                assert!(keep.len() <= all.len());
+                if below > 1 && n >= 4 {
+                    assert!(
+                        keep.len() < all.len(),
+                        "pruning below {below} of {n} should drop at least one node"
+                    );
+                }
             }
         }
     }

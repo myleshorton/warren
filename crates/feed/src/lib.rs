@@ -244,18 +244,35 @@ impl Source for Log {
 /// subscriber can tail from any replica-holder, not only the author.
 pub struct Replica {
     public_key: PublicKey,
+    /// Where the mirrored blocks live — a fresh [`MemStore`] via [`Replica::new`], or a
+    /// shared/persistent backend via [`Replica::with_store`].
+    store: Arc<dyn FeedStore>,
+    feed: FeedKey,
     head: Head,
-    blocks: Vec<Vec<u8>>,
+    /// Leaf hashes, kept in RAM for O(n) proofs and to verify each [`advance`](Replica::advance).
     leaves: Vec<Hash>,
 }
 
 impl Replica {
-    /// Build a replica from a feed's signed `head` and its `blocks` in order.
+    /// Build a replica from a feed's signed `head` and its `blocks` in order, holding them
+    /// in a fresh in-memory store.
+    ///
     /// Returns `None` unless the copy is provably faithful: the head verifies under
     /// `public_key`, the block count matches `head.len`, and the blocks reproduce
     /// `head.root`. So a mirror can neither invent a feed nor serve a doctored one —
     /// a replica that exists is a real, complete prefix of the owner's feed.
     pub fn new(public_key: PublicKey, head: Head, blocks: Vec<Vec<u8>>) -> Option<Replica> {
+        Self::with_store(public_key, head, blocks, Arc::new(MemStore::new()))
+    }
+
+    /// Build a replica over `store` (shared or persistent). Same faithfulness check as
+    /// [`new`](Replica::new); the verified blocks + head are committed to `store`.
+    pub fn with_store(
+        public_key: PublicKey,
+        head: Head,
+        blocks: Vec<Vec<u8>>,
+        store: Arc<dyn FeedStore>,
+    ) -> Option<Replica> {
         if !verify_head(&public_key, &head) || blocks.len() as u64 != head.len {
             return None;
         }
@@ -263,10 +280,22 @@ impl Replica {
         if tree::merkle_root(&leaves) != head.root {
             return None;
         }
+        let feed = public_key.to_bytes();
+        let batch = Batch {
+            blocks: blocks
+                .into_iter()
+                .enumerate()
+                .map(|(i, b)| (i as u64, b))
+                .collect(),
+            nodes: Vec::new(),
+            head: Some(head.clone()),
+        };
+        store.commit(&feed, batch).ok()?;
         Some(Replica {
             public_key,
+            store,
+            feed,
             head,
-            blocks,
             leaves,
         })
     }
@@ -277,18 +306,18 @@ impl Replica {
     }
     /// Number of blocks held.
     pub fn len(&self) -> usize {
-        self.blocks.len()
+        self.leaves.len()
     }
     /// Whether the replica holds no blocks.
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.leaves.is_empty()
     }
 
-    /// All held blocks, in feed order. The payloads are opaque to the feed layer —
-    /// a holder (e.g. a mirror) reads them to serve or render the author's content
-    /// on its behalf, even while the author is offline.
-    pub fn blocks(&self) -> &[Vec<u8>] {
-        &self.blocks
+    /// The block at `index`, if held — an owned copy (the bytes live in the store). A
+    /// holder (e.g. a mirror) reads these to serve or render the author's content on its
+    /// behalf, even while the author is offline.
+    pub fn block(&self, index: usize) -> Option<Vec<u8>> {
+        self.store.block(&self.feed, index as u64).ok().flatten()
     }
 
     /// Advance to a newer signed `head` by appending `new_blocks` — the blocks from
@@ -300,7 +329,7 @@ impl Replica {
     /// new blocks is an accepted no-op.
     pub fn advance(&mut self, head: Head, new_blocks: Vec<Vec<u8>>) -> bool {
         if !verify_head(&self.public_key, &head)
-            || self.blocks.len() as u64 + new_blocks.len() as u64 != head.len
+            || self.leaves.len() as u64 + new_blocks.len() as u64 != head.len
         {
             return false;
         }
@@ -311,7 +340,21 @@ impl Replica {
         if tree::merkle_root(&leaves) != head.root {
             return false;
         }
-        self.blocks.extend(new_blocks);
+        // Persist the new blocks (at their indices) + head atomically before touching the
+        // in-RAM state, so a store failure leaves the replica exactly as it was.
+        let start = self.leaves.len() as u64;
+        let batch = Batch {
+            blocks: new_blocks
+                .into_iter()
+                .enumerate()
+                .map(|(j, b)| (start + j as u64, b))
+                .collect(),
+            nodes: Vec::new(),
+            head: Some(head.clone()),
+        };
+        if self.store.commit(&self.feed, batch).is_err() {
+            return false;
+        }
         self.leaves = leaves;
         self.head = head;
         true
@@ -323,10 +366,10 @@ impl Source for Replica {
         self.head.clone()
     }
     fn get(&self, index: usize) -> Option<Vec<u8>> {
-        self.blocks.get(index).cloned()
+        self.block(index)
     }
     fn proof(&self, index: usize) -> Option<Proof> {
-        (index < self.blocks.len()).then(|| Proof {
+        (index < self.leaves.len()).then(|| Proof {
             siblings: tree::audit_path(&self.leaves, index),
         })
     }

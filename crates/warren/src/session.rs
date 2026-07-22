@@ -456,8 +456,10 @@ impl Session {
         for (replica, _notify) in self.mirrored.lock().expect("mirrored").values() {
             let r = replica.lock().expect("replica");
             let key = r.public_key();
-            for block in r.blocks() {
-                out.push((block.clone(), key));
+            for i in 0..r.len() {
+                if let Some(block) = r.block(i) {
+                    out.push((block, key));
+                }
             }
         }
         out

@@ -35,6 +35,15 @@ fn node_hash(left: &Hash, right: &Hash) -> Hash {
     hash_parts(&[&[NODE_PREFIX], left, right])
 }
 
+/// The stable flat-tree index of the node at `height` covering the leaf range
+/// `[offset·2^height, (offset+1)·2^height)` (mafintosh `flat-tree` numbering). A leaf
+/// (`height = 0`, `offset = i`) is `2i`; the index never changes as the tree grows, so
+/// it's the persistent key for a frozen node. Only called for real tree nodes, so the
+/// shift can't overflow (`height ≤ log₂(len) < 64`).
+fn node_index(height: u32, offset: u64) -> u64 {
+    (offset << (height + 1)) + (1 << height) - 1
+}
+
 /// The largest power of two strictly less than `n` (for `n >= 2`).
 ///
 /// Computed in constant time from the bit width: doubling `k` in a loop would
@@ -114,6 +123,8 @@ pub fn root_from_path(leaf: Hash, index: usize, len: usize, path: &[Hash]) -> Op
 #[derive(Clone, Default)]
 pub struct Accumulator {
     peaks: Vec<Option<Hash>>,
+    /// Total leaves pushed — the feed length, and the basis for addressing frozen nodes.
+    count: u64,
 }
 
 impl Accumulator {
@@ -122,15 +133,26 @@ impl Accumulator {
         Self::default()
     }
 
-    /// Append one leaf hash. Carries equal-height peaks upward like a binary
-    /// counter: a new leaf is a height-0 peak; whenever a peak already occupies a
-    /// height, the two combine (older on the left, as in the tree) into one peak a
-    /// height up, and the carry continues.
-    pub fn push(&mut self, leaf: Hash) {
+    /// Leaves pushed so far.
+    // Consumed by Log/Replica in the Phase-B wiring step (they drop their own leaf count).
+    #[allow(dead_code)]
+    pub fn len(&self) -> u64 {
+        self.count
+    }
+
+    /// Append one leaf hash, returning the nodes **frozen** by this push — the leaf plus
+    /// any internal node completed as equal-height peaks carry upward — each as its
+    /// `(flat-tree index, hash)`, ready to persist. Carries like a binary counter: a new
+    /// leaf is a height-0 peak; whenever a peak already occupies a height, the two combine
+    /// (older on the left, as in the tree) into one peak a height up, and the carry
+    /// continues.
+    pub fn push(&mut self, leaf: Hash) -> Vec<(u64, Hash)> {
+        let index = self.count; // 0-based index of this leaf
+        let mut frozen = vec![(index * 2, leaf)]; // the leaf node lives at flat index 2·index
         let mut carry = leaf;
-        let mut height = 0;
+        let mut height = 0u32;
         loop {
-            match self.peaks.get_mut(height) {
+            match self.peaks.get_mut(height as usize) {
                 None => {
                     self.peaks.push(Some(carry));
                     break;
@@ -144,10 +166,16 @@ impl Accumulator {
                     Some(existing) => {
                         carry = node_hash(&existing, &carry);
                         height += 1;
+                        // The merged node (now at `height`) covers the last 2^height leaves,
+                        // ending at this leaf — a complete perfect subtree, now frozen.
+                        let offset = ((index + 1) >> height) - 1;
+                        frozen.push((node_index(height, offset), carry));
                     }
                 },
             }
         }
+        self.count += 1;
+        frozen
     }
 
     /// The Merkle root over all pushed leaves — identical to [`merkle_root`] of the
@@ -165,6 +193,65 @@ impl Accumulator {
             });
         }
         acc.unwrap_or_else(|| hash(&[]))
+    }
+
+    /// The inclusion path for leaf `index`, assembled from persisted frozen nodes (read
+    /// via `get`, keyed by [`node_index`]) plus the in-RAM peaks — **identical** to
+    /// [`audit_path`] over the same leaves, but O(log n) reads instead of O(n) recompute,
+    /// and without holding the leaves. `None` if `index` is out of range or a needed node
+    /// is missing from the store.
+    ///
+    /// Two parts, deepest-first: (1) leaf `index` up to its peak, whose siblings are all
+    /// frozen perfect-subtree nodes read from `get`; then (2) the peak-bagging siblings —
+    /// for a leaf in peak `j` (peaks ordered largest-first, right-recursively bagged into
+    /// the root), the bag of every peak right of `j`, then peaks `j-1 … 0`.
+    // Consumed by Log/Replica in the Phase-B wiring step (they proof from the store, not leaves).
+    #[allow(dead_code)]
+    pub fn proof(&self, index: u64, get: impl Fn(u64) -> Option<Hash>) -> Option<Vec<Hash>> {
+        if index >= self.count {
+            return None;
+        }
+        // Peaks in root order (largest height first) with each one's base leaf offset.
+        let mut peaks: Vec<(u32, Hash, u64)> = self
+            .peaks
+            .iter()
+            .enumerate()
+            .rev()
+            .filter_map(|(h, slot)| slot.map(|hash| (h as u32, hash, 0u64)))
+            .collect();
+        let mut base = 0u64;
+        for p in peaks.iter_mut() {
+            p.2 = base;
+            base += 1u64 << p.0;
+        }
+        // Which peak holds `index`?
+        let j = peaks
+            .iter()
+            .position(|&(h, _, b)| index >= b && index < b + (1u64 << h))?;
+
+        let mut path = Vec::new();
+        // (1) Within the peak: sibling at each level d is the adjacent 2^d-block (flip the
+        // low bit of the block offset), a frozen node addressed globally.
+        for d in 0..peaks[j].0 {
+            let sibling = (index >> d) ^ 1;
+            path.push(get(node_index(d, sibling))?);
+        }
+        // (2a) Bag the peaks right of j (smaller, rightmost-first): node(p_{j+1}, node(…)).
+        let mut bag: Option<Hash> = None;
+        for &(_, hash, _) in peaks[j + 1..].iter().rev() {
+            bag = Some(match bag {
+                None => hash,
+                Some(rest) => node_hash(&hash, &rest),
+            });
+        }
+        if let Some(bag) = bag {
+            path.push(bag);
+        }
+        // (2b) The peaks left of j, nearest first (p_{j-1} … p_0).
+        for k in (0..j).rev() {
+            path.push(peaks[k].1);
+        }
+        Some(path)
     }
 }
 
@@ -194,6 +281,58 @@ mod tests {
                 ls.len()
             );
         }
+    }
+
+    #[test]
+    fn store_backed_proof_is_identical_to_audit_path() {
+        // The Phase-B acceptance criterion: a proof assembled from persisted frozen nodes
+        // (collected as `push` freezes them) plus the in-RAM peaks must be BYTE-IDENTICAL
+        // to the recursive `audit_path` oracle, for every length and every leaf — and must
+        // verify against the root. This is what guarantees roots/proofs are unchanged.
+        // Exhaustive to 128 — covers heights 0–7, every peak-count combination, and
+        // non-power-of-two lengths. (Verified once up to 512; the oracle is O(n²), so the
+        // committed bound stays small enough for CI.)
+        use std::collections::HashMap;
+        for n in 1..=128u64 {
+            let mut acc = Accumulator::new();
+            let mut nodes: HashMap<u64, Hash> = HashMap::new();
+            let mut ls: Vec<Hash> = Vec::new();
+            for i in 0..n {
+                let leaf = leaf_hash(&i.to_le_bytes());
+                for (idx, hash) in acc.push(leaf) {
+                    nodes.insert(idx, hash);
+                }
+                ls.push(leaf);
+            }
+            let root = merkle_root(&ls);
+            for i in 0..n {
+                let got = acc
+                    .proof(i, |idx| nodes.get(&idx).copied())
+                    .expect("in-range proof exists");
+                let want = audit_path(&ls, i as usize);
+                assert_eq!(got, want, "store proof != audit_path at n={n} i={i}");
+                assert_eq!(
+                    root_from_path(ls[i as usize], i as usize, n as usize, &got),
+                    Some(root),
+                    "store proof fails to verify at n={n} i={i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn store_proof_out_of_range_is_none() {
+        let mut acc = Accumulator::new();
+        acc.push(leaf_hash(b"only"));
+        assert!(
+            acc.proof(1, |_| None).is_none(),
+            "index == len is out of range"
+        );
+        assert_eq!(
+            acc.proof(0, |_| None),
+            Some(Vec::new()),
+            "a single-leaf proof is empty and reads no nodes"
+        );
     }
 
     #[test]

@@ -264,7 +264,7 @@ pub fn serve_feed<S: feed::Source>(request: &Message, source: &S) -> Message {
             let index = *index;
             match usize::try_from(index)
                 .ok()
-                .and_then(|i| source.get(i).map(<[u8]>::to_vec).zip(source.proof(i)))
+                .and_then(|i| source.get(i).zip(source.proof(i)))
             {
                 Some((data, proof)) => Message::Block { index, data, proof },
                 None => Message::Absent,

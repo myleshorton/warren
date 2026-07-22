@@ -1789,7 +1789,7 @@ mod tests {
             &pk,
             &head,
             1,
-            r.get(1).unwrap(),
+            &r.get(1).unwrap(),
             &r.proof(1).unwrap()
         ));
         drop(r);

@@ -35,6 +35,7 @@ mod store;
 mod tree;
 
 use crypto::{Hash, Keypair, PublicKey, Signature, HASH_LEN, SIGNATURE_LEN};
+use std::sync::Arc;
 use thiserror::Error;
 use wire::{Decoder, Encoder, WireError};
 
@@ -85,21 +86,47 @@ pub struct Proof {
 /// node, which is deferred.
 pub struct Log {
     keypair: Keypair,
-    blocks: Vec<Vec<u8>>,
+    /// Where blocks (and, later, the tree) live — a fresh [`MemStore`] for [`Log::new`],
+    /// or a shared/persistent backend via [`Log::with_store`].
+    store: Arc<dyn FeedStore>,
+    feed: FeedKey,
+    /// Leaf hashes, kept in RAM for O(n) inclusion proofs and to rebuild the accumulator
+    /// on reopen. (Moving these to the store — O(log n) proofs — is a later phase.)
     leaves: Vec<Hash>,
     /// Incrementally-maintained subtree roots, so [`Log::root`] is O(log n).
     roots: tree::Accumulator,
 }
 
 impl Log {
-    /// Create an empty log owned by `keypair`.
+    /// Create an empty log owned by `keypair`, backed by a fresh in-memory store.
     pub fn new(keypair: Keypair) -> Self {
-        Self {
-            keypair,
-            blocks: Vec::new(),
-            leaves: Vec::new(),
-            roots: tree::Accumulator::new(),
+        // An empty [`MemStore`] is infallible, so opening over it cannot fail.
+        Self::with_store(keypair, Arc::new(MemStore::new()))
+            .expect("opening a log over an empty MemStore never fails")
+    }
+
+    /// Open a log over `store`, rebuilding the in-RAM tree from whatever blocks the store
+    /// already holds — so a persisted feed reopens intact and new appends land in `store`.
+    pub fn with_store(keypair: Keypair, store: Arc<dyn FeedStore>) -> StoreResult<Self> {
+        let feed = keypair.public().to_bytes();
+        let len = store.contiguous_len(&feed)?;
+        let mut leaves = Vec::with_capacity(len as usize);
+        let mut roots = tree::Accumulator::new();
+        for i in 0..len {
+            let block = store.block(&feed, i)?.ok_or_else(|| {
+                StoreError::Backend(format!("dense feed missing block {i} of {len}"))
+            })?;
+            let leaf = tree::leaf_hash(&block);
+            roots.push(leaf);
+            leaves.push(leaf);
         }
+        Ok(Self {
+            keypair,
+            store,
+            feed,
+            leaves,
+            roots,
+        })
     }
 
     /// The owner's public key — the log's stable identity.
@@ -109,27 +136,50 @@ impl Log {
 
     /// Number of blocks appended.
     pub fn len(&self) -> usize {
-        self.blocks.len()
+        self.leaves.len()
     }
 
     /// Whether the log has no blocks.
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
+        self.leaves.is_empty()
     }
 
     /// Append a block, returning its index.
+    ///
+    /// Panics only if the backing store fails to commit — impossible for the default
+    /// in-memory backend; a fallible `try_append` will accompany the disk backend, where
+    /// a failed commit is a real (disk-full / corruption) condition to surface.
     pub fn append(&mut self, block: impl Into<Vec<u8>>) -> usize {
         let block = block.into();
         let leaf = tree::leaf_hash(&block);
-        self.leaves.push(leaf); // kept for O(n) inclusion proofs
+        let index = self.leaves.len() as u64;
         self.roots.push(leaf); // O(log n) root maintenance
-        self.blocks.push(block);
-        self.blocks.len() - 1
+        self.leaves.push(leaf); // kept for O(n) inclusion proofs
+        let len = self.leaves.len() as u64;
+        let root = self.roots.root();
+        let signature = self.keypair.sign(&head_message(len, &root));
+        let head = Head {
+            len,
+            root,
+            signature,
+        };
+        self.store
+            .commit(
+                &self.feed,
+                Batch {
+                    blocks: vec![(index, block)],
+                    nodes: Vec::new(), // leaves stay in RAM this phase; the tree isn't persisted
+                    head: Some(head),
+                },
+            )
+            .expect("feed store commit failed on append");
+        index as usize
     }
 
-    /// The block at `index`, if present.
-    pub fn get(&self, index: usize) -> Option<&[u8]> {
-        self.blocks.get(index).map(Vec::as_slice)
+    /// The block at `index`, if present. Returns an owned copy (the bytes live in the
+    /// store, not this struct); `None` if absent or on a read error.
+    pub fn get(&self, index: usize) -> Option<Vec<u8>> {
+        self.store.block(&self.feed, index as u64).ok().flatten()
     }
 
     /// The current Merkle root over all blocks — O(log n) from the accumulator.
@@ -139,7 +189,7 @@ impl Log {
 
     /// A signed [`Head`] committing to the log's current length and root.
     pub fn head(&self) -> Head {
-        let len = self.blocks.len() as u64;
+        let len = self.leaves.len() as u64;
         let root = self.root();
         let signature = self.keypair.sign(&head_message(len, &root));
         Head {
@@ -152,7 +202,7 @@ impl Log {
     /// An inclusion proof for the block at `index` (against the current head),
     /// or `None` if `index` is out of range.
     pub fn proof(&self, index: usize) -> Option<Proof> {
-        if index >= self.blocks.len() {
+        if index >= self.leaves.len() {
             return None;
         }
         Some(Proof {
@@ -168,8 +218,9 @@ impl Log {
 pub trait Source {
     /// The current signed head.
     fn head(&self) -> Head;
-    /// The block at `index`, if present.
-    fn get(&self, index: usize) -> Option<&[u8]>;
+    /// The block at `index`, if present. Owned, since a store-backed source can't lend a
+    /// reference into its backend.
+    fn get(&self, index: usize) -> Option<Vec<u8>>;
     /// An inclusion proof for the block at `index` against the head, or `None`.
     fn proof(&self, index: usize) -> Option<Proof>;
 }
@@ -178,7 +229,7 @@ impl Source for Log {
     fn head(&self) -> Head {
         Log::head(self)
     }
-    fn get(&self, index: usize) -> Option<&[u8]> {
+    fn get(&self, index: usize) -> Option<Vec<u8>> {
         Log::get(self, index)
     }
     fn proof(&self, index: usize) -> Option<Proof> {
@@ -271,8 +322,8 @@ impl Source for Replica {
     fn head(&self) -> Head {
         self.head.clone()
     }
-    fn get(&self, index: usize) -> Option<&[u8]> {
-        self.blocks.get(index).map(Vec::as_slice)
+    fn get(&self, index: usize) -> Option<Vec<u8>> {
+        self.blocks.get(index).cloned()
     }
     fn proof(&self, index: usize) -> Option<Proof> {
         (index < self.blocks.len()).then(|| Proof {
@@ -430,9 +481,43 @@ mod tests {
     fn appended_blocks_read_back() {
         let log = log_with(4);
         assert_eq!(log.len(), 4);
-        assert_eq!(log.get(0), Some([0u8; 1].as_slice()));
-        assert_eq!(log.get(3), Some([3u8; 4].as_slice()));
+        assert_eq!(log.get(0).as_deref(), Some([0u8; 1].as_slice()));
+        assert_eq!(log.get(3).as_deref(), Some([3u8; 4].as_slice()));
         assert_eq!(log.get(4), None);
+    }
+
+    #[test]
+    fn with_store_reopens_a_persisted_feed_identically() {
+        // A shared store outlives the log; reopening over it must rebuild the same tree,
+        // head, and blocks — the property the disk backend relies on across a restart.
+        let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
+        let seed = [5u8; 32];
+        let head_before = {
+            let mut log = Log::with_store(Keypair::from_seed(&seed), store.clone()).unwrap();
+            for i in 0..5u8 {
+                log.append(vec![i; i as usize + 1]);
+            }
+            assert_eq!(log.len(), 5);
+            log.head()
+        };
+
+        let reopened = Log::with_store(Keypair::from_seed(&seed), store).unwrap();
+        assert_eq!(reopened.len(), 5, "length recovered from the store");
+        assert_eq!(
+            reopened.head(),
+            head_before,
+            "reopened head is byte-identical — the Merkle tree rebuilt exactly"
+        );
+        assert_eq!(reopened.get(3).as_deref(), Some([3u8; 4].as_slice()));
+        // A proof from the reopened log still verifies against its head.
+        let proof = reopened.proof(3).unwrap();
+        assert!(verify_block(
+            &reopened.public_key(),
+            &reopened.head(),
+            3,
+            &reopened.get(3).unwrap(),
+            &proof
+        ));
     }
 
     #[test]
@@ -444,7 +529,7 @@ mod tests {
         for i in 0..log.len() {
             let proof = log.proof(i).unwrap();
             assert!(
-                verify_block(&pk, &head, i as u64, log.get(i).unwrap(), &proof),
+                verify_block(&pk, &head, i as u64, &log.get(i).unwrap(), &proof),
                 "block {i} should verify"
             );
         }
@@ -461,14 +546,19 @@ mod tests {
             assert!(verify_block_proof(
                 &head,
                 i as u64,
-                log.get(i).unwrap(),
+                &log.get(i).unwrap(),
                 &proof
             ));
         }
         // It still rejects a tampered block and an out-of-range index...
         let proof0 = log.proof(0).unwrap();
         assert!(!verify_block_proof(&head, 0, b"tampered", &proof0));
-        assert!(!verify_block_proof(&head, 99, log.get(0).unwrap(), &proof0));
+        assert!(!verify_block_proof(
+            &head,
+            99,
+            &log.get(0).unwrap(),
+            &proof0
+        ));
         // ...but, unlike verify_block, does NOT check the head signature: a head
         // with a bad signature but the real root still passes proof-only (that's
         // the caller's responsibility to have verified once).
@@ -476,12 +566,17 @@ mod tests {
             signature: Keypair::from_seed(&[0xAB; 32]).sign(b"nonsense"),
             ..head.clone()
         };
-        assert!(verify_block_proof(&forged, 0, log.get(0).unwrap(), &proof0));
+        assert!(verify_block_proof(
+            &forged,
+            0,
+            &log.get(0).unwrap(),
+            &proof0
+        ));
         assert!(!verify_block(
             &log.public_key(),
             &forged,
             0,
-            log.get(0).unwrap(),
+            &log.get(0).unwrap(),
             &proof0
         ));
     }
@@ -502,7 +597,7 @@ mod tests {
         let head = log.head();
         let proof = log.proof(2).unwrap();
         // Right block+proof, wrong claimed index.
-        assert!(!verify_block(&pk, &head, 4, log.get(2).unwrap(), &proof));
+        assert!(!verify_block(&pk, &head, 4, &log.get(2).unwrap(), &proof));
     }
 
     #[test]
@@ -559,7 +654,7 @@ mod tests {
                 &pk,
                 &head,
                 i as u64,
-                replica.get(i).unwrap(),
+                &replica.get(i).unwrap(),
                 &proof
             ));
         }
@@ -619,7 +714,7 @@ mod tests {
                 &pk,
                 &head,
                 i as u64,
-                replica.get(i).unwrap(),
+                &replica.get(i).unwrap(),
                 &proof
             ));
         }

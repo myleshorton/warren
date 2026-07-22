@@ -257,17 +257,17 @@ impl Session {
         // it as an error rather than silently persisting nonsense.)
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Persist the blob (content-addressed, order-independent) *outside* the log
-        // lock so a large write can't block feed serving; then append the feed line
-        // and the in-memory log together *under* the lock — the same ordering + error
-        // semantics as `publish_body`: concurrent publishers can't reorder the on-disk
+        // Persist the blob (content-addressed, order-independent) *outside* the log lock
+        // so a large write can't block feed serving; then append the block *under* the
+        // lock. `try_append` commits to the store (redb — durable, fsync'd) and advances
+        // the in-memory log together, so concurrent publishers can't reorder the persisted
         // feed against the in-memory Merkle order, and a returned `Err` means "not
-        // published". Notify only after the (best-effort) line append returns `Ok`.
+        // published" (the store commits before the in-memory log advances).
         store::write_blob(&self.data_dir, &blob_hex, &stored)?;
         {
             let mut log = self.log.lock().expect("feed log");
-            store::append_line(&self.data_dir, &line)?;
-            log.append(line.into_bytes());
+            log.try_append(line.into_bytes())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         self.appended.notify_waiters(); // wake any live-tail subscribers
 
@@ -317,18 +317,15 @@ impl Session {
         };
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Append to the feed file and the in-memory log under the log lock, so the two
-        // stay in the *same order* even with concurrent publishers (on-disk line order
-        // == in-memory Merkle order, so the head served to subscribers is what rebuild
-        // reproduces), and so a returned `Err` (the file append failed) means "not
-        // published" — the in-memory log is touched only after the append returns `Ok`.
-        // (Best-effort persistence: `append_line` doesn't `fsync`, so it isn't durable
-        // against a crash/power loss.) It's synchronous fs (no `.await`), so this brief
-        // hold can't wedge a live-tail serve.
+        // Append the block under the log lock so concurrent publishers stay in the same
+        // order (persisted-store order == in-memory Merkle order == what a subscriber is
+        // served). `try_append` commits to the store (redb — durable, fsync'd on commit)
+        // *before* advancing the in-memory log, so a returned `Err` means "not published".
+        // Synchronous (no `.await`), so this brief hold can't wedge a live-tail serve.
         {
             let mut log = self.log.lock().expect("feed log");
-            store::append_line(&self.data_dir, &line)?;
-            log.append(line.into_bytes());
+            log.try_append(line.into_bytes())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         self.appended.notify_waiters(); // wake any live-tail subscribers
         Ok(record)

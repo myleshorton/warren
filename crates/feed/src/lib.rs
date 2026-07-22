@@ -144,36 +144,46 @@ impl Log {
         self.leaves.is_empty()
     }
 
-    /// Append a block, returning its index.
-    ///
-    /// Panics only if the backing store fails to commit — impossible for the default
-    /// in-memory backend; a fallible `try_append` will accompany the disk backend, where
-    /// a failed commit is a real (disk-full / corruption) condition to surface.
+    /// Append a block, returning its index. Persists to the backing store atomically;
+    /// panics if the store fails — impossible for the default in-memory backend. Use
+    /// [`try_append`](Log::try_append) where a disk-backed store's failure must surface.
     pub fn append(&mut self, block: impl Into<Vec<u8>>) -> usize {
+        self.try_append(block)
+            .expect("feed store commit failed on append")
+    }
+
+    /// Append a block, returning its index — the fallible form.
+    ///
+    /// Commits to the backing store **before** advancing in-RAM state, so a store failure
+    /// (disk full, corruption) leaves the log exactly as it was rather than desynced ahead
+    /// of what's persisted.
+    pub fn try_append(&mut self, block: impl Into<Vec<u8>>) -> StoreResult<usize> {
         let block = block.into();
         let leaf = tree::leaf_hash(&block);
         let index = self.leaves.len() as u64;
-        self.roots.push(leaf); // O(log n) root maintenance
-        self.leaves.push(leaf); // kept for O(n) inclusion proofs
-        let len = self.leaves.len() as u64;
-        let root = self.roots.root();
+        // Compute the new head against a prospective accumulator, without mutating self.
+        let mut roots = self.roots.clone();
+        roots.push(leaf);
+        let len = index + 1;
+        let root = roots.root();
         let signature = self.keypair.sign(&head_message(len, &root));
         let head = Head {
             len,
             root,
             signature,
         };
-        self.store
-            .commit(
-                &self.feed,
-                Batch {
-                    blocks: vec![(index, block)],
-                    nodes: Vec::new(), // leaves stay in RAM this phase; the tree isn't persisted
-                    head: Some(head),
-                },
-            )
-            .expect("feed store commit failed on append");
-        index as usize
+        self.store.commit(
+            &self.feed,
+            Batch {
+                blocks: vec![(index, block)],
+                nodes: Vec::new(), // leaves stay in RAM this phase; the tree isn't persisted
+                head: Some(head),
+            },
+        )?;
+        // Committed — now advance in-RAM state.
+        self.roots = roots;
+        self.leaves.push(leaf);
+        Ok(index as usize)
     }
 
     /// The block at `index`, if present. Returns an owned copy (the bytes live in the

@@ -90,10 +90,9 @@ pub struct Log {
     /// or a shared/persistent backend via [`Log::with_store`].
     store: Arc<dyn FeedStore>,
     feed: FeedKey,
-    /// Leaf hashes, kept in RAM for O(n) inclusion proofs and to rebuild the accumulator
-    /// on reopen. (Moving these to the store — O(log n) proofs — is a later phase.)
-    leaves: Vec<Hash>,
-    /// Incrementally-maintained subtree roots, so [`Log::root`] is O(log n).
+    /// The append-only tree's peaks, kept in RAM (O(log n)); its frozen interior nodes
+    /// live in the store. Together they answer `root`/`head`/`proof` without holding the
+    /// leaves — so a large feed isn't RAM-bound and a proof is O(log n) store reads.
     roots: tree::Accumulator,
 }
 
@@ -105,26 +104,38 @@ impl Log {
             .expect("opening a log over an empty MemStore never fails")
     }
 
-    /// Open a log over `store`, rebuilding the in-RAM tree from whatever blocks the store
-    /// already holds — so a persisted feed reopens intact and new appends land in `store`.
+    /// Open a log over `store`, rebuilding the in-RAM peaks from the stored blocks — so a
+    /// persisted feed reopens intact and new appends land in `store`. If the tree nodes
+    /// aren't persisted yet (a fresh Phase-B open, or a Phase-A feed whose `nodes` table is
+    /// still empty), they're backfilled here — a one-time O(n) pass; later opens still walk
+    /// the blocks to seed the peaks (an O(log n) peak-read open is a further optimization).
     pub fn with_store(keypair: Keypair, store: Arc<dyn FeedStore>) -> StoreResult<Self> {
         let feed = keypair.public().to_bytes();
         let len = store.contiguous_len(&feed)?;
-        let mut leaves = Vec::with_capacity(len as usize);
         let mut roots = tree::Accumulator::new();
+        let mut frozen = Vec::new();
         for i in 0..len {
             let block = store.block(&feed, i)?.ok_or_else(|| {
                 StoreError::Backend(format!("dense feed missing block {i} of {len}"))
             })?;
-            let leaf = tree::leaf_hash(&block);
-            roots.push(leaf);
-            leaves.push(leaf);
+            frozen.extend(roots.push(tree::leaf_hash(&block)));
+        }
+        // Node 0 is leaf 0 — always frozen for a non-empty feed — so its absence means the
+        // tree isn't persisted; backfill it once. Idempotent: present ⇒ skip the write.
+        if len > 0 && store.node(&feed, 0)?.is_none() {
+            store.commit(
+                &feed,
+                Batch {
+                    blocks: Vec::new(),
+                    nodes: frozen,
+                    head: None,
+                },
+            )?;
         }
         Ok(Self {
             keypair,
             store,
             feed,
-            leaves,
             roots,
         })
     }
@@ -136,12 +147,12 @@ impl Log {
 
     /// Number of blocks appended.
     pub fn len(&self) -> usize {
-        self.leaves.len()
+        self.roots.len() as usize
     }
 
     /// Whether the log has no blocks.
     pub fn is_empty(&self) -> bool {
-        self.leaves.is_empty()
+        self.roots.len() == 0
     }
 
     /// A handle to the backing store, so a caller (e.g. a session) can share it with the
@@ -166,10 +177,12 @@ impl Log {
     pub fn try_append(&mut self, block: impl Into<Vec<u8>>) -> StoreResult<usize> {
         let block = block.into();
         let leaf = tree::leaf_hash(&block);
-        let index = self.leaves.len() as u64;
-        // Compute the new head against a prospective accumulator, without mutating self.
+        let index = self.roots.len();
+        // Push into a prospective accumulator — without mutating self — to get the new head
+        // and the nodes this append freezes, then persist block + frozen nodes + head in one
+        // atomic commit. Only on success do we adopt the advanced accumulator.
         let mut roots = self.roots.clone();
-        roots.push(leaf);
+        let frozen = roots.push(leaf);
         let len = index + 1;
         let root = roots.root();
         let signature = self.keypair.sign(&head_message(len, &root));
@@ -182,13 +195,11 @@ impl Log {
             &self.feed,
             Batch {
                 blocks: vec![(index, block)],
-                nodes: Vec::new(), // leaves stay in RAM this phase; the tree isn't persisted
+                nodes: frozen,
                 head: Some(head),
             },
         )?;
-        // Committed — now advance in-RAM state.
         self.roots = roots;
-        self.leaves.push(leaf);
         Ok(index as usize)
     }
 
@@ -205,7 +216,7 @@ impl Log {
 
     /// A signed [`Head`] committing to the log's current length and root.
     pub fn head(&self) -> Head {
-        let len = self.leaves.len() as u64;
+        let len = self.roots.len();
         let root = self.root();
         let signature = self.keypair.sign(&head_message(len, &root));
         Head {
@@ -215,15 +226,15 @@ impl Log {
         }
     }
 
-    /// An inclusion proof for the block at `index` (against the current head),
-    /// or `None` if `index` is out of range.
+    /// An inclusion proof for the block at `index` (against the current head), assembled
+    /// from the persisted frozen nodes + the in-RAM peaks. `None` if `index` is out of
+    /// range or a needed node is missing from the store.
     pub fn proof(&self, index: usize) -> Option<Proof> {
-        if index >= self.leaves.len() {
-            return None;
-        }
-        Some(Proof {
-            siblings: tree::audit_path(&self.leaves, index),
-        })
+        self.roots
+            .proof(index as u64, |idx| {
+                self.store.node(&self.feed, idx).ok().flatten()
+            })
+            .map(|siblings| Proof { siblings })
     }
 }
 
@@ -265,8 +276,9 @@ pub struct Replica {
     store: Arc<dyn FeedStore>,
     feed: FeedKey,
     head: Head,
-    /// Leaf hashes, kept in RAM for O(n) proofs and to verify each [`advance`](Replica::advance).
-    leaves: Vec<Hash>,
+    /// The tree peaks (RAM); its frozen interior nodes live in the store. Used to verify
+    /// each [`advance`](Replica::advance) and answer proofs without holding the leaves.
+    roots: tree::Accumulator,
 }
 
 impl Replica {
@@ -292,8 +304,12 @@ impl Replica {
         if !verify_head(&public_key, &head) || blocks.len() as u64 != head.len {
             return None;
         }
-        let leaves: Vec<Hash> = blocks.iter().map(|b| tree::leaf_hash(b)).collect();
-        if tree::merkle_root(&leaves) != head.root {
+        let mut roots = tree::Accumulator::new();
+        let mut frozen = Vec::new();
+        for b in &blocks {
+            frozen.extend(roots.push(tree::leaf_hash(b)));
+        }
+        if roots.root() != head.root {
             return None;
         }
         let feed = public_key.to_bytes();
@@ -303,7 +319,7 @@ impl Replica {
                 .enumerate()
                 .map(|(i, b)| (i as u64, b))
                 .collect(),
-            nodes: Vec::new(),
+            nodes: frozen,
             head: Some(head.clone()),
         };
         store.commit(&feed, batch).ok()?;
@@ -312,7 +328,7 @@ impl Replica {
             store,
             feed,
             head,
-            leaves,
+            roots,
         })
     }
 
@@ -325,22 +341,34 @@ impl Replica {
         let Some(head) = store.head(&feed)? else {
             return Ok(None);
         };
-        let mut leaves = Vec::with_capacity(head.len as usize);
+        let mut roots = tree::Accumulator::new();
+        let mut frozen = Vec::new();
         for i in 0..head.len {
             let Some(block) = store.block(&feed, i)? else {
                 return Ok(None); // a gap where the head says there's a block: not faithful
             };
-            leaves.push(tree::leaf_hash(&block));
+            frozen.extend(roots.push(tree::leaf_hash(&block)));
         }
-        if !verify_head(&public_key, &head) || tree::merkle_root(&leaves) != head.root {
+        if !verify_head(&public_key, &head) || roots.root() != head.root {
             return Ok(None); // tampered/corrupt on disk — treat as absent, don't serve it
+        }
+        // Backfill the tree nodes if a Phase-A mirror persisted only blocks (see Log).
+        if head.len > 0 && store.node(&feed, 0)?.is_none() {
+            store.commit(
+                &feed,
+                Batch {
+                    blocks: Vec::new(),
+                    nodes: frozen,
+                    head: None,
+                },
+            )?;
         }
         Ok(Some(Replica {
             public_key,
             store,
             feed,
             head,
-            leaves,
+            roots,
         }))
     }
 
@@ -350,11 +378,11 @@ impl Replica {
     }
     /// Number of blocks held.
     pub fn len(&self) -> usize {
-        self.leaves.len()
+        self.roots.len() as usize
     }
     /// Whether the replica holds no blocks.
     pub fn is_empty(&self) -> bool {
-        self.leaves.is_empty()
+        self.roots.len() == 0
     }
 
     /// The block at `index`, if held — an owned copy (the bytes live in the store). A
@@ -373,33 +401,36 @@ impl Replica {
     /// new blocks is an accepted no-op.
     pub fn advance(&mut self, head: Head, new_blocks: Vec<Vec<u8>>) -> bool {
         if !verify_head(&self.public_key, &head)
-            || self.leaves.len() as u64 + new_blocks.len() as u64 != head.len
+            || self.roots.len() + new_blocks.len() as u64 != head.len
         {
             return false;
         }
-        // Compute the combined leaves and check the root *before* mutating, so a
-        // bad advance can't leave a torn replica.
-        let mut leaves = self.leaves.clone();
-        leaves.extend(new_blocks.iter().map(|b| tree::leaf_hash(b)));
-        if tree::merkle_root(&leaves) != head.root {
+        // Push into a clone and check the root *before* mutating, so a bad advance leaves
+        // the replica unchanged; the clone's pushes yield the nodes to persist.
+        let start = self.roots.len();
+        let mut roots = self.roots.clone();
+        let mut frozen = Vec::new();
+        for b in &new_blocks {
+            frozen.extend(roots.push(tree::leaf_hash(b)));
+        }
+        if roots.root() != head.root {
             return false;
         }
-        // Persist the new blocks (at their indices) + head atomically before touching the
-        // in-RAM state, so a store failure leaves the replica exactly as it was.
-        let start = self.leaves.len() as u64;
+        // Persist the new blocks + frozen nodes + head atomically before touching in-RAM
+        // state, so a store failure leaves the replica exactly as it was.
         let batch = Batch {
             blocks: new_blocks
                 .into_iter()
                 .enumerate()
                 .map(|(j, b)| (start + j as u64, b))
                 .collect(),
-            nodes: Vec::new(),
+            nodes: frozen,
             head: Some(head.clone()),
         };
         if self.store.commit(&self.feed, batch).is_err() {
             return false;
         }
-        self.leaves = leaves;
+        self.roots = roots;
         self.head = head;
         true
     }
@@ -413,9 +444,11 @@ impl Source for Replica {
         self.block(index)
     }
     fn proof(&self, index: usize) -> Option<Proof> {
-        (index < self.leaves.len()).then(|| Proof {
-            siblings: tree::audit_path(&self.leaves, index),
-        })
+        self.roots
+            .proof(index as u64, |idx| {
+                self.store.node(&self.feed, idx).ok().flatten()
+            })
+            .map(|siblings| Proof { siblings })
     }
 }
 

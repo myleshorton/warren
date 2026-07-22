@@ -59,6 +59,11 @@ fn split_point(n: usize) -> usize {
 
 /// The Merkle root over `leaves` (each already a [`leaf_hash`]). An empty tree
 /// hashes to `H("")`, matching RFC 6962's empty-tree definition.
+///
+/// The recursive reference definition — the oracle the [`Accumulator`] and the
+/// store-backed [`Accumulator::proof`] are property-tested against. Production paths
+/// maintain the root incrementally (the accumulator), so this is test-only.
+#[cfg(test)]
 pub fn merkle_root(leaves: &[Hash]) -> Hash {
     match leaves.len() {
         0 => hash(&[]),
@@ -73,6 +78,10 @@ pub fn merkle_root(leaves: &[Hash]) -> Hash {
 /// The inclusion (audit) path for leaf `index` in a tree of `leaves`: the sibling
 /// hashes from the leaf up to the root, deepest sibling first. Returns an empty
 /// path for a single-leaf tree. Panics if `index` is out of range.
+///
+/// The recursive reference definition — the oracle [`Accumulator::proof`] (the
+/// store-backed path used in production) is checked byte-for-byte against. Test-only.
+#[cfg(test)]
 pub fn audit_path(leaves: &[Hash], index: usize) -> Vec<Hash> {
     assert!(index < leaves.len(), "leaf index out of range");
     let n = leaves.len();
@@ -134,8 +143,6 @@ impl Accumulator {
     }
 
     /// Leaves pushed so far.
-    // Consumed by Log/Replica in the Phase-B wiring step (they drop their own leaf count).
-    #[allow(dead_code)]
     pub fn len(&self) -> u64 {
         self.count
     }
@@ -205,8 +212,6 @@ impl Accumulator {
     /// frozen perfect-subtree nodes read from `get`; then (2) the peak-bagging siblings —
     /// for a leaf in peak `j` (peaks ordered largest-first, right-recursively bagged into
     /// the root), the bag of every peak right of `j`, then peaks `j-1 … 0`.
-    // Consumed by Log/Replica in the Phase-B wiring step (they proof from the store, not leaves).
-    #[allow(dead_code)]
     pub fn proof(&self, index: u64, get: impl Fn(u64) -> Option<Hash>) -> Option<Vec<Hash>> {
         if index >= self.count {
             return None;

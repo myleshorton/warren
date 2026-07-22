@@ -126,8 +126,9 @@ Sequence and status:
 4. ⏳ **Remaining:** windowed `Session::mirror_feed`/`run_mirror` in `warren` — bootstrap a
    sparse suffix-window replica, then ingest new tail blocks as the author advances and let
    old ones fall out of the window. The fall-out step is retention *policy*, so this lands
-   with Phase D (GC); without it a windowed mirror only ever grows.
-5. ⏳ Soak a suffix-window seeder (RSS + disk bounded by the window).
+   with Phase D (GC); without it a windowed mirror only ever grows. **Specced in
+   `feed-store-phase-d.md`** (step 1), together with GC, at-rest encryption, and the soak.
+5. ⏳ Soak a suffix-window seeder (RSS + disk bounded by the window) — see Phase D.
 
 Serving a sparse holding already works today with no `warren` change: a `Replica::sparse`
 implements `Source`, so `serve_by_key`/`serve_feed_tail` serve whatever window it holds and

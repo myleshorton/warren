@@ -81,6 +81,12 @@ proptest! {
             Message::GetHead,
             Message::Head(server.head()),
             Message::GetBlock { index: idx },
+            Message::GetPeaks,
+            // Served over an arbitrary feed shape, so the peak count (one per set bit of the
+            // length) and the holdings ranges vary across cases.
+            serve_feed(&Message::GetPeaks, &server),
+            Message::GetFeedHave,
+            serve_feed(&Message::GetFeedHave, &server),
             Message::Absent,
         ];
         if !blocks.is_empty() {

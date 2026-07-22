@@ -271,6 +271,23 @@ pub trait Source {
     fn get(&self, index: usize) -> Option<Vec<u8>>;
     /// An inclusion proof for the block at `index` against the head, or `None`.
     fn proof(&self, index: usize) -> Option<Proof>;
+    /// The feed's peak nodes as `(flat index, hash)`, largest peak first — what a sparse
+    /// subscriber needs (with the head) to open a [`Replica::sparse`] and verify blocks it
+    /// later fetches, without downloading the whole feed.
+    fn peaks(&self) -> Vec<(u64, Hash)>;
+    /// The half-open index ranges `[start, end)` this source holds, ascending and
+    /// non-adjacent. The default is the single dense range `[0, len)` — correct for a full
+    /// [`Log`] and a dense [`Replica`]; a *sparse* holder overrides it to report its
+    /// scattered windows. A subscriber intersects these with what it wants so it only asks
+    /// a peer for blocks that peer actually holds.
+    fn held_ranges(&self) -> Vec<(u64, u64)> {
+        let len = self.head().len;
+        if len == 0 {
+            Vec::new()
+        } else {
+            vec![(0, len)]
+        }
+    }
 }
 
 impl Source for Log {
@@ -283,6 +300,10 @@ impl Source for Log {
     fn proof(&self, index: usize) -> Option<Proof> {
         Log::proof(self, index)
     }
+    fn peaks(&self) -> Vec<(u64, Hash)> {
+        Log::peak_nodes(self)
+    }
+    // held_ranges: the default `[0, len)` is exact — a Log is always dense.
 }
 
 /// A verified, read-only copy of *another* owner's feed: their signed [`Head`]
@@ -462,6 +483,39 @@ impl Replica {
         self.store.block(&self.feed, index as u64).ok().flatten()
     }
 
+    /// The replica's peak nodes as `(flat index, hash)`, largest peak first — the O(log n)
+    /// tops of the tree, which a holder re-serves to a downstream sparse subscriber (with
+    /// the head) so it can verify blocks without the whole feed.
+    pub fn peak_nodes(&self) -> Vec<(u64, Hash)> {
+        self.roots.peak_nodes()
+    }
+
+    /// The half-open index ranges this replica actually holds, ascending and coalesced. A
+    /// dense replica returns `[0, len)`; a sparse one (built via [`Replica::sparse`] +
+    /// [`ingest`](Replica::ingest)) returns only the windows it has. Computed by scanning
+    /// block presence in the store — O(len) reads, so a caller that serves it repeatedly
+    /// should cache it.
+    pub fn held_ranges(&self) -> Vec<(u64, u64)> {
+        let len = self.head.len;
+        let mut ranges = Vec::new();
+        let mut start: Option<u64> = None;
+        for i in 0..len {
+            let held = self.store.has_block(&self.feed, i).unwrap_or(false);
+            match (held, start) {
+                (true, None) => start = Some(i),
+                (false, Some(s)) => {
+                    ranges.push((s, i));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(s) = start {
+            ranges.push((s, len));
+        }
+        ranges
+    }
+
     /// Advance to a newer signed `head` by appending `new_blocks` — the blocks from
     /// the current length up to `head.len`, in order. Returns `false` and leaves the
     /// replica **unchanged** unless the result is provably faithful: `head` verifies
@@ -519,6 +573,12 @@ impl Source for Replica {
                 self.store.node(&self.feed, idx).ok().flatten()
             })
             .map(|siblings| Proof { siblings })
+    }
+    fn peaks(&self) -> Vec<(u64, Hash)> {
+        self.peak_nodes()
+    }
+    fn held_ranges(&self) -> Vec<(u64, u64)> {
+        Replica::held_ranges(self)
     }
 }
 

@@ -147,6 +147,31 @@ impl Accumulator {
         self.count
     }
 
+    /// Seed an accumulator for `count` leaves from its persisted **peak** nodes, read via
+    /// `get` (keyed by [`node_index`]). O(log n) reads — the fast open path that avoids
+    /// re-hashing every block. Returns `None` if any peak node is absent (a feed whose tree
+    /// isn't persisted yet), so the caller can fall back to rebuilding from blocks.
+    ///
+    /// The peaks are the set bits of `count`, largest height (leftmost) first; each is
+    /// either a leaf (always persisted) or a completed perfect-subtree root (frozen when it
+    /// completed), so for a Phase-B feed they are all present.
+    pub fn from_peaks(count: u64, get: impl Fn(u64) -> Option<Hash>) -> Option<Accumulator> {
+        let mut peaks: Vec<Option<Hash>> = Vec::new();
+        let mut base = 0u64;
+        for height in (0..u64::BITS).rev() {
+            if (count >> height) & 1 == 0 {
+                continue;
+            }
+            let hash = get(node_index(height, base >> height))?;
+            if peaks.len() <= height as usize {
+                peaks.resize(height as usize + 1, None);
+            }
+            peaks[height as usize] = Some(hash);
+            base += 1u64 << height;
+        }
+        Some(Accumulator { peaks, count })
+    }
+
     /// Append one leaf hash, returning the nodes **frozen** by this push — the leaf plus
     /// any internal node completed as equal-height peaks carry upward — each as its
     /// `(flat-tree index, hash)`, ready to persist. Carries like a binary counter: a new
@@ -323,6 +348,34 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn from_peaks_reconstructs_the_accumulator() {
+        use std::collections::HashMap;
+        for n in 0..=200u64 {
+            let mut built = Accumulator::new();
+            let mut nodes: HashMap<u64, Hash> = HashMap::new();
+            for i in 0..n {
+                for (idx, h) in built.push(leaf_hash(&i.to_le_bytes())) {
+                    nodes.insert(idx, h);
+                }
+            }
+            let seeded = Accumulator::from_peaks(n, |idx| nodes.get(&idx).copied())
+                .expect("all peak nodes present for a fully-pushed feed");
+            assert_eq!(seeded.root(), built.root(), "root mismatch at n={n}");
+            assert_eq!(seeded.len(), n);
+            if n > 0 {
+                let i = n / 2;
+                assert_eq!(
+                    seeded.proof(i, |idx| nodes.get(&idx).copied()),
+                    built.proof(i, |idx| nodes.get(&idx).copied()),
+                    "proof mismatch at n={n} i={i}"
+                );
+            }
+        }
+        // A missing peak node yields None so the caller falls back to a block rebuild.
+        assert!(Accumulator::from_peaks(5, |_| None).is_none());
     }
 
     #[test]

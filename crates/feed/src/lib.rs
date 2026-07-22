@@ -76,17 +76,14 @@ pub struct Proof {
 ///
 /// # Cost
 ///
-/// [`Log::append`] is O(1) amortized (O(log n) worst case, when the accumulator
-/// carries a run of equal-height peaks), and [`Log::root`] / [`Log::head`] are
-/// **O(log n)**: the root is maintained by an incremental Merkle accumulator that
-/// keeps only the right-spine subtree roots, so a commit doesn't rescan the whole
-/// log. Per-block
-/// inclusion proofs ([`Log::proof`]) still recompute their audit path from the
-/// leaves and are O(n); making those O(log n) would mean retaining every internal
-/// node, which is deferred.
+/// [`Log::append`] is O(1) amortized, and [`Log::root`] / [`Log::head`] are **O(log n)**:
+/// the root is maintained by an incremental Merkle accumulator that keeps only the
+/// right-spine peaks in RAM. Per-block inclusion proofs ([`Log::proof`]) are **O(log n)**
+/// too — the tree's frozen interior nodes are persisted in the store and read on demand,
+/// so a proof holds neither the leaves nor the whole tree in memory.
 pub struct Log {
     keypair: Keypair,
-    /// Where blocks (and, later, the tree) live — a fresh [`MemStore`] for [`Log::new`],
+    /// Where blocks and the Merkle tree nodes live — a fresh [`MemStore`] for [`Log::new`],
     /// or a shared/persistent backend via [`Log::with_store`].
     store: Arc<dyn FeedStore>,
     feed: FeedKey,
@@ -94,6 +91,43 @@ pub struct Log {
     /// live in the store. Together they answer `root`/`head`/`proof` without holding the
     /// leaves — so a large feed isn't RAM-bound and a proof is O(log n) store reads.
     roots: tree::Accumulator,
+}
+
+/// Seed a tree accumulator for a feed of `len` blocks held in `store`.
+///
+/// Fast path: read just the peak nodes (O(log n)) if the tree is persisted. Fallback: walk
+/// the blocks once, rebuild the peaks, and backfill the `nodes` table — the one-time O(n)
+/// cost for a Phase-A feed (blocks but no persisted tree) or a fresh open. After the
+/// backfill, every later open takes the fast path.
+fn seed_accumulator(
+    store: &Arc<dyn FeedStore>,
+    feed: &FeedKey,
+    len: u64,
+) -> StoreResult<tree::Accumulator> {
+    if let Some(acc) =
+        tree::Accumulator::from_peaks(len, |idx| store.node(feed, idx).ok().flatten())
+    {
+        return Ok(acc);
+    }
+    let mut roots = tree::Accumulator::new();
+    let mut frozen = Vec::new();
+    for i in 0..len {
+        let block = store
+            .block(feed, i)?
+            .ok_or_else(|| StoreError::Backend(format!("dense feed missing block {i} of {len}")))?;
+        frozen.extend(roots.push(tree::leaf_hash(&block)));
+    }
+    if !frozen.is_empty() {
+        store.commit(
+            feed,
+            Batch {
+                blocks: Vec::new(),
+                nodes: frozen,
+                head: None,
+            },
+        )?;
+    }
+    Ok(roots)
 }
 
 impl Log {
@@ -104,34 +138,14 @@ impl Log {
             .expect("opening a log over an empty MemStore never fails")
     }
 
-    /// Open a log over `store`, rebuilding the in-RAM peaks from the stored blocks — so a
-    /// persisted feed reopens intact and new appends land in `store`. If the tree nodes
-    /// aren't persisted yet (a fresh Phase-B open, or a Phase-A feed whose `nodes` table is
-    /// still empty), they're backfilled here — a one-time O(n) pass; later opens still walk
-    /// the blocks to seed the peaks (an O(log n) peak-read open is a further optimization).
+    /// Open a log over `store`, seeding the in-RAM peaks from the persisted tree (O(log n)
+    /// peak reads) — so a persisted feed reopens intact and new appends land in `store`. A
+    /// Phase-A feed (blocks but no tree yet) is backfilled once on first open; see
+    /// [`seed_accumulator`].
     pub fn with_store(keypair: Keypair, store: Arc<dyn FeedStore>) -> StoreResult<Self> {
         let feed = keypair.public().to_bytes();
         let len = store.contiguous_len(&feed)?;
-        let mut roots = tree::Accumulator::new();
-        let mut frozen = Vec::new();
-        for i in 0..len {
-            let block = store.block(&feed, i)?.ok_or_else(|| {
-                StoreError::Backend(format!("dense feed missing block {i} of {len}"))
-            })?;
-            frozen.extend(roots.push(tree::leaf_hash(&block)));
-        }
-        // Node 0 is leaf 0 — always frozen for a non-empty feed — so its absence means the
-        // tree isn't persisted; backfill it once. Idempotent: present ⇒ skip the write.
-        if len > 0 && store.node(&feed, 0)?.is_none() {
-            store.commit(
-                &feed,
-                Batch {
-                    blocks: Vec::new(),
-                    nodes: frozen,
-                    head: None,
-                },
-            )?;
-        }
+        let roots = seed_accumulator(&store, &feed, len)?;
         Ok(Self {
             keypair,
             store,
@@ -341,27 +355,14 @@ impl Replica {
         let Some(head) = store.head(&feed)? else {
             return Ok(None);
         };
-        let mut roots = tree::Accumulator::new();
-        let mut frozen = Vec::new();
-        for i in 0..head.len {
-            let Some(block) = store.block(&feed, i)? else {
-                return Ok(None); // a gap where the head says there's a block: not faithful
-            };
-            frozen.extend(roots.push(tree::leaf_hash(&block)));
-        }
+        // Seed the peaks (O(log n) if the tree is persisted, else a one-time block rebuild).
+        // Any reconstruction problem (missing block/node) is treated as "not faithful".
+        let roots = match seed_accumulator(&store, &feed, head.len) {
+            Ok(roots) => roots,
+            Err(_) => return Ok(None),
+        };
         if !verify_head(&public_key, &head) || roots.root() != head.root {
             return Ok(None); // tampered/corrupt on disk — treat as absent, don't serve it
-        }
-        // Backfill the tree nodes if a Phase-A mirror persisted only blocks (see Log).
-        if head.len > 0 && store.node(&feed, 0)?.is_none() {
-            store.commit(
-                &feed,
-                Batch {
-                    blocks: Vec::new(),
-                    nodes: frozen,
-                    head: None,
-                },
-            )?;
         }
         Ok(Some(Replica {
             public_key,

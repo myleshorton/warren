@@ -144,6 +144,12 @@ impl Log {
         self.leaves.is_empty()
     }
 
+    /// A handle to the backing store, so a caller (e.g. a session) can share it with the
+    /// feeds it mirrors — keeping the own log and every mirror in one store.
+    pub fn store(&self) -> Arc<dyn FeedStore> {
+        self.store.clone()
+    }
+
     /// Append a block, returning its index. Persists to the backing store atomically;
     /// panics if the store fails — impossible for the default in-memory backend. Use
     /// [`try_append`](Log::try_append) where a disk-backed store's failure must surface.
@@ -308,6 +314,34 @@ impl Replica {
             head,
             leaves,
         })
+    }
+
+    /// Re-open a replica already held in `store` (no re-commit) — how a mirror is
+    /// restored from disk on restart. Reads the stored head + blocks, rebuilds the in-RAM
+    /// leaves, and verifies them against the head. Returns `Ok(None)` if the store holds
+    /// no head for this feed, or if the stored copy fails verification (corrupt on disk).
+    pub fn open(public_key: PublicKey, store: Arc<dyn FeedStore>) -> StoreResult<Option<Replica>> {
+        let feed = public_key.to_bytes();
+        let Some(head) = store.head(&feed)? else {
+            return Ok(None);
+        };
+        let mut leaves = Vec::with_capacity(head.len as usize);
+        for i in 0..head.len {
+            let Some(block) = store.block(&feed, i)? else {
+                return Ok(None); // a gap where the head says there's a block: not faithful
+            };
+            leaves.push(tree::leaf_hash(&block));
+        }
+        if !verify_head(&public_key, &head) || tree::merkle_root(&leaves) != head.root {
+            return Ok(None); // tampered/corrupt on disk — treat as absent, don't serve it
+        }
+        Ok(Some(Replica {
+            public_key,
+            store,
+            feed,
+            head,
+            leaves,
+        }))
     }
 
     /// The replicated feed's owner (the key its head is verified against).
@@ -775,6 +809,46 @@ mod tests {
         // A non-contiguous advance (wrong new-block count) is rejected, unchanged.
         assert!(!replica.advance(log.head(), vec![b"extra".to_vec()]));
         assert_eq!(replica.len(), 5);
+    }
+
+    #[test]
+    fn replica_reopens_from_its_store() {
+        // A mirror persisted in a store is restored on restart with no re-commit:
+        // Replica::open rebuilds the same head + blocks + verifying proofs.
+        let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
+        let src = log_with(5);
+        let pk = src.public_key();
+        let head = src.head();
+        let blocks: Vec<Vec<u8>> = (0..5).map(|i| src.get(i).unwrap()).collect();
+
+        // Mirror into the store, then re-open from the same store.
+        let mirror = Replica::with_store(pk, head.clone(), blocks, store.clone()).unwrap();
+        assert_eq!(mirror.len(), 5);
+        let reopened = Replica::open(pk, store)
+            .unwrap()
+            .expect("a persisted replica reopens");
+        assert_eq!(reopened.len(), 5);
+        assert_eq!(
+            reopened.head(),
+            head,
+            "reopened head matches — tree rebuilt exactly"
+        );
+        assert_eq!(reopened.block(3).as_deref(), Some([3u8; 4].as_slice()));
+        let proof = reopened.proof(3).unwrap();
+        assert!(verify_block(
+            &pk,
+            &head,
+            3,
+            &reopened.get(3).unwrap(),
+            &proof
+        ));
+    }
+
+    #[test]
+    fn replica_open_absent_feed_is_none() {
+        let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
+        let pk = Keypair::from_seed(&[0x33; 32]).public();
+        assert!(Replica::open(pk, store).unwrap().is_none());
     }
 
     #[test]

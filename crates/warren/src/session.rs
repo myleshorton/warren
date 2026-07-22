@@ -88,10 +88,44 @@ pub struct Session {
     /// mirror store-and-forward layer — we keep an author's feed available and
     /// tailable even while the author is offline.
     mirrored: Arc<StdMutex<HashMap<String, Mirror>>>,
+    /// The shared feed store (redb) backing the own log and every mirror — so a mirror we
+    /// hold persists to disk and is restored on restart, and so we serve it from there.
+    feed_store: Arc<dyn feed::FeedStore>,
 }
 
 /// A mirrored feed: the replica we keep current, and the signal fired when it grows.
 type Mirror = (Arc<StdMutex<feed::Replica>>, Arc<tokio::sync::Notify>);
+
+/// Restore mirrors persisted in `feed_store` (every feed except our own) into `mirrored`,
+/// so a post we mirrored survives a restart with no re-fetch. Best-effort: a feed whose
+/// on-disk copy is absent or fails verification is skipped.
+fn restore_mirrors(
+    feed_store: &Arc<dyn feed::FeedStore>,
+    own: &crypto::PublicKey,
+    mirrored: &Arc<StdMutex<HashMap<String, Mirror>>>,
+) {
+    let own_bytes = own.to_bytes();
+    let Ok(feeds) = feed_store.feeds() else {
+        return;
+    };
+    for feed in feeds {
+        if feed == own_bytes {
+            continue; // our own log, not a mirror
+        }
+        let Ok(pubkey) = crypto::PublicKey::from_bytes(&feed) else {
+            continue;
+        };
+        if let Ok(Some(replica)) = feed::Replica::open(pubkey, feed_store.clone()) {
+            mirrored.lock().expect("mirrored").insert(
+                util::to_hex(&feed),
+                (
+                    Arc::new(StdMutex::new(replica)),
+                    Arc::new(tokio::sync::Notify::new()),
+                ),
+            );
+        }
+    }
+}
 
 impl Session {
     /// Build a session over already-loaded state (see [`store::rebuild`] for the
@@ -107,6 +141,12 @@ impl Session {
         held: Arc<StdMutex<Vec<crypto::Hash>>>,
         clip_keys: Arc<StdMutex<HashMap<String, Enc>>>,
     ) -> Self {
+        // Share the log's backing store with the mirror layer, and restore any mirrors it
+        // already holds on disk (so mirrored posts survive a restart, not just an author
+        // going offline mid-session).
+        let feed_store = log.lock().expect("feed log").store();
+        let mirrored = Arc::new(StdMutex::new(HashMap::new()));
+        restore_mirrors(&feed_store, &feed_pubkey, &mirrored);
         Self {
             node,
             log,
@@ -117,7 +157,8 @@ impl Session {
             held,
             clip_keys,
             appended: Arc::new(tokio::sync::Notify::new()),
-            mirrored: Arc::new(StdMutex::new(HashMap::new())),
+            mirrored,
+            feed_store,
         }
     }
 
@@ -423,20 +464,31 @@ impl Session {
         feed_key: crypto::PublicKey,
     ) -> Option<Mirror> {
         let hex = util::to_hex(&feed_key.to_bytes());
-        if let Some(entry) = self.mirrored.lock().expect("mirrored").get(&hex).cloned() {
-            return Some(entry);
-        }
-        let replica =
-            protocol::fetch_replica(&self.node, provider, feed_key, &transfer::Config::default())
+        let existing = self.mirrored.lock().expect("mirrored").get(&hex).cloned();
+        let entry = match existing {
+            Some(entry) => entry, // already held (or restored from disk on boot)
+            None => {
+                let replica = protocol::fetch_replica(
+                    &self.node,
+                    provider,
+                    feed_key,
+                    &transfer::Config::default(),
+                    self.feed_store.clone(),
+                )
                 .await?;
-        let entry: Mirror = (
-            Arc::new(StdMutex::new(replica)),
-            Arc::new(tokio::sync::Notify::new()),
-        );
-        self.mirrored
-            .lock()
-            .expect("mirrored")
-            .insert(hex, entry.clone());
+                let entry: Mirror = (
+                    Arc::new(StdMutex::new(replica)),
+                    Arc::new(tokio::sync::Notify::new()),
+                );
+                self.mirrored
+                    .lock()
+                    .expect("mirrored")
+                    .insert(hex, entry.clone());
+                entry
+            }
+        };
+        // Announce (idempotent) whether freshly fetched or already held — including a
+        // mirror restored from disk on boot — so we're a discoverable provider for it.
         let _ = self
             .node
             .announce(self.feed_topic(&feed_key.to_bytes()))

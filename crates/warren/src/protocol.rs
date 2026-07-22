@@ -233,6 +233,7 @@ pub async fn fetch_replica(
     provider: NodeId,
     feed_key: crypto::PublicKey,
     cfg: &transfer::Config,
+    store: std::sync::Arc<dyn feed::FeedStore>,
 ) -> Option<feed::Replica> {
     let mut ch = secure_dial(node, provider).await.ok()?;
     let key_bytes = feed_key.to_bytes();
@@ -252,7 +253,7 @@ pub async fn fetch_replica(
     let (head, blocks) = transfer::download_feed_full(&mut ch, feed_key, cfg)
         .await
         .ok()?;
-    feed::Replica::new(feed_key, head?, blocks)
+    feed::Replica::with_store(feed_key, head?, blocks, store)
 }
 
 /// Connect to `peer`, send the feed-style request kind `req`, receive the peer's

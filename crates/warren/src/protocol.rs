@@ -256,6 +256,51 @@ pub async fn fetch_replica(
     feed::Replica::with_store(feed_key, head?, blocks, store)
 }
 
+/// Bootstrap a **windowed** [`feed::Replica`] of `feed_key` from `provider`, holding only
+/// the feed's last `window` blocks — what a bounded seeder mirrors instead of the whole
+/// feed. Handshakes by key, fetches the suffix window (head + peaks + the last `window`
+/// blocks, each verified against the head), and seeds a [`feed::Replica::sparse`], ingesting
+/// the window. Returns `None` if the provider is unreachable, the peaks don't reproduce the
+/// signed root, or any block fails to verify. `window == 0` yields a shape-only replica
+/// (head + peaks, no blocks) — a valid mirror that can ingest later. Keep it current with
+/// [`Session::run_mirror_window`](crate::Session::run_mirror_window).
+pub async fn fetch_replica_window(
+    node: &Node,
+    provider: NodeId,
+    feed_key: crypto::PublicKey,
+    window: u64,
+    cfg: &transfer::Config,
+    store: std::sync::Arc<dyn feed::FeedStore>,
+) -> Option<feed::Replica> {
+    let mut ch = secure_dial(node, provider).await.ok()?;
+    let key_bytes = feed_key.to_bytes();
+    let mut req = Vec::with_capacity(1 + key_bytes.len());
+    req.push(REQ_FEED_KEY);
+    req.extend_from_slice(&key_bytes);
+    ch.send(&req).await.ok()?;
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(cfg.request_timeout * 2, ch.recv(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    if n < 32 || buf[..32] != key_bytes[..] {
+        return None;
+    }
+    let (data, _missing) = transfer::download_feed_suffix(&mut ch, feed_key, window, cfg)
+        .await
+        .ok()?;
+    // Seed the sparse replica from the head + peaks (rejects peaks that don't reproduce the
+    // signed root), then ingest the window (each block re-verified on the way in).
+    let mut replica = feed::Replica::sparse(feed_key, data.head, data.peaks, store)?;
+    for (index, block, proof) in data.blocks {
+        if !replica.ingest(index, block, &proof) {
+            return None; // a block that doesn't verify poisons the bootstrap
+        }
+    }
+    Some(replica)
+}
+
 /// Connect to `peer`, send the feed-style request kind `req`, receive the peer's
 /// 32-byte feed public key, and download + verify the feed it serves. Returns the
 /// raw signed blocks plus the key they were verified against. Used both for the

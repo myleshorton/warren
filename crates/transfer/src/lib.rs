@@ -216,7 +216,29 @@ pub async fn download_feed_window<L: Link>(
     want: impl IntoIterator<Item = u64>,
     cfg: &Config,
 ) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
-    let mut w = FeedWindow::new(public_key, want);
+    drive_feed_window(channel, FeedWindow::new(public_key, want), cfg).await
+}
+
+/// Like [`download_feed_window`], but keep the feed's **last `window` blocks** — the wanted
+/// indices are derived from the head once known, so the caller needn't learn the length
+/// first. The one-shot fetch a suffix-window mirror does before it starts tailing;
+/// `window == 0` fetches only the head + peaks (a shape-only open).
+pub async fn download_feed_suffix<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    window: u64,
+    cfg: &Config,
+) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
+    drive_feed_window(channel, FeedWindow::suffix(public_key, window), cfg).await
+}
+
+/// Drive a [`FeedWindow`] to completion over `channel`, returning the verified window and
+/// the wanted indices this peer couldn't serve (for the caller to fetch elsewhere).
+async fn drive_feed_window<L: Link>(
+    channel: &mut L,
+    mut w: FeedWindow,
+    cfg: &Config,
+) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
     let mut wire = Wire::new(
         channel,
         cfg.initial_rtt,

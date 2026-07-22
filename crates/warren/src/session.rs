@@ -496,6 +496,51 @@ impl Session {
         Some(entry)
     }
 
+    /// Begin a **windowed** mirror of `feed_key`: like [`Self::mirror_feed`], but bootstrap a
+    /// *sparse* replica holding only the feed's last `window` blocks — the bounded-footprint
+    /// choice for a large media feed (a small feed just uses [`Self::mirror_feed`]). Serving
+    /// is unchanged: the sparse replica is a [`feed::Source`], so [`Self::serve_by_key`]
+    /// serves whatever window it holds and answers `Absent` for the rest. Pair with
+    /// [`Self::run_mirror_window`] (spawned) to keep the window current as the author grows.
+    /// Idempotent: a feed we already mirror returns its handles (with its existing window).
+    pub async fn mirror_feed_window(
+        &self,
+        provider: swarm::NodeId,
+        feed_key: crypto::PublicKey,
+        window: u64,
+    ) -> Option<Mirror> {
+        let hex = util::to_hex(&feed_key.to_bytes());
+        let existing = self.mirrored.lock().expect("mirrored").get(&hex).cloned();
+        let entry = match existing {
+            Some(entry) => entry, // already held (dense or windowed) — reuse it
+            None => {
+                let replica = protocol::fetch_replica_window(
+                    &self.node,
+                    provider,
+                    feed_key,
+                    window,
+                    &transfer::Config::default(),
+                    self.feed_store.clone(),
+                )
+                .await?;
+                let entry: Mirror = (
+                    Arc::new(StdMutex::new(replica)),
+                    Arc::new(tokio::sync::Notify::new()),
+                );
+                self.mirrored
+                    .lock()
+                    .expect("mirrored")
+                    .insert(hex, entry.clone());
+                entry
+            }
+        };
+        let _ = self
+            .node
+            .announce(self.feed_topic(&feed_key.to_bytes()))
+            .await;
+        Some(entry)
+    }
+
     /// A snapshot of every mirrored feed's blocks, each paired with its author's feed
     /// key — so an app can render content we hold on an author's behalf even while the
     /// author is offline (the durability [`Self::mirror_feed`] + [`Self::run_mirror`]
@@ -537,6 +582,76 @@ impl Session {
                     &self.node, p.id, feed_key, &replica, &appended, &cfg,
                 )
                 .await;
+            }
+            tokio::time::sleep(RESUBSCRIBE_BACKOFF).await;
+        }
+    }
+
+    /// Keep a **windowed** mirror current, forever: as the author's feed grows, refresh the
+    /// held window to the last `window` blocks and prune the rest, so RSS and disk stay
+    /// bounded. Each round, across the feed's providers: cheaply probe the provider's current
+    /// head (a `window == 0` fetch — head + peaks, no blocks); if it has grown past what we
+    /// hold, re-fetch the last `window` blocks, swap in the fresh sparse replica, prune the
+    /// now-out-of-window prefix from the store, and fire `appended` so our own subscribers
+    /// are pushed at once. Spawn this after [`Self::mirror_feed_window`].
+    ///
+    /// (The refresh re-fetches the whole window on a growth event rather than just the new
+    /// tail — a follow-up can make it incremental — but it only pays that on actual growth,
+    /// and the window is bounded, so the cost is capped.)
+    pub async fn run_mirror_window(
+        &self,
+        feed_key: crypto::PublicKey,
+        replica: Arc<StdMutex<feed::Replica>>,
+        appended: Arc<tokio::sync::Notify>,
+        window: u64,
+    ) {
+        let cfg = transfer::Config::default();
+        let me = self.node.id();
+        let topic = self.feed_topic(&feed_key.to_bytes());
+        let store = self.feed_store.clone();
+        loop {
+            let providers = self.node.lookup(topic).await.unwrap_or_default();
+            for p in providers {
+                if p.id == me {
+                    continue;
+                }
+                // Cheap head probe: head + peaks, no blocks.
+                let Some(probe) = protocol::fetch_replica_window(
+                    &self.node,
+                    p.id,
+                    feed_key,
+                    0,
+                    &cfg,
+                    store.clone(),
+                )
+                .await
+                else {
+                    continue;
+                };
+                let probe_len = probe.len() as u64;
+                let held_len = replica.lock().expect("replica").len() as u64;
+                if probe_len <= held_len {
+                    continue; // this provider has nothing newer than what we hold
+                }
+                // The author grew: re-fetch the last `window` blocks and swap them in.
+                if let Some(fresh) = protocol::fetch_replica_window(
+                    &self.node,
+                    p.id,
+                    feed_key,
+                    window,
+                    &cfg,
+                    store.clone(),
+                )
+                .await
+                {
+                    {
+                        let mut r = replica.lock().expect("replica");
+                        *r = fresh;
+                        // Reclaim the prefix that has fallen out of the window.
+                        r.prune(probe_len.saturating_sub(window));
+                    }
+                    appended.notify_waiters(); // wake subscribers tailing *this* mirror
+                }
             }
             tokio::time::sleep(RESUBSCRIBE_BACKOFF).await;
         }

@@ -556,6 +556,9 @@ pub struct FeedWindow {
     missing: HashSet<u64>,
     /// Request cursor into `want`.
     cursor: usize,
+    /// Suffix mode: keep the last `window` blocks. `want` is empty until the head arrives,
+    /// then filled with `[len - window, len)`. `None` for an explicit index set.
+    window: Option<u64>,
 }
 
 impl FeedWindow {
@@ -575,6 +578,26 @@ impl FeedWindow {
             received: HashMap::new(),
             missing: HashSet::new(),
             cursor: 0,
+            window: None,
+        }
+    }
+
+    /// Begin a windowed sync that keeps the feed's **last `window` blocks**. Unlike
+    /// [`new`](FeedWindow::new), the wanted indices aren't known up front — they're derived
+    /// as `[len - window, len)` once the head's length arrives. `window == 0` fetches only
+    /// the head and peaks (a shape-only open, holding no blocks). This is how a suffix-window
+    /// mirror bootstraps against a feed whose length it doesn't yet know.
+    pub fn suffix(public_key: PublicKey, window: u64) -> Self {
+        Self {
+            public_key,
+            head: None,
+            peaks: None,
+            have_done: false,
+            want: Vec::new(),
+            received: HashMap::new(),
+            missing: HashSet::new(),
+            cursor: 0,
+            window: Some(window),
         }
     }
 
@@ -617,6 +640,10 @@ impl FeedWindow {
                 }
                 if !verify_head(&self.public_key, head) {
                     return Err(SyncError::BadHead);
+                }
+                // Suffix mode: now that the length is known, want the last `window` blocks.
+                if let Some(window) = self.window {
+                    self.want = (head.len.saturating_sub(window)..head.len).collect();
                 }
                 self.head = Some(head.clone());
                 Ok(())
@@ -1352,6 +1379,52 @@ mod tests {
             data.push(0xff);
         }
         assert_eq!(w.handle_response(&bad), Err(SyncError::BadBlock));
+    }
+
+    /// Drive a suffix-window sync to completion, returning the window.
+    fn suffix_sync(server: &Log, pk: PublicKey, window: u64) -> WindowData {
+        let mut w = FeedWindow::suffix(pk, window);
+        while let Some(request) = w.poll_request() {
+            w.handle_response(&serve_feed(&request, server)).unwrap();
+        }
+        assert!(w.is_complete());
+        w.into_window().unwrap()
+    }
+
+    #[test]
+    fn suffix_window_fetches_the_last_n_blocks() {
+        // A suffix mirror doesn't know the length up front — it derives the window from the
+        // head, then fetches exactly the last N.
+        let server = log_with(20, 0x64);
+        let window = suffix_sync(&server, server.public_key(), 5);
+        assert_eq!(window.head.len, 20);
+        assert_eq!(
+            window.blocks.iter().map(|(i, _, _)| *i).collect::<Vec<_>>(),
+            vec![15, 16, 17, 18, 19],
+            "the last five blocks"
+        );
+    }
+
+    #[test]
+    fn suffix_window_wider_than_the_feed_takes_all_of_it() {
+        let server = log_with(3, 0x65);
+        let window = suffix_sync(&server, server.public_key(), 100);
+        assert_eq!(
+            window.blocks.iter().map(|(i, _, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2],
+            "a window wider than the feed clamps to the whole feed"
+        );
+    }
+
+    #[test]
+    fn suffix_window_zero_holds_no_blocks() {
+        // window == 0 is a shape-only open: head + peaks, no blocks — enough to build a
+        // sparse replica that ingests later.
+        let server = log_with(8, 0x66);
+        let window = suffix_sync(&server, server.public_key(), 0);
+        assert_eq!(window.head.len, 8);
+        assert!(window.blocks.is_empty());
+        assert!(!window.peaks.is_empty(), "peaks are still fetched");
     }
 
     /// Publish a blob into a store the server can serve: chunks plus the manifest

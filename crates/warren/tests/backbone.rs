@@ -230,3 +230,96 @@ async fn a_mirror_keeps_a_feed_tailable_after_its_author_goes_offline() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_windowed_mirror_holds_and_re_serves_only_its_suffix_window() {
+    // A bounded seeder mirrors only a feed's tail window, and a *downstream* windowed mirror
+    // can re-fetch that window from it — all while the author is offline. This proves the
+    // whole Phase C+D path end to end over a real backbone: fetch_replica_window builds a
+    // sparse replica, serve_by_key serves it (peaks + held-range + windowed blocks), and a
+    // second windowed mirror bootstraps off the first.
+    let (boot, _peers) = network(4).await;
+    let bootstrap = boot.contact();
+
+    // --- Author: a 10-block feed, announced + served by key. ---
+    let (author, author_key) = make_session(joined(bootstrap, id(1)).await, [0xA1; 32]);
+    {
+        let log = author.log();
+        let mut g = log.lock().expect("log");
+        for i in 0..10 {
+            g.append(format!("msg {i}").into_bytes());
+        }
+    }
+    let author_id = author.node.id();
+    timeout(T, author.node.announce(author_id))
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(T, author.node.announce(author.own_feed_topic()))
+        .await
+        .unwrap()
+        .unwrap();
+    let author_serve = spawn_serve_by_key(author.clone());
+
+    // --- Mirror A: mirror only the last 4 blocks [6, 10). ---
+    let (mirror_a, _ka) = make_session(joined(bootstrap, id(2)).await, [0xB2; 32]);
+    let mirror_a_id = mirror_a.node.id();
+    timeout(T, mirror_a.node.announce(mirror_a_id))
+        .await
+        .unwrap()
+        .unwrap();
+    let (replica_a, _appended_a) =
+        timeout(T, mirror_a.mirror_feed_window(author_id, author_key, 4))
+            .await
+            .unwrap()
+            .expect("windowed mirror bootstraps its suffix window from the author");
+    {
+        let r = replica_a.lock().expect("replica");
+        assert_eq!(r.len(), 10, "the mirror knows the feed's full length");
+        assert_eq!(
+            r.held_ranges(),
+            vec![(6, 10)],
+            "but holds only the last-4 window"
+        );
+    }
+    // mirrored_records exposes exactly the window (blocks 6..10), tagged with the author.
+    let mut held: Vec<Vec<u8>> = mirror_a
+        .mirrored_records()
+        .into_iter()
+        .map(|(block, key)| {
+            assert_eq!(key.to_bytes(), author_key.to_bytes());
+            block
+        })
+        .collect();
+    held.sort();
+    let want: Vec<Vec<u8>> = (6..10).map(|i| format!("msg {i}").into_bytes()).collect();
+    assert_eq!(held, want, "the windowed mirror exposes only its window");
+    let _mirror_a_serve = spawn_serve_by_key(mirror_a.clone());
+
+    // --- The author goes offline. ---
+    author_serve.abort();
+    drop(author);
+
+    // --- Mirror B: bootstrap the SAME window from mirror A (the author is gone), proving
+    // A serves its sparse window over the network. ---
+    let (mirror_b, _kb) = make_session(joined(bootstrap, id(3)).await, [0xC3; 32]);
+    timeout(T, mirror_b.node.announce(mirror_b.node.id()))
+        .await
+        .unwrap()
+        .unwrap();
+    let (replica_b, _appended_b) =
+        timeout(T, mirror_b.mirror_feed_window(mirror_a_id, author_key, 4))
+            .await
+            .unwrap()
+            .expect("a downstream windowed mirror bootstraps off mirror A");
+    let r = replica_b.lock().expect("replica");
+    assert_eq!(r.len(), 10, "B learns the full length from A's head");
+    assert_eq!(r.held_ranges(), vec![(6, 10)], "B holds the same window");
+    for i in 6..10u64 {
+        assert_eq!(
+            r.block(i as usize).as_deref(),
+            Some(format!("msg {i}").as_bytes()),
+            "block {i} re-served by mirror A matches the author's original"
+        );
+    }
+}

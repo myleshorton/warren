@@ -44,6 +44,41 @@ fn node_index(height: u32, offset: u64) -> u64 {
     (offset << (height + 1)) + (1 << height) - 1
 }
 
+/// The height of the peak (perfect subtree) containing leaf `index` in a feed of `len`
+/// leaves — the peaks being the set bits of `len`, largest (leftmost) first.
+fn peak_height(len: u64, index: u64) -> u32 {
+    let mut base = 0u64;
+    for height in (0..u64::BITS).rev() {
+        if (len >> height) & 1 == 0 {
+            continue;
+        }
+        if index >= base && index < base + (1u64 << height) {
+            return height;
+        }
+        base += 1u64 << height;
+    }
+    0 // index out of range — caller shouldn't reach this
+}
+
+/// Split a received audit `proof` for leaf `index` (in a feed of `len` leaves) into the
+/// **within-peak** sibling nodes it should persist, as `(flat index, hash)`.
+///
+/// These are the frozen, stable part of a proof — the first `height(peak(index))` siblings,
+/// whose flat indices are the same ones [`Accumulator::proof`] reads. A sparse holder
+/// stores them so it can re-serve this block's proof later. The remaining (bagging)
+/// siblings are length-dependent — derived from the peaks — so they are dropped here rather
+/// than persisted under a flat index they don't stably own.
+#[allow(dead_code)] // consumed by the sparse-ingest step (Phase C wiring)
+pub fn proof_nodes(len: u64, index: u64, proof: &[Hash]) -> Vec<(u64, Hash)> {
+    let within = peak_height(len, index) as usize;
+    proof
+        .iter()
+        .take(within)
+        .enumerate()
+        .map(|(d, hash)| (node_index(d as u32, (index >> d) ^ 1), *hash))
+        .collect()
+}
+
 /// The largest power of two strictly less than `n` (for `n >= 2`).
 ///
 /// Computed in constant time from the bit width: doubling `k` in a loop would
@@ -376,6 +411,44 @@ mod tests {
         }
         // A missing peak node yields None so the caller falls back to a block rebuild.
         assert!(Accumulator::from_peaks(5, |_| None).is_none());
+    }
+
+    #[test]
+    fn proof_nodes_round_trip_lets_a_sparse_holder_reserve() {
+        // A sparse holder keeps the peaks (from_peaks) plus, per block it ingests, only
+        // that block's within-peak nodes (from proof_nodes). It must then re-emit the
+        // *identical* proof — this is the ingest crux Phase C rests on.
+        use std::collections::HashMap;
+        for n in 1..=128u64 {
+            let mut full = Accumulator::new();
+            let mut full_nodes: HashMap<u64, Hash> = HashMap::new();
+            let mut ls: Vec<Hash> = Vec::new();
+            for i in 0..n {
+                let leaf = leaf_hash(&i.to_le_bytes());
+                for (idx, h) in full.push(leaf) {
+                    full_nodes.insert(idx, h);
+                }
+                ls.push(leaf);
+            }
+            let root = merkle_root(&ls);
+            let sparse_peaks =
+                Accumulator::from_peaks(n, |idx| full_nodes.get(&idx).copied()).unwrap();
+            for i in 0..n {
+                let want = full.proof(i, |idx| full_nodes.get(&idx).copied()).unwrap();
+                // Ingest block i: store only its within-peak nodes.
+                let sparse: HashMap<u64, Hash> = proof_nodes(n, i, &want).into_iter().collect();
+                // Re-emit from peaks (accumulator) + the ingested within-peak nodes only.
+                let got = sparse_peaks
+                    .proof(i, |idx| sparse.get(&idx).copied())
+                    .expect("sparse holder re-emits the proof");
+                assert_eq!(got, want, "sparse re-emit != original at n={n} i={i}");
+                assert_eq!(
+                    root_from_path(ls[i as usize], i as usize, n as usize, &got),
+                    Some(root),
+                    "re-emitted proof fails to verify at n={n} i={i}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -68,7 +68,6 @@ fn peak_height(len: u64, index: u64) -> u32 {
 /// stores them so it can re-serve this block's proof later. The remaining (bagging)
 /// siblings are length-dependent — derived from the peaks — so they are dropped here rather
 /// than persisted under a flat index they don't stably own.
-#[allow(dead_code)] // consumed by the sparse-ingest step (Phase C wiring)
 pub fn proof_nodes(len: u64, index: u64, proof: &[Hash]) -> Vec<(u64, Hash)> {
     let within = peak_height(len, index) as usize;
     proof
@@ -180,6 +179,23 @@ impl Accumulator {
     /// Leaves pushed so far.
     pub fn len(&self) -> u64 {
         self.count
+    }
+
+    /// The current peak nodes as `(flat index, hash)`, largest height (leftmost) first —
+    /// what a provider hands a sparse subscriber so it can seed [`from_peaks`], verify the
+    /// root, and re-serve proofs without holding the whole tree.
+    ///
+    /// [`from_peaks`]: Accumulator::from_peaks
+    pub fn peak_nodes(&self) -> Vec<(u64, Hash)> {
+        let mut out = Vec::new();
+        let mut base = 0u64;
+        for height in (0..self.peaks.len() as u32).rev() {
+            if let Some(Some(hash)) = self.peaks.get(height as usize) {
+                out.push((node_index(height, base >> height), *hash));
+                base += 1u64 << height;
+            }
+        }
+        out
     }
 
     /// Seed an accumulator for `count` leaves from its persisted **peak** nodes, read via

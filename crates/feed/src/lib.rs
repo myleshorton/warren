@@ -175,6 +175,13 @@ impl Log {
         self.store.clone()
     }
 
+    /// The current peak nodes as `(flat index, hash)` — what a provider hands a sparse
+    /// subscriber (with the head) so it can open a [`Replica::sparse`] and verify blocks it
+    /// later ingests, without downloading the whole feed.
+    pub fn peak_nodes(&self) -> Vec<(u64, Hash)> {
+        self.roots.peak_nodes()
+    }
+
     /// Append a block, returning its index. Persists to the backing store atomically;
     /// panics if the store fails — impossible for the default in-memory backend. Use
     /// [`try_append`](Log::try_append) where a disk-backed store's failure must surface.
@@ -371,6 +378,68 @@ impl Replica {
             head,
             roots,
         }))
+    }
+
+    /// Open a **sparse** replica from a feed's signed `head` and its `peak_nodes`
+    /// (`(flat index, hash)`) — holding no blocks yet. Verifies the head and that the peaks
+    /// reproduce its root, then seeds the accumulator so serving + proofs work for blocks
+    /// later brought in by [`ingest`](Replica::ingest). This is how a windowed mirror or an
+    /// on-access cache starts: it learns the feed's shape (root + len) without downloading
+    /// it, then fills in a subset.
+    pub fn sparse(
+        public_key: PublicKey,
+        head: Head,
+        peak_nodes: Vec<(u64, Hash)>,
+        store: Arc<dyn FeedStore>,
+    ) -> Option<Replica> {
+        if !verify_head(&public_key, &head) {
+            return None;
+        }
+        let feed = public_key.to_bytes();
+        store
+            .commit(
+                &feed,
+                Batch {
+                    blocks: Vec::new(),
+                    nodes: peak_nodes,
+                    head: Some(head.clone()),
+                },
+            )
+            .ok()?;
+        let roots =
+            tree::Accumulator::from_peaks(head.len, |idx| store.node(&feed, idx).ok().flatten())?;
+        if roots.root() != head.root {
+            return None; // the peaks don't reproduce the signed root — reject
+        }
+        Some(Replica {
+            public_key,
+            store,
+            feed,
+            head,
+            roots,
+        })
+    }
+
+    /// Bring one block into a sparse replica: verify `block` at `index` against the held
+    /// head and `proof`, and if it checks out, persist the block plus the within-peak proof
+    /// nodes needed to re-serve it. Returns `false` (storing nothing) on a verification or
+    /// store failure. After a successful ingest the replica serves and proves that block
+    /// like any other.
+    pub fn ingest(&mut self, index: u64, block: Vec<u8>, proof: &Proof) -> bool {
+        if !verify_block(&self.public_key, &self.head, index, &block, proof) {
+            return false;
+        }
+        let nodes = tree::proof_nodes(self.head.len, index, &proof.siblings);
+        self.store
+            .commit(
+                &self.feed,
+                Batch {
+                    blocks: vec![(index, block)],
+                    nodes,
+                    head: None,
+                },
+            )
+            .is_ok()
     }
 
     /// The replicated feed's owner (the key its head is verified against).
@@ -883,6 +952,81 @@ mod tests {
         let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
         let pk = Keypair::from_seed(&[0x33; 32]).public();
         assert!(Replica::open(pk, store).unwrap().is_none());
+    }
+
+    #[test]
+    fn sparse_replica_holds_and_serves_a_subset() {
+        // A sparse replica learns a feed's shape (root + len) from the head and peaks while
+        // holding no blocks, then ingests an arbitrary subset and serves/proves exactly
+        // those — staying Absent for the rest. This is Phase C's receive side end to end.
+        let author = log_with(20);
+        let pk = author.public_key();
+        let head = author.head();
+        let peaks = author.peak_nodes();
+
+        let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
+        let mut sparse =
+            Replica::sparse(pk, head.clone(), peaks, store).expect("opens from head + peaks");
+        assert_eq!(
+            sparse.len(),
+            20,
+            "knows the length without holding any block"
+        );
+        assert!(sparse.block(3).is_none(), "holds no blocks yet");
+        assert!(sparse.proof(3).is_none(), "can't prove a block it lacks");
+
+        // Ingest a scattered subset (spanning both peaks: 20 = 16 + 4) with proofs from
+        // the author.
+        for &i in &[3usize, 4, 17] {
+            let block = author.get(i).unwrap();
+            let proof = author.proof(i).unwrap();
+            assert!(
+                sparse.ingest(i as u64, block, &proof),
+                "block {i} verifies and is stored"
+            );
+        }
+
+        // It now serves + proves exactly those, each still verifying against the head.
+        for &i in &[3usize, 4, 17] {
+            assert_eq!(sparse.block(i), author.get(i), "serves ingested block {i}");
+            let proof = sparse.proof(i).expect("proves an ingested block");
+            assert!(
+                verify_block(&pk, &head, i as u64, &sparse.block(i).unwrap(), &proof),
+                "re-served proof for block {i} verifies against the signed head"
+            );
+        }
+
+        // Un-ingested indices remain absent — both the block and its proof.
+        for i in [0usize, 5, 19] {
+            assert!(sparse.block(i).is_none(), "block {i} not ingested → absent");
+            assert!(sparse.proof(i).is_none(), "no proof for un-held block {i}");
+        }
+
+        // A forged block is rejected and stores nothing.
+        let real_proof = author.proof(7).unwrap();
+        assert!(
+            !sparse.ingest(7, b"forged".to_vec(), &real_proof),
+            "wrong bytes fail verification"
+        );
+        assert!(sparse.block(7).is_none(), "rejected ingest stored nothing");
+    }
+
+    #[test]
+    fn sparse_replica_rejects_peaks_that_dont_match_the_head() {
+        // Opening sparse from peaks that don't reproduce the signed root must fail closed —
+        // otherwise a lying provider could seed a holder with a tree it can't verify against.
+        let author = log_with(12);
+        let pk = author.public_key();
+        let head = author.head();
+        let mut peaks = author.peak_nodes();
+        if let Some((_, hash)) = peaks.first_mut() {
+            hash[0] ^= 0xff; // corrupt the largest peak
+        }
+        let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
+        assert!(
+            Replica::sparse(pk, head, peaks, store).is_none(),
+            "peaks not reproducing the root are rejected"
+        );
     }
 
     #[test]

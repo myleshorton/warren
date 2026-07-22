@@ -31,12 +31,14 @@
 //! assert!(!verify_block(&pk, &head, 1, b"tampered", &proof));
 //! ```
 
+mod store;
 mod tree;
 
 use crypto::{Hash, Keypair, PublicKey, Signature, HASH_LEN, SIGNATURE_LEN};
 use thiserror::Error;
 use wire::{Decoder, Encoder, WireError};
 
+pub use store::{Batch, FeedKey, FeedStore, MemStore, StoreError, StoreResult};
 pub use tree::leaf_hash;
 
 /// Domain tag mixed into the signed head, so a log-head signature can never be

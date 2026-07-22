@@ -113,10 +113,25 @@ it.
 
 Additive: no root or `Proof` format change (proofs are byte-identical — Phase B's parity
 test still holds), so it interoperates with un-upgraded peers; the new messages
-(`GetHave`/`Have`, peaks) are new request types an old peer simply doesn't send. Sequence:
-`proof_nodes` + ingest (+ round-trip test) → sparse `Replica` construction/serve →
-`GetHave`/`Have` + peaks messages in `sync` → windowed `mirror_feed`/`run_mirror` →
-soak a suffix-window seeder (RSS + disk bounded by the window).
+(`GetPeaks`/`Peaks`, `GetFeedHave`/`FeedHave`) are new request types an old peer simply
+doesn't send.
+
+Sequence and status:
+
+1. ✅ `proof_nodes` + `Replica::sparse`/`ingest` (+ round-trip and subset tests) — `feed`.
+2. ✅ Sparse-serving protocol — `Source::peaks`/`held_ranges`, the `GetPeaks`/`Peaks` and
+   `GetFeedHave`/`FeedHave` messages, and the windowed `FeedWindow` client — `sync`.
+3. ✅ `transfer::download_feed_window` (the server side needed no change — `transfer`'s
+   serve loop already dispatches `sync::serve_feed`).
+4. ⏳ **Remaining:** windowed `Session::mirror_feed`/`run_mirror` in `warren` — bootstrap a
+   sparse suffix-window replica, then ingest new tail blocks as the author advances and let
+   old ones fall out of the window. The fall-out step is retention *policy*, so this lands
+   with Phase D (GC); without it a windowed mirror only ever grows.
+5. ⏳ Soak a suffix-window seeder (RSS + disk bounded by the window).
+
+Serving a sparse holding already works today with no `warren` change: a `Replica::sparse`
+implements `Source`, so `serve_by_key`/`serve_feed_tail` serve whatever window it holds and
+answer `Absent` for the rest, and `mirrored_records` already skips indices it doesn't hold.
 
 ## Non-goals
 

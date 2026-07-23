@@ -97,9 +97,19 @@ subscriber can still reconstruct the live tail.
 
 Additive and format-compatible: `prune` only removes data (roots/proofs over what remains are
 unchanged), at-rest encryption is invisible above the `FeedStore` seam, and the windowed
-warren methods are new APIs alongside the dense ones. No wire change. Sequence follows the
-build order above: windowed mirror (serving already works) → `prune` + retention policy →
-at-rest encryption → `CrashStore` tests → soak.
+warren methods are new APIs alongside the dense ones. No wire change.
+
+Status:
+
+1. ✅ GC — `tree::retained_node_indices`, `FeedStore::prune` (MemStore + RedbStore),
+   `Replica::prune`, with an exhaustive property test.
+2. ✅ Windowed mirror — `FeedWindow::suffix` + `transfer::download_feed_suffix`,
+   `protocol::fetch_replica_window`, `Session::mirror_feed_window` /
+   `run_mirror_window`; backbone test chains author → windowed mirror → downstream mirror
+   with the author offline.
+3. ⏳ At-rest encryption of blocks/nodes in `feed-redb`.
+4. ⏳ `CrashStore` crash-injection property tests.
+5. ⏳ Soak a suffix-window seeder (bounded RSS + disk).
 
 ## Non-goals
 

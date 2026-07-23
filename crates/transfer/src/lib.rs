@@ -55,6 +55,10 @@ use driver::Channel;
 use frame::{Packet, Reassembler};
 use plan::{Holdings, Plan, Selection};
 use sync::{BlobDownload, FeedDownload, FeedWindow, Message, SyncError};
+
+/// Re-exported so a caller can name the result of [`download_feed_window`] /
+/// [`download_feed_suffix`] without depending on `sync` directly.
+pub use sync::WindowData;
 use thiserror::Error;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Instant};
@@ -230,6 +234,25 @@ pub async fn download_feed_suffix<L: Link>(
     cfg: &Config,
 ) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
     drive_feed_window(channel, FeedWindow::suffix(public_key, window), cfg).await
+}
+
+/// Like [`download_feed_suffix`], but fetch only the window's blocks at index `have` or
+/// above — the delta a windowed mirror needs when it already holds everything below `have`.
+/// A tail refresh that pulls just the newly-appended blocks (empty if the feed hasn't grown
+/// past `have`), so following a growing author costs the delta, not the whole window.
+pub async fn download_feed_suffix_from<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    window: u64,
+    have: u64,
+    cfg: &Config,
+) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
+    drive_feed_window(
+        channel,
+        FeedWindow::suffix_from(public_key, window, have),
+        cfg,
+    )
+    .await
 }
 
 /// Drive a [`FeedWindow`] to completion over `channel`, returning the verified window and

@@ -587,17 +587,14 @@ impl Session {
         }
     }
 
-    /// Keep a **windowed** mirror current, forever: as the author's feed grows, refresh the
-    /// held window to the last `window` blocks and prune the rest, so RSS and disk stay
-    /// bounded. Each round, across the feed's providers: cheaply probe the provider's current
-    /// head (a `window == 0` fetch — head + peaks, no blocks); if it has grown past what we
-    /// hold, re-fetch the last `window` blocks, swap in the fresh sparse replica, prune the
-    /// now-out-of-window prefix from the store, and fire `appended` so our own subscribers
-    /// are pushed at once. Spawn this after [`Self::mirror_feed_window`].
-    ///
-    /// (The refresh re-fetches the whole window on a growth event rather than just the new
-    /// tail — a follow-up can make it incremental — but it only pays that on actual growth,
-    /// and the window is bounded, so the cost is capped.)
+    /// Keep a **windowed** mirror current, forever: as the author's feed grows, follow the
+    /// last `window` blocks and prune the rest, so RSS and disk stay bounded. Each round,
+    /// across the feed's providers, it fetches the **tail delta** in one shot — the current
+    /// head + peaks plus only the blocks above what we already hold (nothing if the author
+    /// hasn't grown) — then [`reseed`](feed::Replica::reseed)s to the new head, ingests the
+    /// delta, prunes the now-out-of-window prefix, and fires `appended` so our own
+    /// subscribers are pushed at once. Following a growing author costs the delta, not the
+    /// whole window. Spawn this after [`Self::mirror_feed_window`].
     pub async fn run_mirror_window(
         &self,
         feed_key: crypto::PublicKey,
@@ -608,48 +605,41 @@ impl Session {
         let cfg = transfer::Config::default();
         let me = self.node.id();
         let topic = self.feed_topic(&feed_key.to_bytes());
-        let store = self.feed_store.clone();
         loop {
             let providers = self.node.lookup(topic).await.unwrap_or_default();
             for p in providers {
                 if p.id == me {
                     continue;
                 }
-                // Cheap head probe: head + peaks, no blocks.
-                let Some(probe) = protocol::fetch_replica_window(
-                    &self.node,
-                    p.id,
-                    feed_key,
-                    0,
-                    &cfg,
-                    store.clone(),
-                )
-                .await
+                let held_len = replica.lock().expect("replica").len() as u64;
+                // One fetch: head + peaks + only the blocks above what we hold (empty if the
+                // author hasn't grown past `held_len`).
+                let Some(data) =
+                    protocol::fetch_tail_window(&self.node, p.id, feed_key, window, held_len, &cfg)
+                        .await
                 else {
                     continue;
                 };
-                let probe_len = probe.len() as u64;
-                let held_len = replica.lock().expect("replica").len() as u64;
-                if probe_len <= held_len {
+                let new_len = data.head.len;
+                if new_len <= held_len {
                     continue; // this provider has nothing newer than what we hold
                 }
-                // The author grew: re-fetch the last `window` blocks and swap them in.
-                if let Some(fresh) = protocol::fetch_replica_window(
-                    &self.node,
-                    p.id,
-                    feed_key,
-                    window,
-                    &cfg,
-                    store.clone(),
-                )
-                .await
-                {
-                    {
-                        let mut r = replica.lock().expect("replica");
-                        *r = fresh;
-                        // Reclaim the prefix that has fallen out of the window.
-                        r.prune(probe_len.saturating_sub(window));
+                let start = new_len.saturating_sub(window);
+                let grew = {
+                    let mut r = replica.lock().expect("replica");
+                    // Advance the head/peaks, ingest the fetched tail, then reclaim the prefix
+                    // that has fallen out of the window.
+                    if r.reseed(data.head, data.peaks) {
+                        for (index, block, proof) in data.blocks {
+                            r.ingest(index, block, &proof);
+                        }
+                        r.prune(start);
+                        true
+                    } else {
+                        false
                     }
+                };
+                if grew {
                     appended.notify_waiters(); // wake subscribers tailing *this* mirror
                 }
             }

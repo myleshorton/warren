@@ -323,3 +323,89 @@ async fn a_windowed_mirror_holds_and_re_serves_only_its_suffix_window() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_windowed_mirror_follows_a_growing_author_incrementally() {
+    // run_mirror_window keeps a windowed mirror current as the author grows, fetching only
+    // the new tail (not the whole window). The author grows by less than the window, so some
+    // of the mirror's existing blocks are reused rather than re-fetched.
+    let window = 4u64;
+    let (boot, _peers) = network(4).await;
+    let bootstrap = boot.contact();
+
+    // --- Author: 5 blocks, growing later; served live by key. ---
+    let (author, author_key) = make_session(joined(bootstrap, id(1)).await, [0xD4; 32]);
+    {
+        let log = author.log();
+        let mut g = log.lock().expect("log");
+        for i in 0..5 {
+            g.append(format!("msg {i}").into_bytes());
+        }
+    }
+    let author_id = author.node.id();
+    timeout(T, author.node.announce(author_id))
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(T, author.node.announce(author.own_feed_topic()))
+        .await
+        .unwrap()
+        .unwrap();
+    let _author_serve = spawn_serve_by_key(author.clone());
+
+    // --- Mirror: bootstrap the window [1, 5), then run the live windowed tail. ---
+    let (mirror, _k) = make_session(joined(bootstrap, id(2)).await, [0xE5; 32]);
+    timeout(T, mirror.node.announce(mirror.node.id()))
+        .await
+        .unwrap()
+        .unwrap();
+    let (replica, appended) = timeout(T, mirror.mirror_feed_window(author_id, author_key, window))
+        .await
+        .unwrap()
+        .expect("windowed mirror bootstraps");
+    assert_eq!(
+        replica.lock().expect("replica").held_ranges(),
+        vec![(1, 5)],
+        "bootstraps the last-4 window of the 5-block feed"
+    );
+    let run = {
+        let (m, r, a) = (mirror.clone(), replica.clone(), appended.clone());
+        tokio::spawn(async move { m.run_mirror_window(author_key, r, a, window).await })
+    };
+
+    // --- The author grows to 7 (by 2 < window 4), so the mirror should slide to [3, 7),
+    // reusing blocks 3 and 4 and fetching only 5 and 6. ---
+    {
+        let log = author.log();
+        let mut g = log.lock().expect("log");
+        for i in 5..7 {
+            g.append(format!("msg {i}").into_bytes());
+        }
+    }
+
+    let deadline = Instant::now() + T;
+    loop {
+        {
+            let r = replica.lock().expect("replica");
+            if r.len() == 7 && r.held_ranges() == vec![(3, 7)] {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the windowed mirror never followed the author's growth"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    run.abort();
+
+    // The slid window holds exactly [3, 7), each block matching the author.
+    let r = replica.lock().expect("replica");
+    for i in 3..7u64 {
+        assert_eq!(
+            r.block(i as usize).as_deref(),
+            Some(format!("msg {i}").as_bytes()),
+            "followed block {i} matches the author"
+        );
+    }
+}

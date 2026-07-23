@@ -557,8 +557,12 @@ pub struct FeedWindow {
     /// Request cursor into `want`.
     cursor: usize,
     /// Suffix mode: keep the last `window` blocks. `want` is empty until the head arrives,
-    /// then filled with `[len - window, len)`. `None` for an explicit index set.
+    /// then filled with `[max(resume, len - window), len)`. `None` for an explicit index set.
     window: Option<u64>,
+    /// Suffix mode floor: don't fetch below this index (blocks the caller already holds), so
+    /// a tail refresh pulls only the delta above what a mirror already has. 0 for a full
+    /// suffix.
+    resume: u64,
 }
 
 impl FeedWindow {
@@ -579,6 +583,7 @@ impl FeedWindow {
             missing: HashSet::new(),
             cursor: 0,
             window: None,
+            resume: 0,
         }
     }
 
@@ -588,6 +593,15 @@ impl FeedWindow {
     /// the head and peaks (a shape-only open, holding no blocks). This is how a suffix-window
     /// mirror bootstraps against a feed whose length it doesn't yet know.
     pub fn suffix(public_key: PublicKey, window: u64) -> Self {
+        Self::suffix_from(public_key, window, 0)
+    }
+
+    /// Like [`suffix`](FeedWindow::suffix), but only fetch blocks at index `have` or above —
+    /// the delta a windowed mirror needs to catch up, given it already holds everything below
+    /// `have`. Once the head arrives the window is `[max(have, len - window), len)`, so a tail
+    /// refresh pulls just the newly-appended blocks (empty if the feed hasn't grown past
+    /// `have`), never the whole window.
+    pub fn suffix_from(public_key: PublicKey, window: u64, have: u64) -> Self {
         Self {
             public_key,
             head: None,
@@ -598,6 +612,7 @@ impl FeedWindow {
             missing: HashSet::new(),
             cursor: 0,
             window: Some(window),
+            resume: have,
         }
     }
 
@@ -641,9 +656,11 @@ impl FeedWindow {
                 if !verify_head(&self.public_key, head) {
                     return Err(SyncError::BadHead);
                 }
-                // Suffix mode: now that the length is known, want the last `window` blocks.
+                // Suffix mode: now that the length is known, want the last `window` blocks,
+                // but never below the resume floor (blocks the caller already holds).
                 if let Some(window) = self.window {
-                    self.want = (head.len.saturating_sub(window)..head.len).collect();
+                    let start = self.resume.max(head.len.saturating_sub(window));
+                    self.want = (start..head.len).collect();
                 }
                 self.head = Some(head.clone());
                 Ok(())
@@ -1414,6 +1431,41 @@ mod tests {
             vec![0, 1, 2],
             "a window wider than the feed clamps to the whole feed"
         );
+    }
+
+    #[test]
+    fn suffix_from_fetches_only_the_delta_above_the_resume_floor() {
+        // A mirror holding [.., 15) follows a feed grown to 20 with window 8: it fetches only
+        // [15, 20) (the delta), not the whole last-8 window [12, 20) — its resume floor (15)
+        // beats len − window (12).
+        let server = log_with(20, 0x67);
+        let pk = server.public_key();
+        let mut w = FeedWindow::suffix_from(pk, 8, 15);
+        while let Some(req) = w.poll_request() {
+            w.handle_response(&serve_feed(&req, &server)).unwrap();
+        }
+        assert!(w.is_complete());
+        let window = w.into_window().unwrap();
+        assert_eq!(
+            window.blocks.iter().map(|(i, _, _)| *i).collect::<Vec<_>>(),
+            vec![15, 16, 17, 18, 19],
+            "only the blocks above the resume floor, not the whole window"
+        );
+    }
+
+    #[test]
+    fn suffix_from_at_the_head_fetches_nothing() {
+        // No growth past the floor ⇒ no blocks fetched (still gets head + peaks).
+        let server = log_with(10, 0x68);
+        let pk = server.public_key();
+        let mut w = FeedWindow::suffix_from(pk, 4, 10);
+        while let Some(req) = w.poll_request() {
+            w.handle_response(&serve_feed(&req, &server)).unwrap();
+        }
+        assert!(w.is_complete());
+        let window = w.into_window().unwrap();
+        assert!(window.blocks.is_empty(), "nothing new above the floor");
+        assert_eq!(window.head.len, 10);
     }
 
     #[test]

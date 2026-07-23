@@ -463,6 +463,47 @@ impl Replica {
             .is_ok()
     }
 
+    /// Advance this replica to a newer signed `head` and its `peaks`, **without**
+    /// re-downloading what it already holds — how a windowed mirror follows a growing author
+    /// incrementally. Verifies the head and that the peaks reproduce its root (from the peaks
+    /// in memory, so a bad head/peaks never touches the store), then swaps in the new head +
+    /// accumulator. Blocks already held stay valid — the tree is append-only, so their frozen
+    /// proof nodes never change — and the new tail is brought in with
+    /// [`ingest`](Replica::ingest). Returns `false`, leaving the replica unchanged, if the
+    /// head doesn't verify or the peaks don't reproduce its root.
+    pub fn reseed(&mut self, head: Head, peaks: Vec<(u64, Hash)>) -> bool {
+        if !verify_head(&self.public_key, &head) {
+            return false;
+        }
+        // Reconstruct + check the root from the peaks in RAM before persisting anything, so a
+        // rejected reseed can't leave a bad head/peaks committed.
+        let Some(roots) = tree::Accumulator::from_peaks(head.len, |idx| {
+            peaks.iter().find(|(i, _)| *i == idx).map(|(_, h)| *h)
+        }) else {
+            return false;
+        };
+        if roots.root() != head.root {
+            return false;
+        }
+        if self
+            .store
+            .commit(
+                &self.feed,
+                Batch {
+                    blocks: Vec::new(),
+                    nodes: peaks,
+                    head: Some(head.clone()),
+                },
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.roots = roots;
+        self.head = head;
+        true
+    }
+
     /// Prune to a suffix window: drop every held block below `below` and every Merkle node
     /// no longer needed to prove a retained block, keeping only `[below, len)` servable. The
     /// head, length, and peaks are untouched — the replica still knows the feed's full shape
@@ -1130,6 +1171,87 @@ mod tests {
             "wrong bytes fail verification"
         );
         assert!(sparse.block(7).is_none(), "rejected ingest stored nothing");
+    }
+
+    #[test]
+    fn reseed_follows_a_growing_author_by_the_tail_only() {
+        // A windowed mirror (window 3) of a 10-block feed follows the author to 14 blocks by
+        // re-seeding to the new head + peaks and ingesting ONLY the new tail [11, 14), then
+        // pruning — never re-fetching the whole window. The result serves + proves the new
+        // window against the new head.
+        let seed = [0x4e; 32];
+        let mut author = Log::new(Keypair::from_seed(&seed));
+        for i in 0..10u8 {
+            author.append(vec![i; 3]);
+        }
+        let pk = author.public_key();
+
+        // Mirror the window [7, 10).
+        let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
+        let mut mirror = Replica::sparse(pk, author.head(), author.peak_nodes(), store).unwrap();
+        for i in 7..10u64 {
+            let proof = author.proof(i as usize).unwrap();
+            assert!(mirror.ingest(i, author.get(i as usize).unwrap(), &proof));
+        }
+        assert_eq!(mirror.held_ranges(), vec![(7, 10)]);
+
+        // The author grows to 14.
+        for i in 10..14u8 {
+            author.append(vec![i; 3]);
+        }
+        let head14 = author.head();
+
+        // Follow incrementally: reseed to the new head/peaks, then ingest only [11, 14) — the
+        // delta a windowed tail would fetch (max(held_len 10, new_len 14 − window 3) = 11).
+        assert!(mirror.reseed(head14.clone(), author.peak_nodes()));
+        assert_eq!(mirror.len(), 14, "the replica now knows the grown length");
+        for i in 11..14u64 {
+            let proof = author.proof(i as usize).unwrap();
+            assert!(mirror.ingest(i, author.get(i as usize).unwrap(), &proof));
+        }
+        mirror.prune(14 - 3); // keep [11, 14)
+
+        assert_eq!(
+            mirror.held_ranges(),
+            vec![(11, 14)],
+            "window slid to the new tail"
+        );
+        for i in 11..14u64 {
+            assert_eq!(mirror.block(i as usize), author.get(i as usize));
+            let proof = Source::proof(&mirror, i as usize).expect("held block proves");
+            assert!(
+                verify_block(&pk, &head14, i, &mirror.block(i as usize).unwrap(), &proof),
+                "block {i} proves against the grown head"
+            );
+        }
+    }
+
+    #[test]
+    fn reseed_rejects_peaks_that_dont_match_the_new_head() {
+        let mut author = Log::new(Keypair::from_seed(&[0x4f; 32]));
+        for i in 0..8u8 {
+            author.append(vec![i; 2]);
+        }
+        let pk = author.public_key();
+        let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
+        let mut mirror = Replica::sparse(pk, author.head(), author.peak_nodes(), store).unwrap();
+        let before = mirror.head();
+
+        // Grow, then corrupt a peak: reseed must fail and leave the replica untouched.
+        for i in 8..12u8 {
+            author.append(vec![i; 2]);
+        }
+        let mut peaks = author.peak_nodes();
+        peaks[0].1[0] ^= 0xff;
+        assert!(
+            !mirror.reseed(author.head(), peaks),
+            "peaks that don't reproduce the new root are rejected"
+        );
+        assert_eq!(
+            mirror.head(),
+            before,
+            "a rejected reseed leaves the replica unchanged"
+        );
     }
 
     #[test]

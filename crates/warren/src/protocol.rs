@@ -301,6 +301,42 @@ pub async fn fetch_replica_window(
     Some(replica)
 }
 
+/// Fetch the **tail delta** of `feed_key`'s window from `provider`: the current head + peaks
+/// plus only the window's blocks at index `have` or above (what a windowed mirror already
+/// holding `have` blocks needs to catch up). Returns the raw [`transfer::WindowData`] for the
+/// caller to apply to a live replica ([`feed::Replica::reseed`] + `ingest`), so following a
+/// growing author costs the delta, not the whole window. `None` if the provider is
+/// unreachable or serves a different feed.
+pub async fn fetch_tail_window(
+    node: &Node,
+    provider: NodeId,
+    feed_key: crypto::PublicKey,
+    window: u64,
+    have: u64,
+    cfg: &transfer::Config,
+) -> Option<transfer::WindowData> {
+    let mut ch = secure_dial(node, provider).await.ok()?;
+    let key_bytes = feed_key.to_bytes();
+    let mut req = Vec::with_capacity(1 + key_bytes.len());
+    req.push(REQ_FEED_KEY);
+    req.extend_from_slice(&key_bytes);
+    ch.send(&req).await.ok()?;
+
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(cfg.request_timeout * 2, ch.recv(&mut buf))
+        .await
+        .ok()?
+        .ok()?;
+    if n < 32 || buf[..32] != key_bytes[..] {
+        return None;
+    }
+    let (data, _missing) =
+        transfer::download_feed_suffix_from(&mut ch, feed_key, window, have, cfg)
+            .await
+            .ok()?;
+    Some(data)
+}
+
 /// Connect to `peer`, send the feed-style request kind `req`, receive the peer's
 /// 32-byte feed public key, and download + verify the feed it serves. Returns the
 /// raw signed blocks plus the key they were verified against. Used both for the

@@ -51,22 +51,78 @@ fn index_of(key: &[u8]) -> u64 {
     u64::from_be_bytes(idx)
 }
 
-/// A [`FeedStore`] backed by a single redb database file.
+/// A [`FeedStore`] backed by a single redb database file. Optionally encrypts block, node,
+/// and head **values** at rest (see [`create_encrypted`](RedbStore::create_encrypted)) — the
+/// keys stay plaintext (so range queries and pruning are unchanged), but a seeder holding
+/// other authors' content doesn't leak it on a lost or seized disk.
 #[derive(Clone)]
 pub struct RedbStore {
     db: Arc<Database>,
+    /// At-rest value-encryption key. `None` ⇒ values are stored plaintext. A given file must
+    /// always be opened with the same setting; mixing is a decode error, not silent
+    /// corruption (the AEAD tag catches it).
+    key: Option<[u8; 32]>,
 }
 
 impl RedbStore {
-    /// Create or open the store at `path`.
+    /// Create or open a **plaintext** store at `path`.
     pub fn create(path: impl AsRef<Path>) -> StoreResult<Self> {
         let db = Database::create(path).map_err(be)?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self {
+            db: Arc::new(db),
+            key: None,
+        })
     }
 
-    /// Wrap an already-open redb database (e.g. one shared with a blob store).
+    /// Create or open an **encrypted** store at `path`: block/node/head values are sealed at
+    /// rest with `key` (XChaCha20-Poly1305, per-value random nonce, the `feed ‖ index` key as
+    /// associated data so a value can't be relocated). `key` is a per-device secret the app
+    /// holds outside the database (e.g. in the keychain) and passes in on open.
+    pub fn create_encrypted(path: impl AsRef<Path>, key: [u8; 32]) -> StoreResult<Self> {
+        let db = Database::create(path).map_err(be)?;
+        Ok(Self {
+            db: Arc::new(db),
+            key: Some(key),
+        })
+    }
+
+    /// Wrap an already-open redb database (e.g. one shared with a blob store). Plaintext.
     pub fn from_db(db: Arc<Database>) -> Self {
-        Self { db }
+        Self { db, key: None }
+    }
+
+    /// Encode a value for storage: sealed (nonce ‖ ciphertext) under the store key with `aad`
+    /// bound, or the plaintext unchanged when the store isn't encrypted.
+    fn encode_value(&self, aad: &[u8], value: &[u8]) -> Vec<u8> {
+        match self.key {
+            Some(key) => {
+                let (nonce, ciphertext) = crypto::seal::aead_seal(&key, aad, value);
+                let mut out = Vec::with_capacity(nonce.len() + ciphertext.len());
+                out.extend_from_slice(&nonce);
+                out.extend_from_slice(&ciphertext);
+                out
+            }
+            None => value.to_vec(),
+        }
+    }
+
+    /// The inverse of [`encode_value`](RedbStore::encode_value). A wrong key, a mismatched
+    /// `aad` (a relocated value), or tampering all surface as a backend error.
+    fn decode_value(&self, aad: &[u8], stored: &[u8]) -> StoreResult<Vec<u8>> {
+        match self.key {
+            Some(key) => {
+                let n = crypto::seal::NONCE_LEN;
+                if stored.len() < n {
+                    return Err(StoreError::Backend("truncated encrypted value".into()));
+                }
+                let (nonce, ciphertext) = stored.split_at(n);
+                let nonce: [u8; crypto::seal::NONCE_LEN] =
+                    nonce.try_into().expect("length checked above");
+                crypto::seal::aead_open(&key, aad, &nonce, ciphertext)
+                    .ok_or_else(|| StoreError::Backend("at-rest decryption failed".into()))
+            }
+            None => Ok(stored.to_vec()),
+        }
     }
 }
 
@@ -77,21 +133,29 @@ impl FeedStore for RedbStore {
             if !batch.blocks.is_empty() {
                 let mut t = txn.open_table(BLOCKS).map_err(be)?;
                 for (index, bytes) in &batch.blocks {
-                    t.insert(composite(feed, *index).as_slice(), bytes.as_slice())
+                    let ck = composite(feed, *index);
+                    t.insert(ck.as_slice(), self.encode_value(&ck, bytes).as_slice())
                         .map_err(be)?;
                 }
             }
             if !batch.nodes.is_empty() {
                 let mut t = txn.open_table(NODES).map_err(be)?;
                 for (index, hash) in &batch.nodes {
-                    t.insert(composite(feed, *index).as_slice(), hash.as_slice())
-                        .map_err(be)?;
+                    let ck = composite(feed, *index);
+                    t.insert(
+                        ck.as_slice(),
+                        self.encode_value(&ck, hash.as_slice()).as_slice(),
+                    )
+                    .map_err(be)?;
                 }
             }
             if let Some(head) = &batch.head {
                 let mut t = txn.open_table(HEADS).map_err(be)?;
-                t.insert(feed.as_slice(), head.encode().as_slice())
-                    .map_err(be)?;
+                t.insert(
+                    feed.as_slice(),
+                    self.encode_value(feed, &head.encode()).as_slice(),
+                )
+                .map_err(be)?;
             }
         }
         txn.commit().map_err(be)?;
@@ -133,10 +197,11 @@ impl FeedStore for RedbStore {
         let Ok(table) = txn.open_table(BLOCKS) else {
             return Ok(None); // table absent = nothing committed yet
         };
-        Ok(table
-            .get(composite(feed, index).as_slice())
-            .map_err(be)?
-            .map(|g| g.value().to_vec()))
+        let ck = composite(feed, index);
+        match table.get(ck.as_slice()).map_err(be)? {
+            Some(g) => Ok(Some(self.decode_value(&ck, g.value())?)),
+            None => Ok(None),
+        }
     }
 
     fn node(&self, feed: &FeedKey, index: u64) -> StoreResult<Option<Hash>> {
@@ -144,11 +209,13 @@ impl FeedStore for RedbStore {
         let Ok(table) = txn.open_table(NODES) else {
             return Ok(None);
         };
-        let Some(guard) = table.get(composite(feed, index).as_slice()).map_err(be)? else {
+        let ck = composite(feed, index);
+        let Some(guard) = table.get(ck.as_slice()).map_err(be)? else {
             return Ok(None);
         };
-        let hash: Hash = guard
-            .value()
+        let hash: Hash = self
+            .decode_value(&ck, guard.value())?
+            .as_slice()
             .try_into()
             .map_err(|_| StoreError::Backend("node hash is not 32 bytes".into()))?;
         Ok(Some(hash))
@@ -162,7 +229,8 @@ impl FeedStore for RedbStore {
         let Some(guard) = table.get(feed.as_slice()).map_err(be)? else {
             return Ok(None);
         };
-        Ok(Some(Head::decode(guard.value()).map_err(be)?))
+        let plain = self.decode_value(feed, guard.value())?;
+        Ok(Some(Head::decode(&plain).map_err(be)?))
     }
 
     fn has_block(&self, feed: &FeedKey, index: u64) -> StoreResult<bool> {
@@ -347,6 +415,73 @@ mod tests {
                 &proof
             ));
         }
+    }
+
+    #[test]
+    fn an_encrypted_store_round_trips_but_stores_ciphertext_at_rest() {
+        let path =
+            std::env::temp_dir().join(format!("feed-redb-enc-{}-{}.redb", std::process::id(), 777));
+        let _ = std::fs::remove_file(&path);
+        let key = [0x5a; 32];
+        let seed = [0x11; 32];
+
+        // Write a feed through an encrypted store.
+        let head_before = {
+            let store = Arc::new(RedbStore::create_encrypted(&path, key).unwrap());
+            let mut log = Log::with_store(crypto::Keypair::from_seed(&seed), store).unwrap();
+            for i in 0..6u8 {
+                log.append(vec![i; i as usize + 1]);
+            }
+            log.head()
+        };
+
+        // The plaintext block bytes must NOT appear verbatim on disk — reopen with the SAME
+        // key and confirm the stored value is a nonce+ciphertext envelope, not the plaintext.
+        {
+            let enc = RedbStore::create_encrypted(&path, key).unwrap();
+            let f = crypto::Keypair::from_seed(&seed).public().to_bytes();
+            // Peek at the raw stored bytes for block 3 (bypassing decode_value).
+            let txn = enc.db.begin_read().unwrap();
+            let table = txn.open_table(BLOCKS).unwrap();
+            let raw = table
+                .get(composite(&f, 3).as_slice())
+                .unwrap()
+                .expect("block 3 present")
+                .value()
+                .to_vec();
+            let plaintext = vec![3u8; 4];
+            assert_ne!(raw, plaintext, "block is not stored in the clear");
+            assert!(
+                raw.len() > plaintext.len() + crypto::seal::NONCE_LEN,
+                "stored value carries a nonce + AEAD tag"
+            );
+            // And decoding through the store recovers the plaintext.
+            assert_eq!(enc.block(&f, 3).unwrap().as_deref(), Some(&plaintext[..]));
+        }
+
+        // Reopen with the same key: the feed rebuilds intact. Scoped so its Database (and
+        // redb's file lock) is released before the wrong-key attempt below.
+        {
+            let store = Arc::new(RedbStore::create_encrypted(&path, key).unwrap());
+            let reopened = Log::with_store(crypto::Keypair::from_seed(&seed), store).unwrap();
+            assert_eq!(reopened.len(), 6);
+            assert_eq!(
+                reopened.head(),
+                head_before,
+                "encrypted feed survives a reopen"
+            );
+            assert_eq!(reopened.get(3).as_deref(), Some([3u8; 4].as_slice()));
+        }
+
+        // Reopen with the WRONG key: the AEAD tag rejects it, so a rebuild fails loudly
+        // rather than yielding garbage.
+        let wrong = Arc::new(RedbStore::create_encrypted(&path, [0xff; 32]).unwrap());
+        assert!(
+            Log::with_store(crypto::Keypair::from_seed(&seed), wrong).is_err(),
+            "the wrong at-rest key cannot open the feed"
+        );
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

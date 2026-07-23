@@ -101,9 +101,9 @@ fn encrypted_marker(data_dir: &Path) -> PathBuf {
 /// Open the feed store, honoring the at-rest encryption decision durably:
 ///
 /// - **encrypted store** (marker present): a key is required; open with it.
-/// - **legacy plaintext store** (no marker, but `feeds.redb` exists): stay plaintext. A key
-///   provided now applies only to a fresh store — migrating an existing plaintext store to
-///   encrypted is a separate step, never a silent reopen that would fail to decrypt.
+/// - **plaintext store, no key** (no marker, `feeds.redb` exists): stay plaintext. (A key +
+///   plaintext store is handled earlier in [`rebuild`], which resets the store to encrypted,
+///   so that combination never reaches here.)
 /// - **fresh install** (neither): if a key is given, encrypt from birth and drop the marker;
 ///   otherwise plaintext.
 fn open_feed_store(
@@ -150,6 +150,19 @@ pub fn rebuild(
     at_rest_key: Option<[u8; 32]>,
 ) -> std::io::Result<(feed::Log, blob::Store, Vec<Record>)> {
     fs::create_dir_all(data_dir)?;
+    // Reset-over-migrate: when an at-rest key is supplied but the store isn't yet encrypted
+    // (a pre-encryption plaintext store), discard the old feed content and start fresh
+    // encrypted rather than migrating it. Identity seeds are untouched, so the node keeps its
+    // id; only the feed blocks + cached blobs are dropped.
+    if at_rest_key.is_some()
+        && feeds_db_path(data_dir).exists()
+        && !encrypted_marker(data_dir).exists()
+    {
+        let _ = fs::remove_file(feeds_db_path(data_dir));
+        let _ = fs::remove_dir_all(blobs_dir(data_dir));
+        let _ = fs::remove_file(legacy_feed_path(data_dir));
+        let _ = fs::remove_file(data_dir.join("feed.jsonl.migrated"));
+    }
     let feed_store = open_feed_store(data_dir, at_rest_key)?;
     let mut log = feed::Log::with_store(keypair, feed_store).map_err(std::io::Error::other)?;
 
@@ -340,23 +353,33 @@ mod tests {
     }
 
     #[test]
-    fn a_legacy_plaintext_store_stays_plaintext_even_if_a_key_is_supplied() {
+    fn a_legacy_plaintext_store_is_reset_to_encrypted_when_a_key_is_supplied() {
         let dir = tempfile::tempdir().unwrap();
-        // A pre-encryption store: plaintext feeds.redb, no marker.
+        // A pre-encryption store: a plaintext post + a cached blob, no marker.
         {
             let (mut log, _b, _r) = rebuild(dir.path(), kp(), None).unwrap();
             log.append(b"old post".to_vec());
         }
+        write_blob(dir.path(), "cc01", b"old blob").unwrap();
         assert!(!dir.path().join("feeds.enc").exists());
 
-        // Supplying a key now must NOT try to decrypt the existing plaintext store (that
-        // would fail) — it stays plaintext until an explicit migration.
-        let (log, _b, _r) = rebuild(dir.path(), kp(), Some([0x99; 32])).unwrap();
-        assert_eq!(log.len(), 1);
-        assert_eq!(log.get(0).as_deref(), Some(&b"old post"[..]));
+        // Supplying a key resets the store to encrypted (reset-over-migrate): old content is
+        // discarded, the marker is written, and the store is now encrypted.
+        let (log, _b, records) = rebuild(dir.path(), kp(), Some([0x99; 32])).unwrap();
+        assert_eq!(log.len(), 0, "old plaintext feed content discarded");
+        assert!(records.is_empty());
         assert!(
-            !dir.path().join("feeds.enc").exists(),
-            "no marker: the legacy store was left plaintext"
+            dir.path().join("feeds.enc").exists(),
+            "store is now encrypted"
+        );
+        assert!(
+            !dir.path().join("blobs/cc01.bin").exists(),
+            "old cached blobs discarded too"
+        );
+        drop(log);
+        assert!(
+            rebuild(dir.path(), kp(), None).is_err(),
+            "the reset store now requires its key"
         );
     }
 

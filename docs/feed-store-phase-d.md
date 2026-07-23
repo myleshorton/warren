@@ -107,9 +107,19 @@ Status:
    `protocol::fetch_replica_window`, `Session::mirror_feed_window` /
    `run_mirror_window`; backbone test chains author → windowed mirror → downstream mirror
    with the author offline.
-3. ⏳ At-rest encryption of blocks/nodes in `feed-redb`.
-4. ⏳ `CrashStore` crash-injection property tests.
-5. ⏳ Soak a suffix-window seeder (bounded RSS + disk).
+3. ✅ At-rest encryption — `crypto::seal::aead_seal`/`aead_open` (AEAD with associated
+   data) + `RedbStore::create_encrypted`, sealing block/node/head values with the
+   `feed ‖ index` slot as AAD. **App-side keychain provisioning still to wire** (murmur
+   generates a per-device key, stores it in the keychain, and passes it to
+   `create_encrypted`).
+4. ✅ `CrashStore` crash-injection tests — commit-before-mutate holds across
+   append/advance/ingest.
+5. ✅ Soak — a windowed seeder's on-disk blocks stay `min(window, len)` and its node set
+   stays length-independent as the author grows well past the window.
+
+**Phase D is complete at the Rust layer.** The one remaining piece is app-side: murmur
+provisions the at-rest key in the keychain and chooses which feeds to mirror windowed
+(large media) vs dense (small), then spawns `run_mirror_window`.
 
 ## Non-goals
 

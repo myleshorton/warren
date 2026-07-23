@@ -92,9 +92,51 @@ pub fn save_peer_cache(data_dir: &Path, peers: &[Peer]) {
     }
 }
 
+/// Marker file whose presence means `feeds.redb` is **encrypted at rest**, so a future open
+/// knows to require the at-rest key. Absent ⇒ a plaintext (possibly legacy) store.
+fn encrypted_marker(data_dir: &Path) -> PathBuf {
+    data_dir.join("feeds.enc")
+}
+
+/// Open the feed store, honoring the at-rest encryption decision durably:
+///
+/// - **encrypted store** (marker present): a key is required; open with it.
+/// - **legacy plaintext store** (no marker, but `feeds.redb` exists): stay plaintext. A key
+///   provided now applies only to a fresh store — migrating an existing plaintext store to
+///   encrypted is a separate step, never a silent reopen that would fail to decrypt.
+/// - **fresh install** (neither): if a key is given, encrypt from birth and drop the marker;
+///   otherwise plaintext.
+fn open_feed_store(
+    data_dir: &Path,
+    at_rest_key: Option<[u8; 32]>,
+) -> std::io::Result<Arc<dyn feed::FeedStore>> {
+    let db_path = feeds_db_path(data_dir);
+    let marker = encrypted_marker(data_dir);
+    let store: Arc<dyn feed::FeedStore> = if marker.exists() {
+        let key = at_rest_key.ok_or_else(|| {
+            std::io::Error::other("feed store is encrypted but no at-rest key was provided")
+        })?;
+        Arc::new(
+            feed_redb::RedbStore::create_encrypted(&db_path, key).map_err(std::io::Error::other)?,
+        )
+    } else if db_path.exists() {
+        Arc::new(feed_redb::RedbStore::create(&db_path).map_err(std::io::Error::other)?)
+    } else if let Some(key) = at_rest_key {
+        let s =
+            feed_redb::RedbStore::create_encrypted(&db_path, key).map_err(std::io::Error::other)?;
+        fs::write(&marker, b"1")?; // record that this store is encrypted, for future opens
+        Arc::new(s)
+    } else {
+        Arc::new(feed_redb::RedbStore::create(&db_path).map_err(std::io::Error::other)?)
+    };
+    Ok(store)
+}
+
 /// Open the feed log (backed by the redb feed store), blob store, and record list from
 /// disk. The returned [`feed::Log`] reads and writes its blocks through `feeds.redb`, so
-/// appends are durable and it isn't RAM-bound.
+/// appends are durable and it isn't RAM-bound. When `at_rest_key` is `Some`, a *fresh* store
+/// is encrypted at rest with it (see [`open_feed_store`]); an existing store keeps whatever
+/// it was created as.
 ///
 /// On the first boot after upgrading from the legacy line-file: if `feed.jsonl` exists
 /// and the store is still empty, its lines (which *are* the feed blocks) are replayed
@@ -105,12 +147,11 @@ pub fn save_peer_cache(data_dir: &Path, peers: &[Peer]) {
 pub fn rebuild(
     data_dir: &Path,
     keypair: crypto::Keypair,
+    at_rest_key: Option<[u8; 32]>,
 ) -> std::io::Result<(feed::Log, blob::Store, Vec<Record>)> {
     fs::create_dir_all(data_dir)?;
-    let feed_store =
-        feed_redb::RedbStore::create(feeds_db_path(data_dir)).map_err(std::io::Error::other)?;
-    let mut log =
-        feed::Log::with_store(keypair, Arc::new(feed_store)).map_err(std::io::Error::other)?;
+    let feed_store = open_feed_store(data_dir, at_rest_key)?;
+    let mut log = feed::Log::with_store(keypair, feed_store).map_err(std::io::Error::other)?;
 
     let legacy = legacy_feed_path(data_dir);
     if log.is_empty() && legacy.exists() {
@@ -225,7 +266,7 @@ mod tests {
                 log.append(record_line(id, bytes).into_bytes());
             }
         }
-        let (log, _blobs, records) = rebuild(dir.path(), kp()).unwrap();
+        let (log, _blobs, records) = rebuild(dir.path(), kp(), None).unwrap();
         assert_eq!(records.len(), 2, "both records restored from redb");
         assert_eq!(log.len(), 2, "both feed blocks restored");
         assert_eq!(records[0].blob.as_deref(), Some("aa01"));
@@ -246,7 +287,7 @@ mod tests {
 
         // First boot after upgrade: rebuild migrates the legacy file into redb.
         let first = {
-            let (log, _blobs, records) = rebuild(dir.path(), kp()).unwrap();
+            let (log, _blobs, records) = rebuild(dir.path(), kp(), None).unwrap();
             assert_eq!(records.len(), 2, "legacy records migrated");
             assert_eq!(log.len(), 2);
             assert!(
@@ -262,9 +303,61 @@ mod tests {
         assert_eq!(first, 2);
 
         // Second boot: redb already holds the feed; no re-migration, data intact.
-        let (log2, _b2, records2) = rebuild(dir.path(), kp()).unwrap();
+        let (log2, _b2, records2) = rebuild(dir.path(), kp(), None).unwrap();
         assert_eq!(records2.len(), 2, "feed persists in redb across reopen");
         assert_eq!(log2.len(), 2);
+    }
+
+    #[test]
+    fn an_encrypted_store_persists_and_requires_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = [0x77u8; 32];
+
+        // Fresh install with a key: the store encrypts from birth and drops the marker.
+        {
+            let (mut log, _b, _r) = rebuild(dir.path(), kp(), Some(key)).unwrap();
+            log.append(b"secret post".to_vec());
+        }
+        assert!(
+            dir.path().join("feeds.enc").exists(),
+            "encryption marker written"
+        );
+
+        // Reopen with the same key: the feed is intact.
+        let (log, _b, records) = rebuild(dir.path(), kp(), Some(key)).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.get(0).as_deref(), Some(&b"secret post"[..]));
+        let _ = records;
+        drop(log);
+
+        // The marker makes a keyless reopen an error, not a silent plaintext open.
+        assert!(
+            rebuild(dir.path(), kp(), None).is_err(),
+            "an encrypted store cannot be opened without its key"
+        );
+        // And the wrong key fails to decrypt (loudly), rather than yielding garbage.
+        assert!(rebuild(dir.path(), kp(), Some([0x11; 32])).is_err());
+    }
+
+    #[test]
+    fn a_legacy_plaintext_store_stays_plaintext_even_if_a_key_is_supplied() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pre-encryption store: plaintext feeds.redb, no marker.
+        {
+            let (mut log, _b, _r) = rebuild(dir.path(), kp(), None).unwrap();
+            log.append(b"old post".to_vec());
+        }
+        assert!(!dir.path().join("feeds.enc").exists());
+
+        // Supplying a key now must NOT try to decrypt the existing plaintext store (that
+        // would fail) — it stays plaintext until an explicit migration.
+        let (log, _b, _r) = rebuild(dir.path(), kp(), Some([0x99; 32])).unwrap();
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.get(0).as_deref(), Some(&b"old post"[..]));
+        assert!(
+            !dir.path().join("feeds.enc").exists(),
+            "no marker: the legacy store was left plaintext"
+        );
     }
 
     #[test]

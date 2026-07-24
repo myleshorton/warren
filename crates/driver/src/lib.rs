@@ -32,6 +32,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
+mod lan;
+
+pub use lan::LanBeacon;
 pub use puncher::Config as PunchConfig;
 pub use swarm::dht::ConnectOutcome;
 pub use swarm::Firewall;
@@ -243,6 +246,13 @@ pub struct ConnectStats {
     pub local_firewall: Option<Firewall>,
     /// `Command::Connect` enqueue → `Event::Connected` (DHT discovery + signaling).
     pub dht_ms: u64,
+    /// Sub-split of `dht_ms`: the Kademlia iterative-lookup phase (connect start →
+    /// a coordinator found). A same-LAN connect that spends seconds here points at
+    /// discovery (routing/announce-propagation), not the punch.
+    pub dht_lookup_ms: u64,
+    /// Sub-split of `dht_ms`: the coordinator-brokered signaling round-trip (lookup
+    /// done → the peer's reply). `dht_lookup_ms + dht_broker_ms == dht_ms`.
+    pub dht_broker_ms: u64,
     /// Punch-primitive duration; `None` when no punch ran (Relayed/NotFound/TimedOut).
     pub punch_ms: Option<u64>,
     /// Whole `connect()` → `Connection` wall time.
@@ -833,8 +843,10 @@ async fn run(
                     mut peer_data_addrs,
                     strategy,
                     peer_firewall,
+                    lookup_ms,
                 } => {
-                    if let Some((data_sock, cmd_ms, mut stats, tx)) = pending_connect.remove(&target)
+                    if let Some((data_sock, cmd_ms, mut stats, tx)) =
+                        pending_connect.remove(&target)
                     {
                         // The peer's candidate set is untrusted (from a Signal, so
                         // only buffer-bounded); prioritize and cap what we actually
@@ -846,6 +858,12 @@ async fn run(
                         // Fold the actor-side funnel fields into the connect-side
                         // stats the caller threaded in.
                         stats.dht_ms = now().saturating_sub(cmd_ms);
+                        // Split the DHT cost into lookup vs. broker. swarm reports the
+                        // lookup duration when it finds a coordinator; `None` means the
+                        // connect never got past the lookup (timed out / found nobody),
+                        // so attribute the whole cost to lookup.
+                        stats.dht_lookup_ms = lookup_ms.unwrap_or(stats.dht_ms).min(stats.dht_ms);
+                        stats.dht_broker_ms = stats.dht_ms.saturating_sub(stats.dht_lookup_ms);
                         stats.strategy = strategy;
                         stats.peer_firewall = peer_firewall;
                         stats.peer_candidates = peer_data_addrs.clone();
@@ -882,11 +900,14 @@ async fn run(
                     for tx in pending_nat_sample.drain(..) {
                         let _ = tx.send(report);
                     }
-                    emit(&events, NodeEvent::NatClassified {
-                        firewall,
-                        samples: samples as u32,
-                        observed_host,
-                    });
+                    emit(
+                        &events,
+                        NodeEvent::NatClassified {
+                            firewall,
+                            samples: samples as u32,
+                            observed_host,
+                        },
+                    );
                 }
                 Event::IncomingConnect {
                     initiator,
@@ -908,12 +929,15 @@ async fn run(
                     // spray fan-out, and keeps its routable hosts.
                     prioritize_and_cap(&mut initiator_data_addrs);
                     let peer_hosts = candidate_hosts(&initiator_data_addrs);
-                    emit(&events, NodeEvent::IncomingConnect {
-                        initiator,
-                        strategy,
-                        initiator_firewall,
-                        peer_candidates: initiator_data_addrs.len().min(255) as u8,
-                    });
+                    emit(
+                        &events,
+                        NodeEvent::IncomingConnect {
+                            initiator,
+                            strategy,
+                            initiator_firewall,
+                            peer_candidates: initiator_data_addrs.len().min(255) as u8,
+                        },
+                    );
                     if !data_ip.is_unspecified() && !peer_hosts.is_empty() {
                         if let Ok(data_sock) = UdpSocket::bind(SocketAddr::new(data_ip, 0)).await {
                             if let Ok(local) = data_sock.local_addr() {
@@ -1210,12 +1234,15 @@ fn spawn_connect_punch(job: PunchJob) {
         // Event-side total (the return path overwrites this with the exact wall
         // time in `Node::connect`): the funnel phases we can see from here.
         stats.total_ms = stats.gather_ms + stats.dht_ms + stats.punch_ms.unwrap_or(0);
-        emit(&events, NodeEvent::ConnectResolved {
-            target,
-            outcome,
-            ok: channel.is_some(),
-            stats: stats.clone(),
-        });
+        emit(
+            &events,
+            NodeEvent::ConnectResolved {
+                target,
+                outcome,
+                ok: channel.is_some(),
+                stats: stats.clone(),
+            },
+        );
         let _ = tx.send(Ok(Connection {
             outcome,
             channel,
@@ -1268,13 +1295,16 @@ fn spawn_accept_punch(job: AcceptJob) {
             // instead of accumulating blocked tasks; the peer can retry.
             shed = incoming_tx.try_send(channel).is_err();
         }
-        emit(&events, NodeEvent::AcceptPunch {
-            initiator,
-            strategy,
-            ok,
-            punch_ms,
-            shed,
-        });
+        emit(
+            &events,
+            NodeEvent::AcceptPunch {
+                initiator,
+                strategy,
+                ok,
+                punch_ms,
+                shed,
+            },
+        );
     });
 }
 
@@ -1532,6 +1562,10 @@ async fn reflexive_addr(
         let probe = Packet {
             sender: id,
             rid,
+            // A reflexive probe comes from a transient data socket, not a routable
+            // endpoint — never a routing "server". (A Reflect is excluded from
+            // routing on the receiver regardless.)
+            reachable: false,
             msg: Message::Reflect,
         }
         .encode();
@@ -1661,7 +1695,8 @@ mod tests {
         // No reflector to ask: fall back to the local address.
         let sock = UdpSocket::bind(lo()).await.unwrap();
         let local = sock.local_addr().unwrap();
-        let (observed, rtt) = reflexive_addr(&sock, NodeId::from_bytes([1u8; 32]), local, &[]).await;
+        let (observed, rtt) =
+            reflexive_addr(&sock, NodeId::from_bytes([1u8; 32]), local, &[]).await;
         assert_eq!(observed, local);
         assert_eq!(rtt, None, "no reflector answered, so there's no RTT");
     }

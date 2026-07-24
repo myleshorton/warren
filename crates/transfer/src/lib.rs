@@ -54,7 +54,11 @@ use crypto::{Hash, PublicKey};
 use driver::Channel;
 use frame::{Packet, Reassembler};
 use plan::{Holdings, Plan, Selection};
-use sync::{BlobDownload, FeedDownload, Message, SyncError};
+use sync::{BlobDownload, FeedDownload, FeedWindow, Message, SyncError};
+
+/// Re-exported so a caller can name the result of [`download_feed_window`] /
+/// [`download_feed_suffix`] without depending on `sync` directly.
+pub use sync::WindowData;
 use thiserror::Error;
 use tokio::task::JoinSet;
 use tokio::time::{sleep, timeout, Instant};
@@ -200,6 +204,77 @@ pub async fn download_feed_full<L: Link>(
         dl.handle_response(&response)?;
     }
     Ok((dl.head().cloned(), dl.into_blocks()))
+}
+
+/// Download a **window** of a feed over `channel`: fetch the head and the peaks, then only
+/// the block indices in `want` this peer holds — each verified against the signed head.
+/// Returns a [`sync::WindowData`] (head, peaks, and the fetched `(index, block, proof)`
+/// triples, everything needed to seed a [`feed::Replica::sparse`] and
+/// [`ingest`](feed::Replica::ingest) the window) together with the wanted indices this peer
+/// couldn't serve, for the caller to fetch from another peer. Unlike [`download_feed`], a
+/// block the peer lacks isn't an error — it just lands in the returned `missing` list. The
+/// building block for a suffix-window seeder and an on-access cache.
+pub async fn download_feed_window<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    want: impl IntoIterator<Item = u64>,
+    cfg: &Config,
+) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
+    drive_feed_window(channel, FeedWindow::new(public_key, want), cfg).await
+}
+
+/// Like [`download_feed_window`], but keep the feed's **last `window` blocks** — the wanted
+/// indices are derived from the head once known, so the caller needn't learn the length
+/// first. The one-shot fetch a suffix-window mirror does before it starts tailing;
+/// `window == 0` fetches only the head + peaks (a shape-only open).
+pub async fn download_feed_suffix<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    window: u64,
+    cfg: &Config,
+) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
+    drive_feed_window(channel, FeedWindow::suffix(public_key, window), cfg).await
+}
+
+/// Like [`download_feed_suffix`], but fetch only the window's blocks at index `have` or
+/// above — the delta a windowed mirror needs when it already holds everything below `have`.
+/// A tail refresh that pulls just the newly-appended blocks (empty if the feed hasn't grown
+/// past `have`), so following a growing author costs the delta, not the whole window.
+pub async fn download_feed_suffix_from<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    window: u64,
+    have: u64,
+    cfg: &Config,
+) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
+    drive_feed_window(
+        channel,
+        FeedWindow::suffix_from(public_key, window, have),
+        cfg,
+    )
+    .await
+}
+
+/// Drive a [`FeedWindow`] to completion over `channel`, returning the verified window and
+/// the wanted indices this peer couldn't serve (for the caller to fetch elsewhere).
+async fn drive_feed_window<L: Link>(
+    channel: &mut L,
+    mut w: FeedWindow,
+    cfg: &Config,
+) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
+    let mut wire = Wire::new(
+        channel,
+        cfg.initial_rtt,
+        cfg.request_timeout,
+        Cursor::default(),
+    );
+    while let Some(request) = w.poll_request() {
+        let response = exchange(&mut wire, &request, cfg).await?;
+        w.handle_response(&response)?;
+    }
+    let missing = w.missing();
+    let window = w.into_window().ok_or(TransferError::Incomplete)?;
+    Ok((window, missing))
 }
 
 /// Subscribe to a feed and deliver its blocks **as they are appended**, over a
@@ -1629,6 +1704,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn windowed_download_fetches_head_peaks_and_the_window() {
+        // A sparse subscriber pulls only a chosen window of a feed — head + peaks + the
+        // requested blocks — over the real transfer path, and the result seeds a verifying
+        // sparse replica. The server is an ordinary full log serving the new sparse-protocol
+        // messages via the same serve loop.
+        let mut log = Log::new(Keypair::from_seed(&[0x5c; 32]));
+        for i in 0..20u8 {
+            log.append(vec![i; (i as usize % 5) + 1]);
+        }
+        let public_key = log.public_key();
+        let head = log.head();
+
+        let (mut client, mut server) = lossy_pair(&[], &[]);
+        let cfg = fast_cfg();
+        let want = vec![3u64, 4, 17];
+        let (served, downloaded) = tokio::join!(
+            serve_feed(&mut server, &log, &cfg),
+            download_feed_window(&mut client, public_key, want.clone(), &cfg),
+        );
+        served.expect("server ends cleanly on idle");
+        let (window, missing) = downloaded.expect("windowed download completes");
+
+        assert!(missing.is_empty(), "a full log serves the whole window");
+        assert_eq!(window.head, head, "the verified head round-trips");
+        assert_eq!(
+            window.blocks.iter().map(|(i, _, _)| *i).collect::<Vec<_>>(),
+            want,
+            "fetched exactly the requested indices, ascending"
+        );
+
+        // The window is enough to seed a sparse replica that serves + proves its blocks.
+        let store: Arc<dyn feed::FeedStore> = Arc::new(feed::MemStore::new());
+        let mut replica =
+            feed::Replica::sparse(public_key, window.head.clone(), window.peaks.clone(), store)
+                .expect("peaks reproduce the head root");
+        for (i, data, proof) in &window.blocks {
+            assert!(replica.ingest(*i, data.clone(), proof), "ingest block {i}");
+        }
+        for &i in &want {
+            assert_eq!(replica.block(i as usize), log.get(i as usize));
+        }
+        assert!(
+            replica.block(0).is_none(),
+            "block outside the window isn't held"
+        );
+    }
+
+    #[tokio::test]
     async fn subscribe_receives_live_appends() {
         use std::sync::{Arc, Mutex as StdMutex};
         use tokio::sync::Notify;
@@ -1789,7 +1912,7 @@ mod tests {
             &pk,
             &head,
             1,
-            r.get(1).unwrap(),
+            &r.get(1).unwrap(),
             &r.proof(1).unwrap()
         ));
         drop(r);

@@ -88,10 +88,44 @@ pub struct Session {
     /// mirror store-and-forward layer — we keep an author's feed available and
     /// tailable even while the author is offline.
     mirrored: Arc<StdMutex<HashMap<String, Mirror>>>,
+    /// The shared feed store (redb) backing the own log and every mirror — so a mirror we
+    /// hold persists to disk and is restored on restart, and so we serve it from there.
+    feed_store: Arc<dyn feed::FeedStore>,
 }
 
 /// A mirrored feed: the replica we keep current, and the signal fired when it grows.
 type Mirror = (Arc<StdMutex<feed::Replica>>, Arc<tokio::sync::Notify>);
+
+/// Restore mirrors persisted in `feed_store` (every feed except our own) into `mirrored`,
+/// so a post we mirrored survives a restart with no re-fetch. Best-effort: a feed whose
+/// on-disk copy is absent or fails verification is skipped.
+fn restore_mirrors(
+    feed_store: &Arc<dyn feed::FeedStore>,
+    own: &crypto::PublicKey,
+    mirrored: &Arc<StdMutex<HashMap<String, Mirror>>>,
+) {
+    let own_bytes = own.to_bytes();
+    let Ok(feeds) = feed_store.feeds() else {
+        return;
+    };
+    for feed in feeds {
+        if feed == own_bytes {
+            continue; // our own log, not a mirror
+        }
+        let Ok(pubkey) = crypto::PublicKey::from_bytes(&feed) else {
+            continue;
+        };
+        if let Ok(Some(replica)) = feed::Replica::open(pubkey, feed_store.clone()) {
+            mirrored.lock().expect("mirrored").insert(
+                util::to_hex(&feed),
+                (
+                    Arc::new(StdMutex::new(replica)),
+                    Arc::new(tokio::sync::Notify::new()),
+                ),
+            );
+        }
+    }
+}
 
 impl Session {
     /// Build a session over already-loaded state (see [`store::rebuild`] for the
@@ -107,6 +141,12 @@ impl Session {
         held: Arc<StdMutex<Vec<crypto::Hash>>>,
         clip_keys: Arc<StdMutex<HashMap<String, Enc>>>,
     ) -> Self {
+        // Share the log's backing store with the mirror layer, and restore any mirrors it
+        // already holds on disk (so mirrored posts survive a restart, not just an author
+        // going offline mid-session).
+        let feed_store = log.lock().expect("feed log").store();
+        let mirrored = Arc::new(StdMutex::new(HashMap::new()));
+        restore_mirrors(&feed_store, &feed_pubkey, &mirrored);
         Self {
             node,
             log,
@@ -117,7 +157,8 @@ impl Session {
             held,
             clip_keys,
             appended: Arc::new(tokio::sync::Notify::new()),
-            mirrored: Arc::new(StdMutex::new(HashMap::new())),
+            mirrored,
+            feed_store,
         }
     }
 
@@ -257,17 +298,17 @@ impl Session {
         // it as an error rather than silently persisting nonsense.)
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Persist the blob (content-addressed, order-independent) *outside* the log
-        // lock so a large write can't block feed serving; then append the feed line
-        // and the in-memory log together *under* the lock — the same ordering + error
-        // semantics as `publish_body`: concurrent publishers can't reorder the on-disk
+        // Persist the blob (content-addressed, order-independent) *outside* the log lock
+        // so a large write can't block feed serving; then append the block *under* the
+        // lock. `try_append` commits to the store (redb — durable, fsync'd) and advances
+        // the in-memory log together, so concurrent publishers can't reorder the persisted
         // feed against the in-memory Merkle order, and a returned `Err` means "not
-        // published". Notify only after the (best-effort) line append returns `Ok`.
+        // published" (the store commits before the in-memory log advances).
         store::write_blob(&self.data_dir, &blob_hex, &stored)?;
         {
             let mut log = self.log.lock().expect("feed log");
-            store::append_line(&self.data_dir, &line)?;
-            log.append(line.into_bytes());
+            log.try_append(line.into_bytes())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         self.appended.notify_waiters(); // wake any live-tail subscribers
 
@@ -317,18 +358,15 @@ impl Session {
         };
         let line = serde_json::to_string(&record)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Append to the feed file and the in-memory log under the log lock, so the two
-        // stay in the *same order* even with concurrent publishers (on-disk line order
-        // == in-memory Merkle order, so the head served to subscribers is what rebuild
-        // reproduces), and so a returned `Err` (the file append failed) means "not
-        // published" — the in-memory log is touched only after the append returns `Ok`.
-        // (Best-effort persistence: `append_line` doesn't `fsync`, so it isn't durable
-        // against a crash/power loss.) It's synchronous fs (no `.await`), so this brief
-        // hold can't wedge a live-tail serve.
+        // Append the block under the log lock so concurrent publishers stay in the same
+        // order (persisted-store order == in-memory Merkle order == what a subscriber is
+        // served). `try_append` commits to the store (redb — durable, fsync'd on commit)
+        // *before* advancing the in-memory log, so a returned `Err` means "not published".
+        // Synchronous (no `.await`), so this brief hold can't wedge a live-tail serve.
         {
             let mut log = self.log.lock().expect("feed log");
-            store::append_line(&self.data_dir, &line)?;
-            log.append(line.into_bytes());
+            log.try_append(line.into_bytes())
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
         self.appended.notify_waiters(); // wake any live-tail subscribers
         Ok(record)
@@ -426,25 +464,104 @@ impl Session {
         feed_key: crypto::PublicKey,
     ) -> Option<Mirror> {
         let hex = util::to_hex(&feed_key.to_bytes());
-        if let Some(entry) = self.mirrored.lock().expect("mirrored").get(&hex).cloned() {
-            return Some(entry);
-        }
-        let replica =
-            protocol::fetch_replica(&self.node, provider, feed_key, &transfer::Config::default())
+        let existing = self.mirrored.lock().expect("mirrored").get(&hex).cloned();
+        let entry = match existing {
+            Some(entry) => entry, // already held (or restored from disk on boot)
+            None => {
+                let replica = protocol::fetch_replica(
+                    &self.node,
+                    provider,
+                    feed_key,
+                    &transfer::Config::default(),
+                    self.feed_store.clone(),
+                )
                 .await?;
-        let entry: Mirror = (
-            Arc::new(StdMutex::new(replica)),
-            Arc::new(tokio::sync::Notify::new()),
-        );
-        self.mirrored
-            .lock()
-            .expect("mirrored")
-            .insert(hex, entry.clone());
+                let entry: Mirror = (
+                    Arc::new(StdMutex::new(replica)),
+                    Arc::new(tokio::sync::Notify::new()),
+                );
+                self.mirrored
+                    .lock()
+                    .expect("mirrored")
+                    .insert(hex, entry.clone());
+                entry
+            }
+        };
+        // Announce (idempotent) whether freshly fetched or already held — including a
+        // mirror restored from disk on boot — so we're a discoverable provider for it.
         let _ = self
             .node
             .announce(self.feed_topic(&feed_key.to_bytes()))
             .await;
         Some(entry)
+    }
+
+    /// Begin a **windowed** mirror of `feed_key`: like [`Self::mirror_feed`], but bootstrap a
+    /// *sparse* replica holding only the feed's last `window` blocks — the bounded-footprint
+    /// choice for a large media feed (a small feed just uses [`Self::mirror_feed`]). Serving
+    /// is unchanged: the sparse replica is a [`feed::Source`], so [`Self::serve_by_key`]
+    /// serves whatever window it holds and answers `Absent` for the rest. Pair with
+    /// [`Self::run_mirror_window`] (spawned) to keep the window current as the author grows.
+    /// Idempotent: a feed we already mirror returns its handles (with its existing window).
+    pub async fn mirror_feed_window(
+        &self,
+        provider: swarm::NodeId,
+        feed_key: crypto::PublicKey,
+        window: u64,
+    ) -> Option<Mirror> {
+        let hex = util::to_hex(&feed_key.to_bytes());
+        let existing = self.mirrored.lock().expect("mirrored").get(&hex).cloned();
+        let entry = match existing {
+            Some(entry) => entry, // already held (dense or windowed) — reuse it
+            None => {
+                let replica = protocol::fetch_replica_window(
+                    &self.node,
+                    provider,
+                    feed_key,
+                    window,
+                    &transfer::Config::default(),
+                    self.feed_store.clone(),
+                )
+                .await?;
+                let entry: Mirror = (
+                    Arc::new(StdMutex::new(replica)),
+                    Arc::new(tokio::sync::Notify::new()),
+                );
+                self.mirrored
+                    .lock()
+                    .expect("mirrored")
+                    .insert(hex, entry.clone());
+                entry
+            }
+        };
+        let _ = self
+            .node
+            .announce(self.feed_topic(&feed_key.to_bytes()))
+            .await;
+        Some(entry)
+    }
+
+    /// A snapshot of every mirrored feed's blocks, each paired with its author's feed
+    /// key — so an app can render content we hold on an author's behalf even while the
+    /// author is offline (the durability [`Self::mirror_feed`] + [`Self::run_mirror`]
+    /// buy). Blocks are opaque here; the caller decodes them into its record type.
+    pub fn mirrored_records(&self) -> Vec<(Vec<u8>, crypto::PublicKey)> {
+        let mut out = Vec::new();
+        for (replica, _notify) in self.mirrored.lock().expect("mirrored").values() {
+            let r = replica.lock().expect("replica");
+            let key = r.public_key();
+            // Walk only the blocks the replica actually holds — a windowed mirror's `len` is
+            // the whole feed but only a suffix window is present, so scanning `0..len` would
+            // probe (and miss) O(len) absent indices on every refresh.
+            for (start, end) in r.held_ranges() {
+                for i in start..end {
+                    if let Some(block) = r.block(i as usize) {
+                        out.push((block, key));
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// Keep a mirrored feed current, forever: fail over across the feed's providers
@@ -470,6 +587,75 @@ impl Session {
                     &self.node, p.id, feed_key, &replica, &appended, &cfg,
                 )
                 .await;
+            }
+            tokio::time::sleep(RESUBSCRIBE_BACKOFF).await;
+        }
+    }
+
+    /// Keep a **windowed** mirror current, forever: as the author's feed grows, follow the
+    /// last `window` blocks and prune the rest, so RSS and disk stay bounded. Each round,
+    /// across the feed's providers, it fetches the **tail delta** in one shot — the current
+    /// head + peaks plus only the blocks above what we already hold (nothing if the author
+    /// hasn't grown) — then [`reseed`](feed::Replica::reseed)s to the new head, ingests the
+    /// delta, prunes the now-out-of-window prefix, and fires `appended` so our own
+    /// subscribers are pushed at once. Following a growing author costs the delta, not the
+    /// whole window. Spawn this after [`Self::mirror_feed_window`].
+    pub async fn run_mirror_window(
+        &self,
+        feed_key: crypto::PublicKey,
+        replica: Arc<StdMutex<feed::Replica>>,
+        appended: Arc<tokio::sync::Notify>,
+        window: u64,
+    ) {
+        let cfg = transfer::Config::default();
+        let me = self.node.id();
+        let topic = self.feed_topic(&feed_key.to_bytes());
+        loop {
+            let providers = self.node.lookup(topic).await.unwrap_or_default();
+            for p in providers {
+                if p.id == me {
+                    continue;
+                }
+                let held_len = replica.lock().expect("replica").len() as u64;
+                // One fetch: head + peaks + only the blocks above what we hold (empty if the
+                // author hasn't grown past `held_len`).
+                let Some(data) =
+                    protocol::fetch_tail_window(&self.node, p.id, feed_key, window, held_len, &cfg)
+                        .await
+                else {
+                    continue;
+                };
+                let new_len = data.head.len;
+                if new_len <= held_len {
+                    continue; // this provider has nothing newer than what we hold
+                }
+                let start = new_len.saturating_sub(window);
+                let grew = {
+                    let mut r = replica.lock().expect("replica");
+                    // Advance the head/peaks, ingest the fetched tail, then reclaim the prefix
+                    // that has fallen out of the window — but only prune + report growth if
+                    // every tail block actually landed. If one fails to verify or persist,
+                    // keep what we hold (don't drop the prefix for a window we didn't fully
+                    // receive) and don't wake subscribers for content that isn't there; another
+                    // provider, or the next round, can still complete it.
+                    if r.reseed(data.head, data.peaks) {
+                        let all_landed = data
+                            .blocks
+                            .into_iter()
+                            .all(|(index, block, proof)| r.ingest(index, block, &proof));
+                        if all_landed {
+                            r.prune(start);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                };
+                if grew {
+                    appended.notify_waiters(); // wake subscribers tailing *this* mirror
+                }
             }
             tokio::time::sleep(RESUBSCRIBE_BACKOFF).await;
         }

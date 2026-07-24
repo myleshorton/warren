@@ -13,6 +13,7 @@ crypto = { path = "../crypto" }
 puncher = { path = "../puncher" }
 portmap = { path = "../portmap" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
+socket2 = "0.6"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "test-util"] }

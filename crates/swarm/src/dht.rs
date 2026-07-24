@@ -45,7 +45,16 @@ pub const ANNOUNCE_TTL_MS: Millis = 60 * 60 * 1_000;
 pub const ALPHA: usize = 3;
 
 /// How long (ms) to wait for a response before treating a request as failed.
-pub const REQUEST_TIMEOUT_MS: u64 = 1_000;
+///
+/// This bounds how long an *unreachable* contact stalls a lookup: with `ALPHA`
+/// requests in flight, N dead contacts cost ~ceil(N/ALPHA) × this. Lowered from
+/// 1000 to 500 as an interim mitigation for the ~5s find_node stall on a routing
+/// table full of departed clients — a ~2× win. It's a floor, not a cure: the real
+/// fix is to keep unreachable clients out of routing (client/server split). Kept
+/// generous enough (2× the ~270ms RTTs seen in the field) that a slow-but-live
+/// node — a distant/cellular peer — isn't prematurely marked dead, which would
+/// drop it from the lookup and can fail a connect outright.
+pub const REQUEST_TIMEOUT_MS: u64 = 500;
 
 /// Overall deadline (ms) for a connect — covering both discovery and the
 /// coordinator-brokered signaling — after which it gives up.
@@ -127,6 +136,12 @@ pub enum Event {
         /// `None` when the connect never reached a reply (`NotFound`/`TimedOut`).
         /// Diagnostic only — does not affect the outcome.
         peer_firewall: Option<Firewall>,
+        /// Duration of the iterative-lookup phase (connect start → coordinator
+        /// found), so the caller can split the total DHT cost into lookup vs.
+        /// coordinator-brokered signaling. `None` if the connect timed out or found
+        /// nobody before a coordinator was chosen (i.e. still in the lookup phase).
+        /// Diagnostic only.
+        lookup_ms: Option<u64>,
     },
     /// A peer wants to connect to us (we are the target). The caller stands up a
     /// data socket, calls [`Dht::accept_connect`] with its candidate address(es)
@@ -182,6 +197,9 @@ struct QueryContact {
 struct Query {
     target: NodeId,
     kind: QueryKind,
+    /// When the query started, to time the iterative-lookup phase (diagnostic:
+    /// splits a connect's DHT cost into lookup vs. coordinator-brokered signaling).
+    started: Millis,
     contacts: Vec<QueryContact>,
     /// Nodes that returned an announce record for the target (potential
     /// coordinators for a connect).
@@ -241,6 +259,11 @@ struct ConnectState {
     /// Our own data-socket candidate addresses, sent in the request so the target
     /// learns where to punch back.
     data_addrs: Vec<SocketAddr>,
+    /// Duration of the iterative-lookup phase (connect start → a coordinator found),
+    /// set when the query finishes and the broker request goes out. `None` while the
+    /// lookup is still running (so a lookup-phase timeout reports it as unknown).
+    /// Diagnostic only.
+    lookup_ms: Option<u64>,
 }
 
 /// The target side of an in-flight connect: a request arrived for us, and we
@@ -466,6 +489,7 @@ impl Dht {
                 deadline: now + CONNECT_TIMEOUT_MS,
                 coordinator: None,
                 data_addrs,
+                lookup_ms: None,
             },
         );
         self.start_query(target, QueryKind::Connect, now)
@@ -516,6 +540,7 @@ impl Dht {
         let mut query = Query {
             target,
             kind,
+            started: now,
             contacts: Vec::new(),
             coordinators: Vec::new(),
             peers: Vec::new(),
@@ -533,11 +558,16 @@ impl Dht {
         let Ok(packet) = Packet::decode(data) else {
             return;
         };
-        // Most packets are direct evidence the sender is reachable at `from`, so
-        // fold it into the routing table. A `Reflect` is the exception: it comes
-        // from a transient data socket (a reflexive probe), not a routable peer,
-        // so inserting it would poison routing with an ephemeral address.
-        if packet.sender != self.id && !matches!(&packet.msg, Message::Reflect) {
+        // Fold the sender into the routing table only if it advertises itself as a
+        // routable ("server") node — directly reachable for a cold query. A NAT'd
+        // "client" (reachable=false) can send us announces/signals/pings while its
+        // mapping is open, but a later cold FindNode won't reach it; adding it would
+        // poison routing with a dead contact that stalls every lookup on a
+        // REQUEST_TIMEOUT (the client/server split). Clients stay discoverable via
+        // announce records. A `Reflect` is never routing evidence (it comes from a
+        // transient reflexive-probe socket, not a routable endpoint).
+        if packet.sender != self.id && packet.reachable && !matches!(&packet.msg, Message::Reflect)
+        {
             self.table.insert(Contact::new(packet.sender, from));
         }
 
@@ -627,6 +657,12 @@ impl Dht {
                         c.status = Status::Failed;
                     }
                 }
+                // A FindNode we sent went unanswered: count it against the
+                // contact in the routing table. Sustained silence evicts a
+                // departed server so later lookups stop burning a REQUEST_TIMEOUT
+                // on it; any inbound packet (handle_input's insert) resets the
+                // count, so a live-but-lossy peer is never dropped.
+                self.table.record_failure(&p.contact);
                 self.drive_query(p.query, now);
             }
         }
@@ -648,7 +684,9 @@ impl Dht {
             .map(|(target, _)| *target)
             .collect();
         for target in stale {
-            self.connecting.remove(&target);
+            // Carry the lookup timing if we got as far as brokering (Some) vs. timed
+            // out still looking (None) — so the caller can tell which phase stalled.
+            let lookup_ms = self.connecting.remove(&target).and_then(|cs| cs.lookup_ms);
             // Stop any still-running discovery for this target so it can't emit
             // a late Signal after we've already reported TimedOut.
             self.cancel_connect_queries(&target);
@@ -658,6 +696,7 @@ impl Dht {
                 peer_data_addrs: Vec::new(),
                 strategy: None,
                 peer_firewall: None,
+                lookup_ms,
             });
         }
 
@@ -692,10 +731,21 @@ impl Dht {
         let data = Packet {
             sender: self.id,
             rid,
+            reachable: self.is_server(),
             msg,
         }
         .encode();
         self.outbox.push_back(Transmit { to, data });
+    }
+
+    /// Whether we advertise ourselves as a routable ("server") node — one a peer
+    /// can add to its routing table and reach with a cold query. True only with
+    /// POSITIVE evidence of being directly reachable: a pinned-Open firewall (a
+    /// public node like the VPS) or a sampled-Open classification. "Unknown"
+    /// (the default before classification) counts as a client, so a NAT'd node
+    /// doesn't leak into peers' routing tables during its pre-sample window.
+    fn is_server(&self) -> bool {
+        self.pinned == Some(Firewall::Open) || self.firewall() == Some(Firewall::Open)
     }
 
     fn on_nodes_response(
@@ -932,8 +982,15 @@ impl Dht {
         }
 
         if let Some((kind, target, closest, coordinators, peers)) = done {
+            // Time the lookup phase (query start → now) before dropping the query, so
+            // a connect can split its DHT cost into lookup vs. broker signaling.
+            let lookup_ms = self
+                .queries
+                .get(&qid)
+                .map(|q| now.saturating_sub(q.started))
+                .unwrap_or(0);
             self.queries.remove(&qid);
-            self.finish_query(qid, kind, target, closest, coordinators, peers);
+            self.finish_query(qid, kind, target, closest, coordinators, peers, lookup_ms);
         }
     }
 
@@ -946,6 +1003,7 @@ impl Dht {
         closest: Vec<Contact>,
         coordinators: Vec<Contact>,
         peers: Vec<Contact>,
+        lookup_ms: u64,
     ) {
         match kind {
             QueryKind::FindNode => {
@@ -979,6 +1037,7 @@ impl Dht {
                     let data_addrs = match self.connecting.get_mut(&target) {
                         Some(cs) => {
                             cs.coordinator = Some(coord.addr);
+                            cs.lookup_ms = Some(lookup_ms); // lookup done; broker begins
                             cs.data_addrs.clone()
                         }
                         None => return, // connect already resolved/expired
@@ -1000,12 +1059,15 @@ impl Dht {
                 }
                 None => {
                     self.connecting.remove(&target);
+                    // The lookup ran to completion but turned up no coordinator, so
+                    // the whole DHT cost so far was lookup; there was no broker phase.
                     self.events.push_back(Event::Connected {
                         target,
                         outcome: ConnectOutcome::NotFound,
                         peer_data_addrs: Vec::new(),
                         strategy: None,
                         peer_firewall: None,
+                        lookup_ms: Some(lookup_ms),
                     });
                 }
             },
@@ -1108,7 +1170,7 @@ impl Dht {
                 .get(&target)
                 .is_some_and(|cs| cs.coordinator == Some(from));
             if from_coordinator {
-                self.connecting.remove(&target);
+                let lookup_ms = self.connecting.remove(&target).and_then(|cs| cs.lookup_ms);
                 let strategy = plan(self.signaling_firewall(), nat);
                 self.events.push_back(Event::Connected {
                     target,
@@ -1116,6 +1178,7 @@ impl Dht {
                     peer_data_addrs: data_addrs,
                     strategy: Some(strategy),
                     peer_firewall: Some(nat),
+                    lookup_ms,
                 });
             }
         } else if self.seen_initiators.contains(&(target, initiator_addr))
@@ -1179,6 +1242,7 @@ mod tests {
         Packet {
             sender: id(9),
             rid: 1,
+            reachable: true,
             msg: Message::Signal {
                 target,
                 initiator,
@@ -1303,6 +1367,7 @@ mod tests {
             Packet {
                 sender,
                 rid,
+                reachable: true,
                 msg: Message::Nodes {
                     contacts: vec![],
                     peers: vec![],
@@ -1346,6 +1411,7 @@ mod tests {
             Packet {
                 sender,
                 rid,
+                reachable: true,
                 msg: Message::Pong {
                     observed: addr("203.0.113.1:40000"),
                 },
@@ -1417,6 +1483,7 @@ mod tests {
         let request = Packet {
             sender: id(9),
             rid: 1,
+            reachable: true,
             msg: Message::Signal {
                 target: me,
                 initiator,
@@ -1457,6 +1524,7 @@ mod tests {
         let reflect = Packet {
             sender: id(2),
             rid: 5,
+            reachable: true,
             msg: Message::Reflect,
         }
         .encode();
@@ -1480,10 +1548,58 @@ mod tests {
         let ping = Packet {
             sender: id(2),
             rid: 6,
+            reachable: true,
             msg: Message::Ping,
         }
         .encode();
         dht.handle_input(prober, &ping, 0);
-        assert_eq!(dht.routing_len(), 1, "a Ping is routing evidence");
+        assert_eq!(
+            dht.routing_len(),
+            1,
+            "a reachable node's Ping is routing evidence"
+        );
+    }
+
+    #[test]
+    fn client_packets_do_not_pollute_routing() {
+        // The client/server split: a packet from a node that advertises itself as
+        // reachable (a server) earns a routing slot; the same packet from a NAT'd
+        // client (reachable = false) does not — so departed/unreachable clients
+        // can't fill the table and stall lookups on their timeouts.
+        let mut dht = Dht::new(id(1));
+        let client = addr("198.51.100.9:7777");
+        let server = addr("203.0.113.9:8888");
+
+        // A client's announce/ping must NOT add it to routing.
+        for msg in [Message::Ping, Message::Announce { topic: id(1) }] {
+            let pkt = Packet {
+                sender: id(2),
+                rid: 1,
+                reachable: false,
+                msg,
+            }
+            .encode();
+            dht.handle_input(client, &pkt, 0);
+        }
+        assert_eq!(
+            dht.routing_len(),
+            0,
+            "a NAT'd client must not enter the routing table"
+        );
+
+        // A server's ping DOES add it.
+        let pkt = Packet {
+            sender: id(3),
+            rid: 2,
+            reachable: true,
+            msg: Message::Ping,
+        }
+        .encode();
+        dht.handle_input(server, &pkt, 0);
+        assert_eq!(
+            dht.routing_len(),
+            1,
+            "a reachable server must enter the routing table"
+        );
     }
 }

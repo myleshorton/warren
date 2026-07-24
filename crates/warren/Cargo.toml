@@ -13,6 +13,7 @@ swarm = { path = "../swarm" }
 driver = { path = "../driver" }
 transfer = { path = "../transfer" }
 feed = { path = "../feed" }
+feed-redb = { path = "../feed-redb" }
 blob = { path = "../blob" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

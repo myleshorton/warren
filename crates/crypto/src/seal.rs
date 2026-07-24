@@ -15,7 +15,7 @@
 
 use chacha20::cipher::{KeyIvInit, StreamCipher, StreamCipherSeek};
 use chacha20::XChaCha20;
-use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 
 use crate::hash_parts;
@@ -105,6 +105,48 @@ pub fn unwrap_key(
     plain.try_into().ok()
 }
 
+/// AEAD-seal `plaintext` under a fixed `key`, authenticating (but not encrypting) `aad`.
+/// Returns a fresh random nonce and the ciphertext (Poly1305 tag appended). Unlike
+/// [`seal`] this reuses a caller-owned key across many values — for at-rest storage where
+/// the key is a per-device secret and `aad` binds the value to its slot (e.g. a store key),
+/// so a value can't be relocated to a different slot and still authenticate. XChaCha20's
+/// 24-byte nonce makes random per-value nonces collision-safe under that key reuse.
+pub fn aead_seal(key: &[u8; 32], aad: &[u8], plaintext: &[u8]) -> ([u8; NONCE_LEN], Vec<u8>) {
+    let mut nonce = [0u8; NONCE_LEN];
+    fill_random(&mut nonce);
+    let cipher = XChaCha20Poly1305::new_from_slice(key).expect("32-byte key");
+    let ciphertext = cipher
+        .encrypt(
+            XNonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .expect("AEAD encrypt");
+    (nonce, ciphertext)
+}
+
+/// Open an [`aead_seal`] ciphertext. `None` if the key is wrong, `aad` differs from what was
+/// sealed, or the ciphertext was tampered with.
+pub fn aead_open(
+    key: &[u8; 32],
+    aad: &[u8],
+    nonce: &[u8; NONCE_LEN],
+    ciphertext: &[u8],
+) -> Option<Vec<u8>> {
+    let cipher = XChaCha20Poly1305::new_from_slice(key).ok()?;
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +179,29 @@ mod tests {
 
         let wrong = derive_key(b"different-secret", b"murmur:content-kek:v1");
         assert_eq!(unwrap_key(&wrong, &n, &wrapped), None, "wrong KEK fails");
+    }
+
+    #[test]
+    fn aead_round_trips_and_binds_the_associated_data() {
+        let key = derive_key(b"per-device-store-secret", b"warren:feed-store:v1");
+        let msg = b"a mirrored block's bytes".repeat(10);
+        let aad = b"feed-key||index-7";
+        let (nonce, ct) = aead_seal(&key, aad, &msg);
+        assert_ne!(ct, msg, "ciphertext differs from plaintext");
+        assert_eq!(aead_open(&key, aad, &nonce, &ct), Some(msg.clone()));
+
+        // A different key, a different AAD (relocating the value to another slot), or a
+        // tampered ciphertext all fail to open.
+        let wrong_key = derive_key(b"other-secret", b"warren:feed-store:v1");
+        assert_eq!(aead_open(&wrong_key, aad, &nonce, &ct), None, "wrong key");
+        assert_eq!(
+            aead_open(&key, b"feed-key||index-8", &nonce, &ct),
+            None,
+            "AAD mismatch (value relocated to another slot) is rejected"
+        );
+        let mut tampered = ct.clone();
+        tampered[0] ^= 0xff;
+        assert_eq!(aead_open(&key, aad, &nonce, &tampered), None, "tampered");
     }
 
     #[test]

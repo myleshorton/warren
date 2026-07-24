@@ -2,15 +2,29 @@
 //!
 //! Contacts are filed into 256 buckets by the shared-prefix length between the
 //! contact's id and our own. Each bucket holds up to [`K`] contacts,
-//! most-recently-seen last. This is the structure the ephemeral/persistent
-//! lifecycle and eviction policy will later hook into; for now a full bucket
-//! simply keeps its existing (older, presumed-live) contacts.
+//! most-recently-seen last, and a full bucket keeps its existing (older,
+//! presumed-live) contacts.
+//!
+//! Departed servers are evicted by a consecutive-failure count: [`record_failure`]
+//! bumps a per-contact counter, [`insert`] (a fresh sighting) clears it, and a
+//! contact reaching [`EVICTION_THRESHOLD`] failures is dropped. Because any packet
+//! from a peer refreshes it, only a peer that is *both* silent and unresponsive
+//! across several lookups is removed — a single lost round-trip never evicts.
+//!
+//! [`record_failure`]: RoutingTable::record_failure
+//! [`insert`]: RoutingTable::insert
 
 use crate::id::{NodeId, ID_LEN};
 use std::net::SocketAddr;
 
 /// Bucket capacity — the Kademlia replication parameter.
 pub const K: usize = 20;
+
+/// Consecutive unanswered FindNodes (with no intervening packet from the peer)
+/// after which a contact is evicted. Three, not one: a lost datagram or a brief
+/// blip is transient, and a live server clears its count the moment it sends us
+/// anything — so eviction only removes a peer that has genuinely gone away.
+pub const EVICTION_THRESHOLD: u8 = 3;
 
 /// A known peer: its id and where to reach it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -28,11 +42,21 @@ impl Contact {
     }
 }
 
+/// A stored contact plus its liveness bookkeeping. The failure counter is
+/// table-internal — `closest`/`contains` hand callers bare [`Contact`]s, so it
+/// never leaks into query results or the `Nodes` wire message.
+#[derive(Clone, Copy, Debug)]
+struct Entry {
+    contact: Contact,
+    /// Consecutive unanswered FindNodes; reset to 0 by any fresh sighting.
+    failures: u8,
+}
+
 /// A routing table owned by the node with id `local`.
 #[derive(Debug)]
 pub struct RoutingTable {
     local: NodeId,
-    buckets: Vec<Vec<Contact>>,
+    buckets: Vec<Vec<Entry>>,
 }
 
 impl RoutingTable {
@@ -58,26 +82,56 @@ impl RoutingTable {
     /// Insert or refresh a contact.
     ///
     /// Returns `true` if the contact is now present. A contact already known is
-    /// moved to the most-recently-seen position. A new contact for a full bucket
-    /// is dropped (keeping older, presumed-live peers) and `false` is returned.
+    /// moved to the most-recently-seen position, its address refreshed, and its
+    /// failure count cleared — a fresh sighting is proof the peer is live. A new
+    /// contact for a full bucket is dropped (keeping older, presumed-live peers)
+    /// and `false` is returned.
     pub fn insert(&mut self, contact: Contact) -> bool {
         let Some(idx) = self.bucket_index(&contact.id) else {
             return false;
         };
         let bucket = &mut self.buckets[idx];
 
-        if let Some(pos) = bucket.iter().position(|c| c.id == contact.id) {
-            let existing = bucket.remove(pos);
-            // Refresh address in case it changed, then move to the back.
-            bucket.push(Contact {
-                id: existing.id,
-                addr: contact.addr,
-            });
+        if let Some(pos) = bucket.iter().position(|e| e.contact.id == contact.id) {
+            let mut existing = bucket.remove(pos);
+            // Refresh address in case it changed, clear any accumulated failures
+            // (the peer just proved itself live), then move to the back.
+            existing.contact.addr = contact.addr;
+            existing.failures = 0;
+            bucket.push(existing);
             return true;
         }
 
         if bucket.len() < K {
-            bucket.push(contact);
+            bucket.push(Entry {
+                contact,
+                failures: 0,
+            });
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Record that a request to `id` went unanswered.
+    ///
+    /// Increments the contact's consecutive-failure count; if that reaches
+    /// [`EVICTION_THRESHOLD`] the contact is removed and `true` is returned.
+    /// An unknown id is a no-op returning `false`. A subsequent [`insert`] (any
+    /// fresh sighting) resets the count, so only *sustained* silence evicts.
+    ///
+    /// [`insert`]: RoutingTable::insert
+    pub fn record_failure(&mut self, id: &NodeId) -> bool {
+        let Some(idx) = self.bucket_index(id) else {
+            return false;
+        };
+        let bucket = &mut self.buckets[idx];
+        let Some(pos) = bucket.iter().position(|e| e.contact.id == *id) else {
+            return false;
+        };
+        bucket[pos].failures = bucket[pos].failures.saturating_add(1);
+        if bucket[pos].failures >= EVICTION_THRESHOLD {
+            bucket.remove(pos);
             true
         } else {
             false
@@ -87,7 +141,7 @@ impl RoutingTable {
     /// Whether a contact with this id is present.
     pub fn contains(&self, id: &NodeId) -> bool {
         match self.bucket_index(id) {
-            Some(idx) => self.buckets[idx].iter().any(|c| c.id == *id),
+            Some(idx) => self.buckets[idx].iter().any(|e| e.contact.id == *id),
             None => false,
         }
     }
@@ -104,7 +158,7 @@ impl RoutingTable {
 
     /// The `n` contacts closest to `target`, nearest first.
     pub fn closest(&self, target: &NodeId, n: usize) -> Vec<Contact> {
-        let mut all: Vec<Contact> = self.buckets.iter().flatten().copied().collect();
+        let mut all: Vec<Contact> = self.buckets.iter().flatten().map(|e| e.contact).collect();
         all.sort_by_key(|c| c.id.distance(target));
         all.truncate(n);
         all
@@ -191,5 +245,60 @@ mod tests {
         for retained in &inserted {
             assert!(t.contains(retained));
         }
+    }
+
+    #[test]
+    fn failures_below_threshold_retain_contact() {
+        let mut t = RoutingTable::new(id(0x00));
+        let c = Contact::new(id(0x42), addr(1));
+        t.insert(c);
+        for _ in 0..(EVICTION_THRESHOLD - 1) {
+            assert!(
+                !t.record_failure(&c.id),
+                "should not evict before threshold"
+            );
+        }
+        assert!(t.contains(&c.id));
+    }
+
+    #[test]
+    fn sustained_failures_evict() {
+        let mut t = RoutingTable::new(id(0x00));
+        let c = Contact::new(id(0x42), addr(1));
+        t.insert(c);
+        let mut evicted = false;
+        for _ in 0..EVICTION_THRESHOLD {
+            evicted = t.record_failure(&c.id);
+        }
+        assert!(evicted, "the threshold-th failure returns true");
+        assert!(!t.contains(&c.id), "the departed contact is gone");
+        assert_eq!(t.len(), 0);
+    }
+
+    #[test]
+    fn success_resets_failure_count() {
+        // A live-but-lossy server: it accumulates failures, but a single fresh
+        // sighting between them clears the count, so it is never evicted.
+        let mut t = RoutingTable::new(id(0x00));
+        let c = Contact::new(id(0x42), addr(1));
+        t.insert(c);
+        for _ in 0..(EVICTION_THRESHOLD - 1) {
+            t.record_failure(&c.id);
+        }
+        t.insert(c); // a packet arrives — proof of life, resets the counter
+        for _ in 0..(EVICTION_THRESHOLD - 1) {
+            assert!(!t.record_failure(&c.id));
+        }
+        assert!(
+            t.contains(&c.id),
+            "reset means the second failure run also stays below threshold"
+        );
+    }
+
+    #[test]
+    fn record_failure_unknown_id_is_noop() {
+        let mut t = RoutingTable::new(id(0x00));
+        assert!(!t.record_failure(&id(0x99)));
+        assert_eq!(t.len(), 0);
     }
 }

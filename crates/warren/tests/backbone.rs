@@ -173,6 +173,24 @@ async fn a_mirror_keeps_a_feed_tailable_after_its_author_goes_offline() {
     author_serve.abort();
     drop(author);
 
+    // With the author gone, the mirror still exposes its records to an app — this is what
+    // Murmur's refresh_feed reads to keep an offline author's posts in the feed. Every
+    // block, in order, tagged with the author's feed key.
+    let records = mirror.mirrored_records();
+    assert_eq!(
+        records.len(),
+        5,
+        "mirrored_records exposes the whole mirrored feed while the author is offline"
+    );
+    for (i, (block, key)) in records.iter().enumerate() {
+        assert_eq!(block.as_slice(), format!("msg {i}").as_bytes());
+        assert_eq!(
+            key.to_bytes(),
+            author_key.to_bytes(),
+            "each mirrored record is tagged with its author's feed key"
+        );
+    }
+
     // --- Subscriber: tail the author's feed by key. The author is gone, so the DHT
     // failover in Session::subscribe must fall through to the mirror. ---
     let subscriber = make_session(joined(bootstrap, id(3)).await, [0xCC; 32]).0;
@@ -209,6 +227,185 @@ async fn a_mirror_keeps_a_feed_tailable_after_its_author_goes_offline() {
             blocks.get(&i).map(|b| b.as_slice()),
             Some(format!("msg {i}").as_bytes()),
             "block {i} tailed from the mirror must match the author's original"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_windowed_mirror_holds_and_re_serves_only_its_suffix_window() {
+    // A bounded seeder mirrors only a feed's tail window, and a *downstream* windowed mirror
+    // can re-fetch that window from it — all while the author is offline. This proves the
+    // whole Phase C+D path end to end over a real backbone: fetch_replica_window builds a
+    // sparse replica, serve_by_key serves it (peaks + held-range + windowed blocks), and a
+    // second windowed mirror bootstraps off the first.
+    let (boot, _peers) = network(4).await;
+    let bootstrap = boot.contact();
+
+    // --- Author: a 10-block feed, announced + served by key. ---
+    let (author, author_key) = make_session(joined(bootstrap, id(1)).await, [0xA1; 32]);
+    {
+        let log = author.log();
+        let mut g = log.lock().expect("log");
+        for i in 0..10 {
+            g.append(format!("msg {i}").into_bytes());
+        }
+    }
+    let author_id = author.node.id();
+    timeout(T, author.node.announce(author_id))
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(T, author.node.announce(author.own_feed_topic()))
+        .await
+        .unwrap()
+        .unwrap();
+    let author_serve = spawn_serve_by_key(author.clone());
+
+    // --- Mirror A: mirror only the last 4 blocks [6, 10). ---
+    let (mirror_a, _ka) = make_session(joined(bootstrap, id(2)).await, [0xB2; 32]);
+    let mirror_a_id = mirror_a.node.id();
+    timeout(T, mirror_a.node.announce(mirror_a_id))
+        .await
+        .unwrap()
+        .unwrap();
+    let (replica_a, _appended_a) =
+        timeout(T, mirror_a.mirror_feed_window(author_id, author_key, 4))
+            .await
+            .unwrap()
+            .expect("windowed mirror bootstraps its suffix window from the author");
+    {
+        let r = replica_a.lock().expect("replica");
+        assert_eq!(r.len(), 10, "the mirror knows the feed's full length");
+        assert_eq!(
+            r.held_ranges(),
+            vec![(6, 10)],
+            "but holds only the last-4 window"
+        );
+    }
+    // mirrored_records exposes exactly the window (blocks 6..10), tagged with the author.
+    let mut held: Vec<Vec<u8>> = mirror_a
+        .mirrored_records()
+        .into_iter()
+        .map(|(block, key)| {
+            assert_eq!(key.to_bytes(), author_key.to_bytes());
+            block
+        })
+        .collect();
+    held.sort();
+    let want: Vec<Vec<u8>> = (6..10).map(|i| format!("msg {i}").into_bytes()).collect();
+    assert_eq!(held, want, "the windowed mirror exposes only its window");
+    let _mirror_a_serve = spawn_serve_by_key(mirror_a.clone());
+
+    // --- The author goes offline. ---
+    author_serve.abort();
+    drop(author);
+
+    // --- Mirror B: bootstrap the SAME window from mirror A (the author is gone), proving
+    // A serves its sparse window over the network. ---
+    let (mirror_b, _kb) = make_session(joined(bootstrap, id(3)).await, [0xC3; 32]);
+    timeout(T, mirror_b.node.announce(mirror_b.node.id()))
+        .await
+        .unwrap()
+        .unwrap();
+    let (replica_b, _appended_b) =
+        timeout(T, mirror_b.mirror_feed_window(mirror_a_id, author_key, 4))
+            .await
+            .unwrap()
+            .expect("a downstream windowed mirror bootstraps off mirror A");
+    let r = replica_b.lock().expect("replica");
+    assert_eq!(r.len(), 10, "B learns the full length from A's head");
+    assert_eq!(r.held_ranges(), vec![(6, 10)], "B holds the same window");
+    for i in 6..10u64 {
+        assert_eq!(
+            r.block(i as usize).as_deref(),
+            Some(format!("msg {i}").as_bytes()),
+            "block {i} re-served by mirror A matches the author's original"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_windowed_mirror_follows_a_growing_author_incrementally() {
+    // run_mirror_window keeps a windowed mirror current as the author grows, fetching only
+    // the new tail (not the whole window). The author grows by less than the window, so some
+    // of the mirror's existing blocks are reused rather than re-fetched.
+    let window = 4u64;
+    let (boot, _peers) = network(4).await;
+    let bootstrap = boot.contact();
+
+    // --- Author: 5 blocks, growing later; served live by key. ---
+    let (author, author_key) = make_session(joined(bootstrap, id(1)).await, [0xD4; 32]);
+    {
+        let log = author.log();
+        let mut g = log.lock().expect("log");
+        for i in 0..5 {
+            g.append(format!("msg {i}").into_bytes());
+        }
+    }
+    let author_id = author.node.id();
+    timeout(T, author.node.announce(author_id))
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(T, author.node.announce(author.own_feed_topic()))
+        .await
+        .unwrap()
+        .unwrap();
+    let _author_serve = spawn_serve_by_key(author.clone());
+
+    // --- Mirror: bootstrap the window [1, 5), then run the live windowed tail. ---
+    let (mirror, _k) = make_session(joined(bootstrap, id(2)).await, [0xE5; 32]);
+    timeout(T, mirror.node.announce(mirror.node.id()))
+        .await
+        .unwrap()
+        .unwrap();
+    let (replica, appended) = timeout(T, mirror.mirror_feed_window(author_id, author_key, window))
+        .await
+        .unwrap()
+        .expect("windowed mirror bootstraps");
+    assert_eq!(
+        replica.lock().expect("replica").held_ranges(),
+        vec![(1, 5)],
+        "bootstraps the last-4 window of the 5-block feed"
+    );
+    let run = {
+        let (m, r, a) = (mirror.clone(), replica.clone(), appended.clone());
+        tokio::spawn(async move { m.run_mirror_window(author_key, r, a, window).await })
+    };
+
+    // --- The author grows to 7 (by 2 < window 4), so the mirror should slide to [3, 7),
+    // reusing blocks 3 and 4 and fetching only 5 and 6. ---
+    {
+        let log = author.log();
+        let mut g = log.lock().expect("log");
+        for i in 5..7 {
+            g.append(format!("msg {i}").into_bytes());
+        }
+    }
+
+    let deadline = Instant::now() + T;
+    loop {
+        {
+            let r = replica.lock().expect("replica");
+            if r.len() == 7 && r.held_ranges() == vec![(3, 7)] {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the windowed mirror never followed the author's growth"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    run.abort();
+
+    // The slid window holds exactly [3, 7), each block matching the author.
+    let r = replica.lock().expect("replica");
+    for i in 3..7u64 {
+        assert_eq!(
+            r.block(i as usize).as_deref(),
+            Some(format!("msg {i}").as_bytes()),
+            "followed block {i} matches the author"
         );
     }
 }

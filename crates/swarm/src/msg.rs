@@ -98,6 +98,13 @@ pub struct Packet {
     pub sender: NodeId,
     /// Request id; a response repeats the id of the request it answers.
     pub rid: u64,
+    /// Whether the sender advertises itself as a routable ("server") node —
+    /// directly reachable for a cold request. Only reachable senders earn a
+    /// routing-table slot on the receiver; NAT'd "client" senders set this false
+    /// so they never pollute routing with contacts that can't answer a later cold
+    /// query (they stay discoverable via announce records instead). See
+    /// [`crate::dht::Dht`]'s client/server split.
+    pub reachable: bool,
     /// The message body.
     pub msg: Message,
 }
@@ -108,6 +115,7 @@ impl Packet {
         let mut enc = Encoder::new();
         enc.raw(self.sender.as_bytes());
         enc.uint(self.rid);
+        enc.u8(u8::from(self.reachable));
         match &self.msg {
             Message::Ping => {
                 enc.u8(KIND_PING);
@@ -161,6 +169,7 @@ impl Packet {
         let mut dec = Decoder::new(buf);
         let sender = NodeId::from_bytes(dec.array::<ID_LEN>()?);
         let rid = dec.uint()?;
+        let reachable = dec.u8()? != 0;
         let kind = dec.u8()?;
         let msg = match kind {
             KIND_PING => Message::Ping,
@@ -204,7 +213,12 @@ impl Packet {
             _ => return Err(MsgError::Malformed("unknown message kind")),
         };
         dec.finish()?;
-        Ok(Packet { sender, rid, msg })
+        Ok(Packet {
+            sender,
+            rid,
+            reachable,
+            msg,
+        })
     }
 }
 
@@ -234,14 +248,14 @@ fn decode_contacts<'a>(dec: &mut Decoder<'a>) -> Result<Vec<Contact>, MsgError> 
     Ok(contacts)
 }
 
-fn encode_addrs(enc: &mut Encoder, addrs: &[SocketAddr]) {
+pub(crate) fn encode_addrs(enc: &mut Encoder, addrs: &[SocketAddr]) {
     enc.uint(addrs.len() as u64);
     for a in addrs {
         encode_addr(enc, a);
     }
 }
 
-fn decode_addrs<'a>(dec: &mut Decoder<'a>) -> Result<Vec<SocketAddr>, MsgError> {
+pub(crate) fn decode_addrs<'a>(dec: &mut Decoder<'a>) -> Result<Vec<SocketAddr>, MsgError> {
     // Smallest address is a family tag + a v4 address: 1 + 4 + 2 bytes. Bound the
     // count by that (not by a fixed cap) so a crafted length can't force an
     // allocation far larger than the buffer — same guard as `decode_contacts`.
@@ -257,7 +271,7 @@ fn decode_addrs<'a>(dec: &mut Decoder<'a>) -> Result<Vec<SocketAddr>, MsgError> 
     Ok(addrs)
 }
 
-fn encode_addr(enc: &mut Encoder, addr: &SocketAddr) {
+pub(crate) fn encode_addr(enc: &mut Encoder, addr: &SocketAddr) {
     match addr {
         SocketAddr::V4(a) => {
             enc.u8(ADDR_V4);
@@ -272,7 +286,7 @@ fn encode_addr(enc: &mut Encoder, addr: &SocketAddr) {
     }
 }
 
-fn decode_addr(dec: &mut Decoder) -> Result<SocketAddr, MsgError> {
+pub(crate) fn decode_addr(dec: &mut Decoder) -> Result<SocketAddr, MsgError> {
     match dec.u8()? {
         ADDR_V4 => {
             let octets = dec.array::<4>()?;
@@ -308,11 +322,13 @@ mod tests {
         roundtrip(&Packet {
             sender: id(1),
             rid: 7,
+            reachable: false,
             msg: Message::Ping,
         });
         roundtrip(&Packet {
             sender: id(2),
             rid: 8,
+            reachable: false,
             msg: Message::Pong {
                 observed: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(9, 9, 9, 9), 42)),
             },
@@ -320,10 +336,25 @@ mod tests {
     }
 
     #[test]
+    fn reachable_flag_roundtrips() {
+        // The client/server routing bit must survive encode/decode both ways.
+        for reachable in [true, false] {
+            let p = Packet {
+                sender: id(1),
+                rid: 5,
+                reachable,
+                msg: Message::Ping,
+            };
+            assert_eq!(Packet::decode(&p.encode()).unwrap().reachable, reachable);
+        }
+    }
+
+    #[test]
     fn find_node_roundtrip() {
         roundtrip(&Packet {
             sender: id(3),
             rid: 42,
+            reachable: false,
             msg: Message::FindNode { target: id(9) },
         });
     }
@@ -345,12 +376,14 @@ mod tests {
         roundtrip(&Packet {
             sender: id(4),
             rid: 100,
+            reachable: false,
             msg: Message::Nodes { contacts, peers },
         });
         // Empty peers list is the common case and must round-trip too.
         roundtrip(&Packet {
             sender: id(4),
             rid: 101,
+            reachable: false,
             msg: Message::Nodes {
                 contacts: vec![Contact::new(id(10), addr4(5000))],
                 peers: vec![],
@@ -363,6 +396,7 @@ mod tests {
         roundtrip(&Packet {
             sender: id(5),
             rid: 1,
+            reachable: false,
             msg: Message::Announce { topic: id(99) },
         });
     }
@@ -372,11 +406,13 @@ mod tests {
         roundtrip(&Packet {
             sender: id(7),
             rid: 2,
+            reachable: false,
             msg: Message::Reflect,
         });
         roundtrip(&Packet {
             sender: id(8),
             rid: 3,
+            reachable: false,
             msg: Message::Reflected {
                 observed: addr4(51000),
             },
@@ -402,6 +438,7 @@ mod tests {
                 roundtrip(&Packet {
                     sender: id(6),
                     rid: 3,
+                    reachable: false,
                     msg: Message::Signal {
                         target: id(20),
                         initiator: id(21),
@@ -420,6 +457,7 @@ mod tests {
         let mut enc = Encoder::new();
         enc.raw(id(1).as_bytes());
         enc.uint(1);
+        enc.u8(0); // reachable flag
         enc.u8(99);
         assert_eq!(
             Packet::decode(&enc.into_vec()),
@@ -432,6 +470,7 @@ mod tests {
         let mut bytes = Packet {
             sender: id(1),
             rid: 1,
+            reachable: false,
             msg: Message::Ping,
         }
         .encode();
@@ -450,6 +489,7 @@ mod tests {
         let mut enc = Encoder::new();
         enc.raw(id(1).as_bytes());
         enc.uint(1);
+        enc.u8(0); // reachable flag
         enc.u8(KIND_SIGNAL);
         enc.raw(id(20).as_bytes());
         enc.raw(id(21).as_bytes());

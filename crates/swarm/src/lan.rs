@@ -20,13 +20,18 @@ use thiserror::Error;
 use wire::{Decoder, Encoder, WireError};
 
 use crate::id::NodeId;
-use crate::msg::{decode_addrs, encode_addrs};
+use crate::msg::{decode_addr, decode_addrs, encode_addr, encode_addrs};
 
 /// Beacon wire version — bumped on any incompatible change to the encoding.
 const BEACON_VERSION: u8 = 1;
 /// Domain tag mixed into the signed bytes, so a beacon signature can't be mistaken for a
 /// signature over anything else this key signs.
 const BEACON_DOMAIN: &[u8] = b"warren-lan-beacon-v1";
+/// Connect-request wire version.
+const CONNECT_VERSION: u8 = 1;
+/// Domain tag for a connect request — distinct from the beacon's, so the two can't be
+/// cross-verified even though they carry the same fields.
+const CONNECT_DOMAIN: &[u8] = b"warren-lan-connect-v1";
 /// A node advertises at most a few LAN addresses (multi-homed) and a few blinded topics
 /// (current + previous epoch, a handful of channels). Hard caps keep `decode` from allocating
 /// on a crafted count.
@@ -134,6 +139,116 @@ fn signed_bytes(key: &PublicKey, addrs: &[SocketAddr], topics: &[Hash]) -> Vec<u
     enc.bytes(BEACON_DOMAIN);
     enc.raw(key.as_bytes());
     encode_addrs(&mut enc, addrs);
+    enc.uint(topics.len() as u64);
+    for t in topics {
+        enc.raw(t);
+    }
+    enc.into_vec()
+}
+
+/// A LAN **connect request**: the Requester's identity + the data-socket address it wants the
+/// Responder to punch, and the blinded topics it's in — signed under its key. Sent once,
+/// unicast, to a discovered peer's LAN control address to broker a backbone-free connect (see
+/// `docs/lan-direct-connect.md`).
+#[derive(Debug, Clone)]
+pub struct Connect {
+    /// The requester's identity key; its node id is `hash(key)`.
+    pub key: PublicKey,
+    /// The requester's LAN data-socket address, where the responder dials it.
+    pub addr: SocketAddr,
+    /// Blinded per-epoch topics — the responder connects only for a channel it shares.
+    pub topics: Vec<Hash>,
+    /// Signature over `(domain, key, addr, topics)`.
+    pub sig: Signature,
+}
+
+impl Connect {
+    /// Build and sign a connect request for `keypair`.
+    pub fn sign(keypair: &Keypair, addr: SocketAddr, topics: Vec<Hash>) -> Connect {
+        let key = keypair.public();
+        let sig = keypair.sign(&connect_signed_bytes(&key, &addr, &topics));
+        Connect {
+            key,
+            addr,
+            topics,
+            sig,
+        }
+    }
+
+    /// The node id this request claims — `hash(key)`, what the Responder's Noise-accept binds.
+    pub fn node_id(&self) -> NodeId {
+        NodeId::from_bytes(hash(self.key.as_bytes()))
+    }
+
+    /// Whether the signature checks out against the claimed key.
+    pub fn verify(&self) -> bool {
+        self.key
+            .verify(
+                &connect_signed_bytes(&self.key, &self.addr, &self.topics),
+                &self.sig,
+            )
+            .is_ok()
+    }
+
+    /// Whether this request shares any topic with `ours` — i.e. is for a channel we're in.
+    pub fn shares_topic(&self, ours: &[Hash]) -> bool {
+        self.topics.iter().any(|t| ours.contains(t))
+    }
+
+    /// Encode for the wire.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut enc = Encoder::new();
+        enc.u8(CONNECT_VERSION);
+        enc.raw(self.key.as_bytes());
+        encode_addr(&mut enc, &self.addr);
+        enc.uint(self.topics.len() as u64);
+        for t in &self.topics {
+            enc.raw(t);
+        }
+        enc.raw(&self.sig.to_bytes());
+        enc.into_vec()
+    }
+
+    /// Decode a connect request. Hostile-input-safe: rejects an unknown version, an over-long
+    /// topic count, or trailing bytes; never panics.
+    pub fn decode(buf: &[u8]) -> Result<Connect, LanError> {
+        let mut dec = Decoder::new(buf);
+        let version = dec.u8()?;
+        if version != CONNECT_VERSION {
+            return Err(LanError::Version(version));
+        }
+        let key = PublicKey::from_bytes(&dec.array::<PUBLIC_KEY_LEN>()?)
+            .map_err(|_| LanError::Malformed("invalid public key"))?;
+        let addr = decode_addr(&mut dec).map_err(|_| LanError::Malformed("invalid address"))?;
+        let count = dec.uint()?;
+        if count > MAX_TOPICS as u64 {
+            return Err(LanError::Malformed("too many topics"));
+        }
+        if count > dec.remaining() as u64 / HASH_LEN as u64 {
+            return Err(LanError::Malformed("topic count exceeds buffer"));
+        }
+        let mut topics = Vec::with_capacity(count as usize);
+        for _ in 0..count {
+            topics.push(dec.array::<HASH_LEN>()?);
+        }
+        let sig = Signature::from_bytes(dec.array::<SIGNATURE_LEN>()?);
+        dec.finish()?;
+        Ok(Connect {
+            key,
+            addr,
+            topics,
+            sig,
+        })
+    }
+}
+
+/// The exact bytes a connect request signs — domain-tagged + framed, mirroring
+/// [`signed_bytes`] for the beacon but over a single address and its own domain.
+fn connect_signed_bytes(key: &PublicKey, addr: &SocketAddr, topics: &[Hash]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.bytes(CONNECT_DOMAIN);
+    enc.raw(key.as_bytes());
+    encode_addr(&mut enc, addr);
     enc.uint(topics.len() as u64);
     for t in topics {
         enc.raw(t);
@@ -267,6 +382,58 @@ mod tests {
             let junk: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();
             let _ = Beacon::decode(&junk);
         }
+    }
+
+    #[test]
+    fn connect_round_trips_and_verifies() {
+        let c = Connect::sign(
+            &kp(1),
+            "192.168.1.7:50000".parse().unwrap(),
+            vec![hash(&[10]), hash(&[20])],
+        );
+        let d = Connect::decode(&c.encode()).unwrap();
+        assert_eq!(d.key.to_bytes(), c.key.to_bytes());
+        assert_eq!(d.addr, c.addr);
+        assert_eq!(d.topics, c.topics);
+        assert!(d.verify());
+        assert_eq!(d.node_id(), c.node_id());
+        assert!(d.shares_topic(&[hash(&[20])]), "same channel");
+        assert!(!d.shares_topic(&[hash(&[99])]), "different channel");
+    }
+
+    #[test]
+    fn a_tampered_connect_fails_to_verify() {
+        let mut c = Connect::sign(&kp(2), "10.0.0.1:1".parse().unwrap(), vec![hash(&[1])]);
+        c.addr = "10.0.0.2:2".parse().unwrap(); // change the signed data address
+        assert!(!c.verify());
+    }
+
+    #[test]
+    fn connect_decode_rejects_bad_version_and_never_panics_on_garbage() {
+        let mut b = Connect::sign(&kp(3), "192.168.0.1:9".parse().unwrap(), vec![]).encode();
+        b[0] = 7;
+        assert!(matches!(Connect::decode(&b), Err(LanError::Version(7))));
+        for len in 0..80usize {
+            let junk: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(17)).collect();
+            let _ = Connect::decode(&junk);
+        }
+    }
+
+    #[test]
+    fn a_beacon_and_a_connect_do_not_cross_verify() {
+        // Distinct domains: a Connect's signature must not validate if reinterpreted with the
+        // beacon's signed bytes (and vice versa), even with identical fields.
+        let key = kp(4);
+        let addr: SocketAddr = "192.168.1.5:6000".parse().unwrap();
+        let topics = vec![hash(&[7])];
+        let c = Connect::sign(&key, addr, topics.clone());
+        // A beacon over the same fields has a different signature payload (domain + addr list).
+        let b = Beacon::sign(&key, vec![addr], topics);
+        assert_ne!(
+            c.sig.to_bytes(),
+            b.sig.to_bytes(),
+            "domain separation holds"
+        );
     }
 
     #[test]

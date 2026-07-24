@@ -271,7 +271,7 @@ pub(crate) fn decode_addrs<'a>(dec: &mut Decoder<'a>) -> Result<Vec<SocketAddr>,
     Ok(addrs)
 }
 
-fn encode_addr(enc: &mut Encoder, addr: &SocketAddr) {
+pub(crate) fn encode_addr(enc: &mut Encoder, addr: &SocketAddr) {
     match addr {
         SocketAddr::V4(a) => {
             enc.u8(ADDR_V4);
@@ -286,7 +286,7 @@ fn encode_addr(enc: &mut Encoder, addr: &SocketAddr) {
     }
 }
 
-fn decode_addr(dec: &mut Decoder) -> Result<SocketAddr, MsgError> {
+pub(crate) fn decode_addr(dec: &mut Decoder) -> Result<SocketAddr, MsgError> {
     match dec.u8()? {
         ADDR_V4 => {
             let octets = dec.array::<4>()?;

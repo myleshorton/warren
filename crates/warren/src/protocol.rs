@@ -263,7 +263,7 @@ pub async fn fetch_replica(
 /// the window. Returns `None` if the provider is unreachable, the peaks don't reproduce the
 /// signed root, or any block fails to verify. `window == 0` yields a shape-only replica
 /// (head + peaks, no blocks) — a valid mirror that can ingest later. Keep it current with
-/// [`Session::run_mirror_window`](crate::Session::run_mirror_window).
+/// `Session::run_mirror_window`.
 pub async fn fetch_replica_window(
     node: &Node,
     provider: NodeId,

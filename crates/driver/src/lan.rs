@@ -63,7 +63,7 @@ impl Drop for LanBeacon {
 impl LanBeacon {
     /// Start LAN discovery: join the multicast group and beacon `lan_addr` (where a peer dials
     /// this node directly on the LAN) plus the current `topics` — the node's blinded per-epoch
-    /// channel topics — every [`BEACON_INTERVAL`], recording same-topic peers heard. Returns an
+    /// channel topics — every `BEACON_INTERVAL`, recording same-topic peers heard. Returns an
     /// error if the multicast socket can't be set up (no multicast on this network), so the
     /// caller can simply skip LAN and fall back to the DHT.
     pub async fn start(

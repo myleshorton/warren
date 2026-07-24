@@ -135,7 +135,7 @@ fn open_feed_store(
 /// Open the feed log (backed by the redb feed store), blob store, and record list from
 /// disk. The returned [`feed::Log`] reads and writes its blocks through `feeds.redb`, so
 /// appends are durable and it isn't RAM-bound. When `at_rest_key` is `Some`, a *fresh* store
-/// is encrypted at rest with it (see [`open_feed_store`]); an existing store keeps whatever
+/// is encrypted at rest with it (see `open_feed_store`); an existing store keeps whatever
 /// it was created as.
 ///
 /// On the first boot after upgrading from the legacy line-file: if `feed.jsonl` exists

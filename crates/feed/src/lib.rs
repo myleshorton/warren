@@ -141,7 +141,7 @@ impl Log {
     /// Open a log over `store`, seeding the in-RAM peaks from the persisted tree (O(log n)
     /// peak reads) — so a persisted feed reopens intact and new appends land in `store`. A
     /// Phase-A feed (blocks but no tree yet) is backfilled once on first open; see
-    /// [`seed_accumulator`].
+    /// `seed_accumulator`.
     pub fn with_store(keypair: Keypair, store: Arc<dyn FeedStore>) -> StoreResult<Self> {
         let feed = keypair.public().to_bytes();
         let len = store.contiguous_len(&feed)?;

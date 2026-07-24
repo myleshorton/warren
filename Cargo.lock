@@ -300,6 +300,7 @@ dependencies = [
  "crypto",
  "portmap",
  "puncher",
+ "socket2",
  "swarm",
  "tokio",
 ]

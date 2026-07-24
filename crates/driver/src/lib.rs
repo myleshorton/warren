@@ -32,6 +32,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
+mod lan;
+
+pub use lan::LanBeacon;
 pub use puncher::Config as PunchConfig;
 pub use swarm::dht::ConnectOutcome;
 pub use swarm::Firewall;

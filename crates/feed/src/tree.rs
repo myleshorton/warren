@@ -39,9 +39,15 @@ fn node_hash(left: &Hash, right: &Hash) -> Hash {
 /// The stable flat-tree index of the node at `height` covering the leaf range
 /// `[offset·2^height, (offset+1)·2^height)` (mafintosh `flat-tree` numbering). A leaf
 /// (`height = 0`, `offset = i`) is `2i`; the index never changes as the tree grows, so
-/// it's the persistent key for a frozen node. Only called for real tree nodes, so the
-/// shift can't overflow (`height ≤ log₂(len) < 64`).
+/// it's the persistent key for a frozen node. Only called for nodes of an existing tree,
+/// where `height ≤ log₂(len)`; a `u64`-length feed can never approach `2^63` blocks, so
+/// `height < 63` and the `height + 1` shift stays within `u64`. The debug assertion documents
+/// (and enforces under test) that bound.
 fn node_index(height: u32, offset: u64) -> u64 {
+    debug_assert!(
+        height < 63,
+        "node height {height} overflows the flat-tree index shift"
+    );
     (offset << (height + 1)) + (1 << height) - 1
 }
 

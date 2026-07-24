@@ -550,9 +550,14 @@ impl Session {
         for (replica, _notify) in self.mirrored.lock().expect("mirrored").values() {
             let r = replica.lock().expect("replica");
             let key = r.public_key();
-            for i in 0..r.len() {
-                if let Some(block) = r.block(i) {
-                    out.push((block, key));
+            // Walk only the blocks the replica actually holds — a windowed mirror's `len` is
+            // the whole feed but only a suffix window is present, so scanning `0..len` would
+            // probe (and miss) O(len) absent indices on every refresh.
+            for (start, end) in r.held_ranges() {
+                for i in start..end {
+                    if let Some(block) = r.block(i as usize) {
+                        out.push((block, key));
+                    }
                 }
             }
         }

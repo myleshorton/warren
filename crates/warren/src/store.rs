@@ -98,6 +98,26 @@ fn encrypted_marker(data_dir: &Path) -> PathBuf {
     data_dir.join("feeds.enc")
 }
 
+/// Write the encryption marker durably: fsync the file and its directory so the marker can't
+/// lag the ciphertext it guards. If a crash lost this marker while `feeds.redb` had already
+/// persisted encrypted data, the next open would see "encrypted redb + key + no marker" and
+/// [`rebuild`]'s reset-over-migrate would wipe the store as if it were plaintext — data loss.
+/// fsyncing here (before any block is appended) closes that window.
+fn write_encrypted_marker(path: &Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = fs::File::create(path)?;
+    f.write_all(b"1")?;
+    f.sync_all()?;
+    // Also fsync the directory so the new entry itself is durable (best-effort: not every
+    // platform/filesystem supports or requires a directory fsync).
+    if let Some(dir) = path.parent() {
+        if let Ok(d) = fs::File::open(dir) {
+            let _ = d.sync_all();
+        }
+    }
+    Ok(())
+}
+
 /// Open the feed store, honoring the at-rest encryption decision durably:
 ///
 /// - **encrypted store** (marker present): a key is required; open with it.
@@ -124,7 +144,7 @@ fn open_feed_store(
     } else if let Some(key) = at_rest_key {
         let s =
             feed_redb::RedbStore::create_encrypted(&db_path, key).map_err(std::io::Error::other)?;
-        fs::write(&marker, b"1")?; // record that this store is encrypted, for future opens
+        write_encrypted_marker(&marker)?; // durably record encryption before any block lands
         Arc::new(s)
     } else {
         Arc::new(feed_redb::RedbStore::create(&db_path).map_err(std::io::Error::other)?)

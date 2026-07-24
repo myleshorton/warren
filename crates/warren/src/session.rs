@@ -633,13 +633,22 @@ impl Session {
                 let grew = {
                     let mut r = replica.lock().expect("replica");
                     // Advance the head/peaks, ingest the fetched tail, then reclaim the prefix
-                    // that has fallen out of the window.
+                    // that has fallen out of the window — but only prune + report growth if
+                    // every tail block actually landed. If one fails to verify or persist,
+                    // keep what we hold (don't drop the prefix for a window we didn't fully
+                    // receive) and don't wake subscribers for content that isn't there; another
+                    // provider, or the next round, can still complete it.
                     if r.reseed(data.head, data.peaks) {
-                        for (index, block, proof) in data.blocks {
-                            r.ingest(index, block, &proof);
+                        let all_landed = data
+                            .blocks
+                            .into_iter()
+                            .all(|(index, block, proof)| r.ingest(index, block, &proof));
+                        if all_landed {
+                            r.prune(start);
+                            true
+                        } else {
+                            false
                         }
-                        r.prune(start);
-                        true
                     } else {
                         false
                     }

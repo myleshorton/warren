@@ -141,9 +141,11 @@ fn open_feed_store(
 /// On the first boot after upgrading from the legacy line-file: if `feed.jsonl` exists
 /// and the store is still empty, its lines (which *are* the feed blocks) are replayed
 /// into redb in order — reproducing the originally-published Merkle roots — and the file
-/// is renamed to `feed.jsonl.migrated` (kept, never deleted, so a migration mishap can't
-/// lose data). Blobs are re-ingested from their content-addressed files so we can serve
-/// them.
+/// is renamed aside to `feed.jsonl.migrated` (kept, never deleted, so a migration mishap
+/// can't lose data). The rename is best-effort: if it fails the legacy file simply lingers,
+/// which is harmless — re-migration only runs when the store is empty, so a populated store
+/// won't re-apply it, and an empty one re-migrating from the leftover is the desired
+/// recovery. Blobs are re-ingested from their content-addressed files so we can serve them.
 pub fn rebuild(
     data_dir: &Path,
     keypair: crypto::Keypair,

@@ -130,14 +130,17 @@ async fn run(
     loop {
         tokio::select! {
             _ = interval.tick() => {
+                // Age out stale peers every tick regardless of our own topics — otherwise a
+                // node with no topics yet (before joining, or mid channel-switch) skips the
+                // sweep and holds entries observed earlier until it re-joins.
+                let now = shared.now_ms();
+                shared.peers.lock().expect("lan peers").expire(now, PEER_TTL_MS);
                 let topics = shared.topics.lock().expect("lan topics").clone();
                 if topics.is_empty() {
                     continue; // not in any channel yet — nothing to advertise
                 }
                 let beacon = Beacon::sign(&identity, vec![lan_addr], topics);
                 let _ = socket.send_to(&beacon.encode(), group).await;
-                let now = shared.now_ms();
-                shared.peers.lock().expect("lan peers").expire(now, PEER_TTL_MS);
             }
             recv = socket.recv_from(&mut buf) => {
                 let Ok((n, _src)) = recv else { continue };

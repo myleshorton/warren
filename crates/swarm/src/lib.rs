@@ -21,6 +21,7 @@
 
 pub mod dht;
 pub mod id;
+pub mod lan;
 pub mod msg;
 pub mod nat;
 pub mod natbox;

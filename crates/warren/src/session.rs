@@ -9,7 +9,7 @@
 //! operations. Murmur is one such application (short video); a chat client would
 //! be another.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -600,16 +600,52 @@ impl Session {
     /// delta, prunes the now-out-of-window prefix, and fires `appended` so our own
     /// subscribers are pushed at once. Following a growing author costs the delta, not the
     /// whole window. Spawn this after [`Self::mirror_feed_window`].
+    ///
+    /// `pin` decides, per block, whether it must survive falling out of the window. Blocks
+    /// are opaque here, so this is the only way the layer that understands them can say "not
+    /// this one": a membership record shares a feed with ordinary content, and a mirror that
+    /// has let one scroll away can no longer tell a member's posts from an outsider's. Return
+    /// `false` for a plain suffix window; the retained footprint is `window` plus whatever
+    /// `pin` accepts, so pinning by a predicate that matches ordinary content forfeits the
+    /// bound this method exists to provide.
     pub async fn run_mirror_window(
         &self,
         feed_key: crypto::PublicKey,
         replica: Arc<StdMutex<feed::Replica>>,
         appended: Arc<tokio::sync::Notify>,
         window: u64,
+        pin: impl Fn(&[u8]) -> bool + Send,
     ) {
         let cfg = transfer::Config::default();
         let me = self.node.id();
         let topic = self.feed_topic(&feed_key.to_bytes());
+        // Blocks that must outlive the window. Restated on every prune, because
+        // `prune_pinning` drops whatever it isn't given — a pin isn't sticky in the store.
+        //
+        // Seeded once from what we already hold (the initial window `mirror_feed_window`
+        // fetched, whose blocks this loop never sees), then extended per round from the
+        // freshly ingested delta — the only blocks that can newly become pinnable. That
+        // keeps the per-round cost proportional to the delta: `held_ranges` walks `0..len`,
+        // which is fine once per mirror task but would be wasteful every round.
+        let mut pinned: BTreeSet<u64> = {
+            let r = replica.lock().expect("replica");
+            let mut keep = BTreeSet::new();
+            for (s, e) in r.held_ranges() {
+                for i in s..e {
+                    // `Replica::block` indexes by `usize`; on a 32-bit target a `as` cast
+                    // would wrap and test some *other* block's bytes, pinning `i` on a
+                    // decision that isn't about `i`. `len` is attacker-signed, so prefer
+                    // skipping an index we can't address over pinning the wrong one.
+                    let Ok(idx) = usize::try_from(i) else {
+                        continue;
+                    };
+                    if r.block(idx).is_some_and(|b| pin(&b)) {
+                        keep.insert(i);
+                    }
+                }
+            }
+            keep
+        };
         loop {
             let providers = self.node.lookup(topic).await.unwrap_or_default();
             for p in providers {
@@ -639,12 +675,19 @@ impl Session {
                     // receive) and don't wake subscribers for content that isn't there; another
                     // provider, or the next round, can still complete it.
                     if r.reseed(data.head, data.peaks) {
-                        let all_landed = data
-                            .blocks
-                            .into_iter()
-                            .all(|(index, block, proof)| r.ingest(index, block, &proof));
+                        let mut fresh_pins = Vec::new();
+                        let all_landed = data.blocks.into_iter().all(|(index, block, proof)| {
+                            if pin(&block) {
+                                fresh_pins.push(index);
+                            }
+                            r.ingest(index, block, &proof)
+                        });
                         if all_landed {
-                            r.prune(start);
+                            // Only commit the round's pins once the whole tail landed, for the
+                            // same reason we only prune then: a partial window shouldn't
+                            // reshape what we retain.
+                            pinned.extend(fresh_pins);
+                            r.prune_pinning(start, &pinned);
                             true
                         } else {
                             false

@@ -167,6 +167,7 @@ impl FeedStore for RedbStore {
         feed: &FeedKey,
         retain_from: u64,
         retain_nodes: &BTreeSet<u64>,
+        pinned_blocks: &BTreeSet<u64>,
     ) -> StoreResult<()> {
         // This feed's whole key span: feed‖0 .. feed‖u64::MAX. `retain_in` only touches
         // keys in the range, so other feeds are untouched, and it drops entries whose
@@ -178,7 +179,8 @@ impl FeedStore for RedbStore {
             let mut blocks = txn.open_table(BLOCKS).map_err(be)?;
             blocks
                 .retain_in(lo.as_slice()..=hi.as_slice(), |key, _| {
-                    index_of(key) >= retain_from
+                    let i = index_of(key);
+                    i >= retain_from || pinned_blocks.contains(&i)
                 })
                 .map_err(be)?;
             let mut nodes = txn.open_table(NODES).map_err(be)?;

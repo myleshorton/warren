@@ -49,8 +49,10 @@ impl FeedStore for CrashStore {
         feed: &FeedKey,
         retain_from: u64,
         retain_nodes: &BTreeSet<u64>,
+        pinned_blocks: &BTreeSet<u64>,
     ) -> StoreResult<()> {
-        self.inner.prune(feed, retain_from, retain_nodes)
+        self.inner
+            .prune(feed, retain_from, retain_nodes, pinned_blocks)
     }
     fn block(&self, feed: &FeedKey, index: u64) -> StoreResult<Option<Vec<u8>>> {
         self.inner.block(feed, index)

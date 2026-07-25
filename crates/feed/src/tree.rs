@@ -120,6 +120,25 @@ pub fn retained_node_indices(len: u64, below: u64) -> BTreeSet<u64> {
     keep
 }
 
+/// [`retained_node_indices`], plus the audit path of each block in `pinned` — blocks below
+/// `below` the caller is keeping anyway. Without their paths a pinned block would still be
+/// *present* but no longer *provable*, so it could be read locally and never served; keeping
+/// the paths costs `O(log len)` nodes each and leaves the window's own guarantees unchanged.
+/// Indices at or above `below`, or past `len`, are already covered and add nothing.
+pub fn retained_node_indices_pinning(
+    len: u64,
+    below: u64,
+    pinned: &BTreeSet<u64>,
+) -> BTreeSet<u64> {
+    let mut keep = retained_node_indices(len, below);
+    for &j in pinned {
+        if j < below.min(len) {
+            keep.extend(within_peak_indices(len, j));
+        }
+    }
+    keep
+}
+
 /// The largest power of two strictly less than `n` (for `n >= 2`).
 ///
 /// Computed in constant time from the bit width: doubling `k` in a loop would

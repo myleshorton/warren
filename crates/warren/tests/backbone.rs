@@ -370,7 +370,11 @@ async fn a_windowed_mirror_follows_a_growing_author_incrementally() {
     );
     let run = {
         let (m, r, a) = (mirror.clone(), replica.clone(), appended.clone());
-        tokio::spawn(async move { m.run_mirror_window(author_key, r, a, window).await })
+        // `|_| false` pins nothing: this case is about the plain suffix window sliding.
+        tokio::spawn(async move {
+            m.run_mirror_window(author_key, r, a, window, |_| false)
+                .await
+        })
     };
 
     // --- The author grows to 7 (by 2 < window 4), so the mirror should slide to [3, 7),
@@ -408,4 +412,107 @@ async fn a_windowed_mirror_follows_a_growing_author_incrementally() {
             "followed block {i} matches the author"
         );
     }
+}
+
+#[tokio::test]
+async fn a_windowed_mirror_keeps_a_pinned_block_when_the_window_slides_past_it() {
+    // A window bounds the footprint, but some blocks must not fall out of it: a membership
+    // record shares its feed with ordinary content, and a mirror that has let one scroll away
+    // can no longer tell a member's blocks from an outsider's. `pin` is how the layer that can
+    // actually read the blocks says "not this one" — the window still slides and still bounds
+    // what we keep, but a pinned block below it survives.
+    //
+    // Blocks are opaque at this layer, so a byte marker stands in for the record type.
+    let window = 4u64;
+    let (boot, _peers) = network(4).await;
+    let bootstrap = boot.contact();
+
+    // --- Author: 5 blocks, one of which must outlive the window. ---
+    let (author, author_key) = make_session(joined(bootstrap, id(1)).await, [0xD6; 32]);
+    {
+        let log = author.log();
+        let mut g = log.lock().expect("log");
+        for i in 0..5 {
+            if i == 1 {
+                g.append(b"KEEP grant".to_vec());
+            } else {
+                g.append(format!("msg {i}").into_bytes());
+            }
+        }
+    }
+    let author_id = author.node.id();
+    timeout(T, author.node.announce(author_id))
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(T, author.node.announce(author.own_feed_topic()))
+        .await
+        .unwrap()
+        .unwrap();
+    let _author_serve = spawn_serve_by_key(author.clone());
+
+    // --- Mirror: bootstrap [1, 5), which still contains the block to pin. ---
+    let (mirror, _k) = make_session(joined(bootstrap, id(2)).await, [0xE7; 32]);
+    timeout(T, mirror.node.announce(mirror.node.id()))
+        .await
+        .unwrap()
+        .unwrap();
+    let (replica, appended) = timeout(T, mirror.mirror_feed_window(author_id, author_key, window))
+        .await
+        .unwrap()
+        .expect("windowed mirror bootstraps");
+    assert_eq!(
+        replica.lock().expect("replica").held_ranges(),
+        vec![(1, 5)],
+        "bootstraps the last-4 window, which still holds the block we will pin"
+    );
+
+    // The pin set is seeded from what's already held, so a block the bootstrap fetched (this
+    // loop never sees it) is still protected on the first prune.
+    let run = {
+        let (m, r, a) = (mirror.clone(), replica.clone(), appended.clone());
+        tokio::spawn(async move {
+            m.run_mirror_window(author_key, r, a, window, |b: &[u8]| b.starts_with(b"KEEP"))
+                .await
+        })
+    };
+
+    // --- The author grows to 7, so the window becomes [3, 7): blocks 1 and 2 both fall out
+    // of it. Block 2 is reclaimed; block 1 is pinned and stays. ---
+    {
+        let log = author.log();
+        let mut g = log.lock().expect("log");
+        for i in 5..7 {
+            g.append(format!("msg {i}").into_bytes());
+        }
+    }
+
+    let deadline = Instant::now() + T;
+    loop {
+        {
+            let r = replica.lock().expect("replica");
+            if r.len() == 7 && r.held_ranges() == vec![(1, 2), (3, 7)] {
+                break;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pinned block never survived the sliding window (held {:?})",
+            replica.lock().expect("replica").held_ranges()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    run.abort();
+
+    let r = replica.lock().expect("replica");
+    assert_eq!(
+        r.block(1).as_deref(),
+        Some(b"KEEP grant".as_slice()),
+        "the pinned block is readable, not merely listed as held"
+    );
+    assert!(
+        r.block(2).is_none(),
+        "the unpinned block that fell out of the window was still reclaimed — pinning is per \
+         block, not a wider window"
+    );
 }

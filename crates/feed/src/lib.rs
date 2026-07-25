@@ -35,6 +35,7 @@ mod store;
 mod tree;
 
 use crypto::{Hash, Keypair, PublicKey, Signature, HASH_LEN, SIGNATURE_LEN};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use thiserror::Error;
 use wire::{Decoder, Encoder, WireError};
@@ -511,10 +512,25 @@ impl Replica {
     /// bounded-footprint primitive a windowed seeder calls as the author's feed grows.
     /// Idempotent, and a no-op for `below == 0`.
     pub fn prune(&self, below: u64) {
-        let retain = tree::retained_node_indices(self.head.len, below);
+        self.prune_pinning(below, &BTreeSet::new());
+    }
+
+    /// [`Self::prune`], but keeping the blocks in `pinned` even though they fall below
+    /// `below` — with their audit paths, so a pinned block stays provable and servable
+    /// rather than merely present.
+    ///
+    /// Blocks are opaque at this layer: only the caller knows that a block carries something
+    /// a window must not evict. A membership record is the motivating case — it shares a feed
+    /// with ordinary content, so a plain suffix window silently drops the authorization that
+    /// content depends on, and a mirror that has forgotten it can no longer tell a member's
+    /// posts from an outsider's. Pinning is a per-block escape hatch from the window, not a
+    /// second window: the footprint stays `O(window + pinned)`, so a caller that pins
+    /// unboundedly gives up the bound it came for.
+    pub fn prune_pinning(&self, below: u64, pinned: &BTreeSet<u64>) {
+        let retain = tree::retained_node_indices_pinning(self.head.len, below, pinned);
         // Best-effort: a store failure here only leaves extra data on disk, never corrupts
         // what's retained (the kept set is a strict superset of what proofs need).
-        let _ = self.store.prune(&self.feed, below, &retain);
+        let _ = self.store.prune(&self.feed, below, &retain, pinned);
     }
 
     /// The replicated feed's owner (the key its head is verified against).
@@ -1114,6 +1130,61 @@ mod tests {
         // Idempotent + monotonic: re-pruning at or below the window is a no-op for the tail.
         mirror.prune(12);
         assert_eq!(mirror.held_ranges(), vec![(12, 20)]);
+    }
+
+    #[test]
+    fn pinning_keeps_a_sub_window_block_servable_and_provable() {
+        // A window exists for the bounded footprint, but some blocks must not fall out of it:
+        // a membership record authorizes the very content the window keeps, and a mirror that
+        // has dropped it can no longer tell a member's blocks from an outsider's. Pinning
+        // exempts those indices *and* keeps their audit paths, so a pinned block below the
+        // window still serves and still proves — present but unprovable would be a block we
+        // could read locally and never hand to a peer.
+        let src = log_with(20);
+        let pk = src.public_key();
+        let head = src.head();
+        let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
+        let blocks: Vec<Vec<u8>> = (0..20).map(|i| src.get(i).unwrap()).collect();
+        let mirror = Replica::with_store(pk, head.clone(), blocks, store).unwrap();
+
+        let pinned = BTreeSet::from([3u64, 7]);
+        mirror.prune_pinning(12, &pinned); // window [12, 20) + blocks 3 and 7
+
+        assert_eq!(
+            mirror.held_ranges(),
+            vec![(3, 4), (7, 8), (12, 20)],
+            "the pinned blocks plus the window, and nothing else"
+        );
+        for i in [3usize, 7] {
+            assert_eq!(mirror.block(i), src.get(i), "pinned block {i} still served");
+            let proof = Source::proof(&mirror, i).expect("a pinned block still proves");
+            assert!(
+                verify_block(&pk, &head, i as u64, &mirror.block(i).unwrap(), &proof),
+                "pinned block {i} verifies against the unchanged head"
+            );
+        }
+        for i in (0..12).filter(|i| !pinned.contains(&(*i as u64))) {
+            assert!(
+                mirror.block(i).is_none(),
+                "unpinned prefix block {i} is gone"
+            );
+        }
+        for i in 12..20 {
+            assert!(
+                Source::proof(&mirror, i).is_some(),
+                "the window itself is unaffected: block {i} still proves"
+            );
+        }
+
+        // Pins are not sticky in the store: every prune states the whole set, so a later
+        // prune that omits them reclaims them. `run_mirror_window` carries its set across
+        // rounds for exactly this reason.
+        mirror.prune_pinning(12, &BTreeSet::new());
+        assert_eq!(
+            mirror.held_ranges(),
+            vec![(12, 20)],
+            "omitting the earlier pins reclaims them"
+        );
     }
 
     #[test]

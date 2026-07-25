@@ -632,7 +632,14 @@ impl Session {
             let mut keep = BTreeSet::new();
             for (s, e) in r.held_ranges() {
                 for i in s..e {
-                    if r.block(i as usize).is_some_and(|b| pin(&b)) {
+                    // `Replica::block` indexes by `usize`; on a 32-bit target a `as` cast
+                    // would wrap and test some *other* block's bytes, pinning `i` on a
+                    // decision that isn't about `i`. `len` is attacker-signed, so prefer
+                    // skipping an index we can't address over pinning the wrong one.
+                    let Ok(idx) = usize::try_from(i) else {
+                        continue;
+                    };
+                    if r.block(idx).is_some_and(|b| pin(&b)) {
                         keep.insert(i);
                     }
                 }

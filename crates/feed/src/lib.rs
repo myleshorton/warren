@@ -161,8 +161,8 @@ impl Log {
     }
 
     /// Number of blocks appended.
-    pub fn len(&self) -> usize {
-        self.roots.len() as usize
+    pub fn len(&self) -> u64 {
+        self.roots.len()
     }
 
     /// Whether the log has no blocks.
@@ -227,8 +227,8 @@ impl Log {
 
     /// The block at `index`, if present. Returns an owned copy (the bytes live in the
     /// store, not this struct); `None` if absent or on a read error.
-    pub fn get(&self, index: usize) -> Option<Vec<u8>> {
-        self.store.block(&self.feed, index as u64).ok().flatten()
+    pub fn get(&self, index: u64) -> Option<Vec<u8>> {
+        self.store.block(&self.feed, index).ok().flatten()
     }
 
     /// The current Merkle root over all blocks — O(log n) from the accumulator.
@@ -251,11 +251,9 @@ impl Log {
     /// An inclusion proof for the block at `index` (against the current head), assembled
     /// from the persisted frozen nodes + the in-RAM peaks. `None` if `index` is out of
     /// range or a needed node is missing from the store.
-    pub fn proof(&self, index: usize) -> Option<Proof> {
+    pub fn proof(&self, index: u64) -> Option<Proof> {
         self.roots
-            .proof(index as u64, |idx| {
-                self.store.node(&self.feed, idx).ok().flatten()
-            })
+            .proof(index, |idx| self.store.node(&self.feed, idx).ok().flatten())
             .map(|siblings| Proof { siblings })
     }
 }
@@ -269,9 +267,9 @@ pub trait Source {
     fn head(&self) -> Head;
     /// The block at `index`, if present. Owned, since a store-backed source can't lend a
     /// reference into its backend.
-    fn get(&self, index: usize) -> Option<Vec<u8>>;
+    fn get(&self, index: u64) -> Option<Vec<u8>>;
     /// An inclusion proof for the block at `index` against the head, or `None`.
-    fn proof(&self, index: usize) -> Option<Proof>;
+    fn proof(&self, index: u64) -> Option<Proof>;
     /// The feed's peak nodes as `(flat index, hash)`, largest peak first — what a sparse
     /// subscriber needs (with the head) to open a [`Replica::sparse`] and verify blocks it
     /// later fetches, without downloading the whole feed.
@@ -295,10 +293,10 @@ impl Source for Log {
     fn head(&self) -> Head {
         Log::head(self)
     }
-    fn get(&self, index: usize) -> Option<Vec<u8>> {
+    fn get(&self, index: u64) -> Option<Vec<u8>> {
         Log::get(self, index)
     }
-    fn proof(&self, index: usize) -> Option<Proof> {
+    fn proof(&self, index: u64) -> Option<Proof> {
         Log::proof(self, index)
     }
     fn peaks(&self) -> Vec<(u64, Hash)> {
@@ -538,8 +536,8 @@ impl Replica {
         self.public_key
     }
     /// Number of blocks held.
-    pub fn len(&self) -> usize {
-        self.roots.len() as usize
+    pub fn len(&self) -> u64 {
+        self.roots.len()
     }
     /// Whether the replica holds no blocks.
     pub fn is_empty(&self) -> bool {
@@ -549,8 +547,8 @@ impl Replica {
     /// The block at `index`, if held — an owned copy (the bytes live in the store). A
     /// holder (e.g. a mirror) reads these to serve or render the author's content on its
     /// behalf, even while the author is offline.
-    pub fn block(&self, index: usize) -> Option<Vec<u8>> {
-        self.store.block(&self.feed, index as u64).ok().flatten()
+    pub fn block(&self, index: u64) -> Option<Vec<u8>> {
+        self.store.block(&self.feed, index).ok().flatten()
     }
 
     /// The replica's peak nodes as `(flat index, hash)`, largest peak first — the O(log n)
@@ -634,14 +632,12 @@ impl Source for Replica {
     fn head(&self) -> Head {
         self.head.clone()
     }
-    fn get(&self, index: usize) -> Option<Vec<u8>> {
+    fn get(&self, index: u64) -> Option<Vec<u8>> {
         self.block(index)
     }
-    fn proof(&self, index: usize) -> Option<Proof> {
+    fn proof(&self, index: u64) -> Option<Proof> {
         self.roots
-            .proof(index as u64, |idx| {
-                self.store.node(&self.feed, idx).ok().flatten()
-            })
+            .proof(index, |idx| self.store.node(&self.feed, idx).ok().flatten())
             .map(|siblings| Proof { siblings })
     }
     fn peaks(&self) -> Vec<(u64, Hash)> {
@@ -849,7 +845,7 @@ mod tests {
         for i in 0..log.len() {
             let proof = log.proof(i).unwrap();
             assert!(
-                verify_block(&pk, &head, i as u64, &log.get(i).unwrap(), &proof),
+                verify_block(&pk, &head, i, &log.get(i).unwrap(), &proof),
                 "block {i} should verify"
             );
         }
@@ -863,12 +859,7 @@ mod tests {
         for i in 0..log.len() {
             let proof = log.proof(i).unwrap();
             // Proof-only verification accepts every real block against the head.
-            assert!(verify_block_proof(
-                &head,
-                i as u64,
-                &log.get(i).unwrap(),
-                &proof
-            ));
+            assert!(verify_block_proof(&head, i, &log.get(i).unwrap(), &proof));
         }
         // It still rejects a tampered block and an out-of-range index...
         let proof0 = log.proof(0).unwrap();
@@ -973,7 +964,7 @@ mod tests {
             assert!(verify_block(
                 &pk,
                 &head,
-                i as u64,
+                i,
                 &replica.get(i).unwrap(),
                 &proof
             ));
@@ -1033,7 +1024,7 @@ mod tests {
             assert!(verify_block(
                 &pk,
                 &head,
-                i as u64,
+                i,
                 &replica.get(i).unwrap(),
                 &proof
             ));
@@ -1123,7 +1114,7 @@ mod tests {
             );
             let proof = Source::proof(&mirror, i).expect("retained block still proves");
             assert!(
-                verify_block(&pk, &head, i as u64, &mirror.block(i).unwrap(), &proof),
+                verify_block(&pk, &head, i, &mirror.block(i).unwrap(), &proof),
                 "retained block {i} verifies against the original head"
             );
         }
@@ -1155,15 +1146,15 @@ mod tests {
             vec![(3, 4), (7, 8), (12, 20)],
             "the pinned blocks plus the window, and nothing else"
         );
-        for i in [3usize, 7] {
+        for i in [3u64, 7] {
             assert_eq!(mirror.block(i), src.get(i), "pinned block {i} still served");
             let proof = Source::proof(&mirror, i).expect("a pinned block still proves");
             assert!(
-                verify_block(&pk, &head, i as u64, &mirror.block(i).unwrap(), &proof),
+                verify_block(&pk, &head, i, &mirror.block(i).unwrap(), &proof),
                 "pinned block {i} verifies against the unchanged head"
             );
         }
-        for i in (0..12).filter(|i| !pinned.contains(&(*i as u64))) {
+        for i in (0..12u64).filter(|i| !pinned.contains(i)) {
             assert!(
                 mirror.block(i).is_none(),
                 "unpinned prefix block {i} is gone"
@@ -1210,27 +1201,27 @@ mod tests {
 
         // Ingest a scattered subset (spanning both peaks: 20 = 16 + 4) with proofs from
         // the author.
-        for &i in &[3usize, 4, 17] {
+        for &i in &[3u64, 4, 17] {
             let block = author.get(i).unwrap();
             let proof = author.proof(i).unwrap();
             assert!(
-                sparse.ingest(i as u64, block, &proof),
+                sparse.ingest(i, block, &proof),
                 "block {i} verifies and is stored"
             );
         }
 
         // It now serves + proves exactly those, each still verifying against the head.
-        for &i in &[3usize, 4, 17] {
+        for &i in &[3u64, 4, 17] {
             assert_eq!(sparse.block(i), author.get(i), "serves ingested block {i}");
             let proof = sparse.proof(i).expect("proves an ingested block");
             assert!(
-                verify_block(&pk, &head, i as u64, &sparse.block(i).unwrap(), &proof),
+                verify_block(&pk, &head, i, &sparse.block(i).unwrap(), &proof),
                 "re-served proof for block {i} verifies against the signed head"
             );
         }
 
         // Un-ingested indices remain absent — both the block and its proof.
-        for i in [0usize, 5, 19] {
+        for i in [0u64, 5, 19] {
             assert!(sparse.block(i).is_none(), "block {i} not ingested → absent");
             assert!(sparse.proof(i).is_none(), "no proof for un-held block {i}");
         }
@@ -1261,8 +1252,8 @@ mod tests {
         let store: std::sync::Arc<dyn FeedStore> = std::sync::Arc::new(MemStore::new());
         let mut mirror = Replica::sparse(pk, author.head(), author.peak_nodes(), store).unwrap();
         for i in 7..10u64 {
-            let proof = author.proof(i as usize).unwrap();
-            assert!(mirror.ingest(i, author.get(i as usize).unwrap(), &proof));
+            let proof = author.proof(i).unwrap();
+            assert!(mirror.ingest(i, author.get(i).unwrap(), &proof));
         }
         assert_eq!(mirror.held_ranges(), vec![(7, 10)]);
 
@@ -1277,8 +1268,8 @@ mod tests {
         assert!(mirror.reseed(head14.clone(), author.peak_nodes()));
         assert_eq!(mirror.len(), 14, "the replica now knows the grown length");
         for i in 11..14u64 {
-            let proof = author.proof(i as usize).unwrap();
-            assert!(mirror.ingest(i, author.get(i as usize).unwrap(), &proof));
+            let proof = author.proof(i).unwrap();
+            assert!(mirror.ingest(i, author.get(i).unwrap(), &proof));
         }
         mirror.prune(14 - 3); // keep [11, 14)
 
@@ -1288,10 +1279,10 @@ mod tests {
             "window slid to the new tail"
         );
         for i in 11..14u64 {
-            assert_eq!(mirror.block(i as usize), author.get(i as usize));
-            let proof = Source::proof(&mirror, i as usize).expect("held block proves");
+            assert_eq!(mirror.block(i), author.get(i));
+            let proof = Source::proof(&mirror, i).expect("held block proves");
             assert!(
-                verify_block(&pk, &head14, i, &mirror.block(i as usize).unwrap(), &proof),
+                verify_block(&pk, &head14, i, &mirror.block(i).unwrap(), &proof),
                 "block {i} proves against the grown head"
             );
         }

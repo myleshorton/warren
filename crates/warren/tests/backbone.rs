@@ -317,7 +317,7 @@ async fn a_windowed_mirror_holds_and_re_serves_only_its_suffix_window() {
     assert_eq!(r.held_ranges(), vec![(6, 10)], "B holds the same window");
     for i in 6..10u64 {
         assert_eq!(
-            r.block(i as usize).as_deref(),
+            r.block(i).as_deref(),
             Some(format!("msg {i}").as_bytes()),
             "block {i} re-served by mirror A matches the author's original"
         );
@@ -407,7 +407,7 @@ async fn a_windowed_mirror_follows_a_growing_author_incrementally() {
     let r = replica.lock().expect("replica");
     for i in 3..7u64 {
         assert_eq!(
-            r.block(i as usize).as_deref(),
+            r.block(i).as_deref(),
             Some(format!("msg {i}").as_bytes()),
             "followed block {i} matches the author"
         );

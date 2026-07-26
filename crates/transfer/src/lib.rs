@@ -343,7 +343,7 @@ pub async fn replicate_feed<L: Link>(
         Cursor::default(),
     );
     loop {
-        let from = into.lock().expect("replica").len() as u64;
+        let from = into.lock().expect("replica").len();
         let head_msg = exchange(&mut wire, &Message::Tail { have: from }, cfg).await?;
         let mut dl = FeedDownload::resume(public_key, from);
         dl.handle_response(&head_msg)?;
@@ -1743,7 +1743,7 @@ mod tests {
             assert!(replica.ingest(*i, data.clone(), proof), "ingest block {i}");
         }
         for &i in &want {
-            assert_eq!(replica.block(i as usize), log.get(i as usize));
+            assert_eq!(replica.block(i), log.get(i));
         }
         assert!(
             replica.block(0).is_none(),

@@ -412,7 +412,7 @@ mod tests {
             assert!(feed::verify_block(
                 &pk,
                 &head,
-                i as u64,
+                i,
                 &reopened.block(i).unwrap(),
                 &proof
             ));

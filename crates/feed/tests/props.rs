@@ -29,7 +29,7 @@ proptest! {
         prop_assert!(verify_head(&pk, &head));
         prop_assert_eq!(head.len as usize, blocks.len());
         for (i, block) in blocks.iter().enumerate() {
-            let proof = log.proof(i).unwrap();
+            let proof = log.proof(i as u64).unwrap();
             prop_assert!(verify_block(&pk, &head, i as u64, block, &proof));
         }
     }
@@ -49,7 +49,7 @@ proptest! {
         } else {
             block.push(0);
         }
-        let proof = log.proof(i).unwrap();
+        let proof = log.proof(i as u64).unwrap();
         prop_assert!(!verify_block(&pk, &head, i as u64, &block, &proof));
     }
 
@@ -70,7 +70,7 @@ proptest! {
         let head = log.head();
         let i = (seed as usize) % blocks.len();
         let j = (i + 1) % blocks.len(); // a different index
-        let proof = log.proof(i).unwrap();
+        let proof = log.proof(i as u64).unwrap();
         prop_assume!(blocks[i] != blocks[j]);
         prop_assert!(!verify_block(&pk, &head, j as u64, &blocks[i], &proof));
     }
@@ -89,7 +89,7 @@ proptest! {
         let head = log.head();
         prop_assert_eq!(Head::decode(&head.encode()).unwrap(), head);
         for i in 0..blocks.len() {
-            let proof = log.proof(i).unwrap();
+            let proof = log.proof(i as u64).unwrap();
             prop_assert_eq!(Proof::decode(&proof.encode()).unwrap(), proof);
         }
     }

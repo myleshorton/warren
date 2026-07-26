@@ -28,7 +28,7 @@ fn a_windowed_seeder_stays_disk_bounded_as_the_author_grows() {
             let i = author.len();
             author.append(vec![i as u8; 4]);
         }
-        let len = author.len() as u64;
+        let len = author.len();
         let start = len.saturating_sub(window);
 
         // Refresh the window exactly as run_mirror_window does: a fresh sparse replica for
@@ -36,9 +36,9 @@ fn a_windowed_seeder_stays_disk_bounded_as_the_author_grows() {
         let mut mirror = Replica::sparse(pk, author.head(), author.peak_nodes(), store.clone())
             .expect("peaks reproduce the head root");
         for i in start..len {
-            let proof = author.proof(i as usize).unwrap();
+            let proof = author.proof(i).unwrap();
             assert!(
-                mirror.ingest(i, author.get(i as usize).unwrap(), &proof),
+                mirror.ingest(i, author.get(i).unwrap(), &proof),
                 "window block {i} ingests"
             );
         }
@@ -51,7 +51,7 @@ fn a_windowed_seeder_stays_disk_bounded_as_the_author_grows() {
             "held window slides with the author (len {len})"
         );
         for i in start..len {
-            assert_eq!(mirror.block(i as usize), author.get(i as usize));
+            assert_eq!(mirror.block(i), author.get(i));
         }
 
         // Disk is bounded: the store holds only the window's blocks, never the whole feed.
@@ -77,9 +77,9 @@ fn a_windowed_seeder_stays_disk_bounded_as_the_author_grows() {
     }
 
     // After all that growth the author is well past the window…
-    assert!(author.len() as u64 >= 200);
+    assert!(author.len() >= 200);
     // …yet the seeder's final footprint is still just the window.
-    let final_len = author.len() as u64;
+    let final_len = author.len();
     let held = (0..final_len)
         .filter(|&i| store.has_block(&feed, i).unwrap())
         .count() as u64;

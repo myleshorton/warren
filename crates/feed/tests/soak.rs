@@ -28,7 +28,7 @@ fn a_windowed_seeder_stays_disk_bounded_as_the_author_grows() {
             let i = author.len();
             author.append(vec![i as u8; 4]);
         }
-        let len = author.len() as u64;
+        let len = author.len();
         let start = len.saturating_sub(window);
 
         // Refresh the window exactly as run_mirror_window does: a fresh sparse replica for
@@ -77,9 +77,9 @@ fn a_windowed_seeder_stays_disk_bounded_as_the_author_grows() {
     }
 
     // After all that growth the author is well past the window…
-    assert!(author.len() as u64 >= 200);
+    assert!(author.len() >= 200);
     // …yet the seeder's final footprint is still just the window.
-    let final_len = author.len() as u64;
+    let final_len = author.len();
     let held = (0..final_len)
         .filter(|&i| store.has_block(&feed, i).unwrap())
         .count() as u64;

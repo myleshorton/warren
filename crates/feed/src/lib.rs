@@ -161,8 +161,8 @@ impl Log {
     }
 
     /// Number of blocks appended.
-    pub fn len(&self) -> usize {
-        self.roots.len() as usize
+    pub fn len(&self) -> u64 {
+        self.roots.len()
     }
 
     /// Whether the log has no blocks.
@@ -536,8 +536,8 @@ impl Replica {
         self.public_key
     }
     /// Number of blocks held.
-    pub fn len(&self) -> usize {
-        self.roots.len() as usize
+    pub fn len(&self) -> u64 {
+        self.roots.len()
     }
     /// Whether the replica holds no blocks.
     pub fn is_empty(&self) -> bool {
@@ -842,7 +842,7 @@ mod tests {
         let pk = log.public_key();
         let head = log.head();
         assert!(verify_head(&pk, &head));
-        for i in 0..log.len() as u64 {
+        for i in 0..log.len() {
             let proof = log.proof(i).unwrap();
             assert!(
                 verify_block(&pk, &head, i, &log.get(i).unwrap(), &proof),
@@ -856,7 +856,7 @@ mod tests {
     fn verify_block_proof_checks_inclusion_without_the_signature() {
         let log = log_with(8);
         let head = log.head();
-        for i in 0..log.len() as u64 {
+        for i in 0..log.len() {
             let proof = log.proof(i).unwrap();
             // Proof-only verification accepts every real block against the head.
             assert!(verify_block_proof(&head, i, &log.get(i).unwrap(), &proof));
@@ -939,7 +939,7 @@ mod tests {
         let log = log_with(7);
         let head = log.head();
         assert_eq!(Head::decode(&head.encode()).unwrap(), head);
-        for i in 0..log.len() as u64 {
+        for i in 0..log.len() {
             let proof = log.proof(i).unwrap();
             assert_eq!(Proof::decode(&proof.encode()).unwrap(), proof);
         }
@@ -950,14 +950,14 @@ mod tests {
         let log = log_with(10);
         let pk = log.public_key();
         let head = log.head();
-        let blocks: Vec<Vec<u8>> = (0..log.len() as u64)
+        let blocks: Vec<Vec<u8>> = (0..log.len())
             .map(|i| log.get(i).unwrap().to_vec())
             .collect();
 
         let replica = Replica::new(pk, head.clone(), blocks).expect("faithful replica");
         assert_eq!(replica.len(), 10);
         assert_eq!(replica.head(), head); // same signed head — not re-signed
-        for i in 0..replica.len() as u64 {
+        for i in 0..replica.len() {
             assert_eq!(replica.get(i), log.get(i));
             let proof = replica.proof(i).unwrap();
             // The replica's recomputed proof verifies against the owner's head.
@@ -977,7 +977,7 @@ mod tests {
         let log = log_with(5);
         let pk = log.public_key();
         let head = log.head();
-        let blocks: Vec<Vec<u8>> = (0..log.len() as u64)
+        let blocks: Vec<Vec<u8>> = (0..log.len())
             .map(|i| log.get(i).unwrap().to_vec())
             .collect();
 
@@ -1019,7 +1019,7 @@ mod tests {
 
         // Every block, old and new, still verifies against the advanced head.
         let head = log.head();
-        for i in 0..replica.len() as u64 {
+        for i in 0..replica.len() {
             let proof = replica.proof(i).unwrap();
             assert!(verify_block(
                 &pk,

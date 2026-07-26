@@ -199,7 +199,7 @@ pub fn rebuild(
     // Decode records + re-ingest blob bytes from the (redb-backed) log's blocks.
     let mut blobs = blob::Store::new();
     let mut records = Vec::new();
-    for i in 0..log.len() as u64 {
+    for i in 0..log.len() {
         let Some(block) = log.get(i) else { continue };
         // The block bytes verbatim are the feed block; decoding to a Record is
         // best-effort (for the records list + blob cache). An undecodable block is

@@ -645,7 +645,7 @@ impl Session {
                 if p.id == me {
                     continue;
                 }
-                let held_len = replica.lock().expect("replica").len() as u64;
+                let held_len = replica.lock().expect("replica").len();
                 // One fetch: head + peaks + only the blocks above what we hold (empty if the
                 // author hasn't grown past `held_len`).
                 let Some(data) =

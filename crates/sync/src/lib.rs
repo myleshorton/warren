@@ -366,8 +366,16 @@ pub fn serve_feed<S: feed::Source>(request: &Message, source: &S) -> Message {
             // 32-bit build any index at or past 2^32 answered `Absent` — refusing a block
             // the server actually held, indistinguishably from genuinely not having it.
             let index = *index;
-            match source.get(index).zip(source.proof(index)) {
-                Some((data, proof)) => Message::Block { index, data, proof },
+            // Deliberately not `zip`: it takes its argument by value, so the proof would be
+            // computed even for a block we don't hold — real store reads for the audit path
+            // on every miss, which a sparse holder sees constantly and a peer could drive
+            // with repeated misses. Prove only what we actually found. (clippy's
+            // `manual_option_zip` suggests `zip` here; it can't see the eager cost.)
+            let Some(data) = source.get(index) else {
+                return Message::Absent;
+            };
+            match source.proof(index) {
+                Some(proof) => Message::Block { index, data, proof },
                 None => Message::Absent,
             }
         }

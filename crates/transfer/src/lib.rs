@@ -343,7 +343,7 @@ pub async fn replicate_feed<L: Link>(
         Cursor::default(),
     );
     loop {
-        let from = into.lock().expect("replica").len() as u64;
+        let from = into.lock().expect("replica").len();
         let head_msg = exchange(&mut wire, &Message::Tail { have: from }, cfg).await?;
         let mut dl = FeedDownload::resume(public_key, from);
         dl.handle_response(&head_msg)?;
@@ -1818,7 +1818,7 @@ mod tests {
         let mut author = Log::new(kp);
         author.append(vec![0u8; 80]);
         author.append(vec![1u8; 80]);
-        let seed: Vec<Vec<u8>> = (0..author.len() as u64)
+        let seed: Vec<Vec<u8>> = (0..author.len())
             .map(|i| author.get(i).unwrap().to_vec())
             .collect();
         let replica = Arc::new(StdMutex::new(

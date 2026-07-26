@@ -36,9 +36,9 @@ fn a_windowed_seeder_stays_disk_bounded_as_the_author_grows() {
         let mut mirror = Replica::sparse(pk, author.head(), author.peak_nodes(), store.clone())
             .expect("peaks reproduce the head root");
         for i in start..len {
-            let proof = author.proof(i as usize).unwrap();
+            let proof = author.proof(i).unwrap();
             assert!(
-                mirror.ingest(i, author.get(i as usize).unwrap(), &proof),
+                mirror.ingest(i, author.get(i).unwrap(), &proof),
                 "window block {i} ingests"
             );
         }
@@ -51,7 +51,7 @@ fn a_windowed_seeder_stays_disk_bounded_as_the_author_grows() {
             "held window slides with the author (len {len})"
         );
         for i in start..len {
-            assert_eq!(mirror.block(i as usize), author.get(i as usize));
+            assert_eq!(mirror.block(i), author.get(i));
         }
 
         // Disk is bounded: the store holds only the window's blocks, never the whole feed.

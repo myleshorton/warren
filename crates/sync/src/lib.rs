@@ -361,11 +361,12 @@ pub fn serve_feed<S: feed::Source>(request: &Message, source: &S) -> Message {
         // signed head; holding a `Tail` until the feed grows is the I/O layer's job.
         Message::GetHead | Message::Tail { .. } => Message::Head(source.head()),
         Message::GetBlock { index } => {
+            // No narrowing on the way in: the wire index, the store key, and `Source`'s
+            // parameter are all `u64` now. This used to `usize::try_from` first, so on a
+            // 32-bit build any index at or past 2^32 answered `Absent` — refusing a block
+            // the server actually held, indistinguishably from genuinely not having it.
             let index = *index;
-            match usize::try_from(index)
-                .ok()
-                .and_then(|i| source.get(i).zip(source.proof(i)))
-            {
+            match source.get(index).zip(source.proof(index)) {
                 Some((data, proof)) => Message::Block { index, data, proof },
                 None => Message::Absent,
             }
@@ -1294,13 +1295,13 @@ mod tests {
             assert!(replica.ingest(*i, data.clone(), proof), "ingest block {i}");
         }
         for &i in &want {
-            assert_eq!(replica.block(i as usize), server.get(i as usize));
-            let proof = Source::proof(&replica, i as usize).expect("proof for a held block");
+            assert_eq!(replica.block(i), server.get(i));
+            let proof = Source::proof(&replica, i).expect("proof for a held block");
             assert!(feed::verify_block(
                 &pk,
                 &head,
                 i,
-                &replica.block(i as usize).unwrap(),
+                &replica.block(i).unwrap(),
                 &proof
             ));
         }
@@ -1320,8 +1321,8 @@ mod tests {
         let store: std::sync::Arc<dyn feed::FeedStore> = std::sync::Arc::new(feed::MemStore::new());
         let mut seeder = Replica::sparse(pk, head.clone(), author.peak_nodes(), store).unwrap();
         for i in 12..20u64 {
-            let proof = author.proof(i as usize).unwrap();
-            assert!(seeder.ingest(i, author.get(i as usize).unwrap(), &proof));
+            let proof = author.proof(i).unwrap();
+            assert!(seeder.ingest(i, author.get(i).unwrap(), &proof));
         }
         assert_eq!(
             seeder.held_ranges(),

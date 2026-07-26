@@ -1743,7 +1743,7 @@ mod tests {
             assert!(replica.ingest(*i, data.clone(), proof), "ingest block {i}");
         }
         for &i in &want {
-            assert_eq!(replica.block(i as usize), log.get(i as usize));
+            assert_eq!(replica.block(i), log.get(i));
         }
         assert!(
             replica.block(0).is_none(),
@@ -1818,7 +1818,7 @@ mod tests {
         let mut author = Log::new(kp);
         author.append(vec![0u8; 80]);
         author.append(vec![1u8; 80]);
-        let seed: Vec<Vec<u8>> = (0..author.len())
+        let seed: Vec<Vec<u8>> = (0..author.len() as u64)
             .map(|i| author.get(i).unwrap().to_vec())
             .collect();
         let replica = Arc::new(StdMutex::new(

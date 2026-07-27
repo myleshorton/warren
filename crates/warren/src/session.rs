@@ -39,15 +39,20 @@ const RESUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(
 /// carrier-grade NAT — that is a 10-second stall and a radio wake every round, indefinitely,
 /// for something that cannot succeed.
 const DIAL_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(15);
-/// How long to wait before re-dialing a peer that has failed `strikes` times in a row:
-/// 15s, 30s, 60s, then flat at the cap.
+/// How long to wait before re-dialing a peer, given `strikes` — a **count** of consecutive
+/// failed dials, so `1` means "has just failed once". Yields 15s, 30s, 60s, then flat at the cap.
 ///
-/// The shift is clamped before it happens. `1u32 << strikes` panics in debug once `strikes`
-/// reaches 32, and strikes only grows — a peer unreachable for a long session would eventually
-/// get there, turning a battery optimisation into a crash.
+/// 1-based because that is what `note_dial` records: it increments on every failure including
+/// the first, so a peer that has just failed arrives here as `1`. An earlier version shifted by
+/// `strikes` directly, which made that first failure wait 30s instead of the base and left
+/// `dial_wait(0)` — unreachable in practice — as the only path to 15s.
+///
+/// The shift is clamped before it happens. `1u32 << n` panics in debug once `n` reaches 32, and
+/// strikes only grows — a peer unreachable for a long session would eventually get there,
+/// turning a battery optimisation into a crash.
 fn dial_wait(strikes: u32) -> std::time::Duration {
     DIAL_BACKOFF_BASE
-        .saturating_mul(1u32 << strikes.min(8))
+        .saturating_mul(1u32 << strikes.saturating_sub(1).min(8))
         .min(DIAL_BACKOFF_CAP)
 }
 
@@ -117,7 +122,8 @@ pub struct Session {
     /// The shared feed store (redb) backing the own log and every mirror — so a mirror we
     /// hold persists to disk and is restored on restart, and so we serve it from there.
     feed_store: Arc<dyn feed::FeedStore>,
-    /// Peers whose last dial failed: when, and how many times in a row. Consulted by
+    /// Peers whose last dial failed: when, and the count of consecutive failures — 1 on the
+    /// first, matching [`dial_wait`]'s 1-based parameter. Consulted by
     /// [`Self::discover`] so an unreachable peer isn't re-dialed every round. Cleared for a
     /// peer the moment it answers.
     dial_failures: Arc<StdMutex<HashMap<swarm::NodeId, (std::time::Instant, u32)>>>,
@@ -991,18 +997,23 @@ mod tests {
 
     #[test]
     fn dial_wait_backs_off_then_flattens_at_the_cap() {
+        // 1-based: `note_dial` records 1 for the first failure, so that is the case which has
+        // to map to the base. Getting this wrong made the first retry wait 30s.
+        assert_eq!(
+            dial_wait(1),
+            DIAL_BACKOFF_BASE,
+            "the first failure waits the base"
+        );
+        assert_eq!(dial_wait(2), DIAL_BACKOFF_BASE * 2);
+        assert_eq!(dial_wait(3), DIAL_BACKOFF_CAP, "doubling reaches the cap");
+        assert_eq!(dial_wait(4), DIAL_BACKOFF_CAP, "and stays there");
+        // Defensive: 0 should be unreachable, but must degrade to the base rather than
+        // underflowing into a huge shift.
         assert_eq!(
             dial_wait(0),
             DIAL_BACKOFF_BASE,
-            "first failure waits the base"
+            "0 degrades to the base, not a panic"
         );
-        assert_eq!(dial_wait(1), DIAL_BACKOFF_BASE * 2);
-        assert_eq!(
-            dial_wait(2),
-            DIAL_BACKOFF_CAP,
-            "doubling reaches the cap at 60s"
-        );
-        assert_eq!(dial_wait(3), DIAL_BACKOFF_CAP, "and stays there");
         // Strikes only ever grow, so the shift must survive a peer that is unreachable for a
         // very long session. `1u32 << 32` panics in debug; the clamp is what prevents it.
         assert_eq!(

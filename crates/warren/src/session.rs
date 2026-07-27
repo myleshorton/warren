@@ -30,6 +30,32 @@ const RESEED_HELD_CAP: usize = 96;
 /// known provider of a feed, so it re-looks-up at a bounded rate instead of spinning.
 const RESUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// After a failed dial, how long to leave that peer alone before trying again — doubling per
+/// consecutive failure up to [`DIAL_BACKOFF_CAP`].
+///
+/// Without this, `discover` re-dials every member it finds on every round, and a dial to an
+/// unreachable peer costs a full connect timeout (~10s) before failing. On a network that
+/// permits discovery but blocks peer connections — client isolation, or a peer behind
+/// carrier-grade NAT — that is a 10-second stall and a radio wake every round, indefinitely,
+/// for something that cannot succeed.
+const DIAL_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_secs(15);
+/// How long to wait before re-dialing a peer that has failed `strikes` times in a row:
+/// 15s, 30s, 60s, then flat at the cap.
+///
+/// The shift is clamped before it happens. `1u32 << strikes` panics in debug once `strikes`
+/// reaches 32, and strikes only grows — a peer unreachable for a long session would eventually
+/// get there, turning a battery optimisation into a crash.
+fn dial_wait(strikes: u32) -> std::time::Duration {
+    DIAL_BACKOFF_BASE
+        .saturating_mul(1u32 << strikes.min(8))
+        .min(DIAL_BACKOFF_CAP)
+}
+
+/// Ceiling on the dial backoff. Deliberately short: the cost of being wrong is that a peer
+/// which just became reachable (the user moved to a working network) waits this long to be
+/// retried, so the ceiling bounds recovery time rather than maximising the saving.
+const DIAL_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The channel keys + topic domains a session runs under. `content_key` empty ⇒ a
 /// blind node that can discover, cache, and serve ciphertext but cannot decrypt.
 #[derive(Clone)]
@@ -91,6 +117,10 @@ pub struct Session {
     /// The shared feed store (redb) backing the own log and every mirror — so a mirror we
     /// hold persists to disk and is restored on restart, and so we serve it from there.
     feed_store: Arc<dyn feed::FeedStore>,
+    /// Peers whose last dial failed: when, and how many times in a row. Consulted by
+    /// [`Self::discover`] so an unreachable peer isn't re-dialed every round. Cleared for a
+    /// peer the moment it answers.
+    dial_failures: Arc<StdMutex<HashMap<swarm::NodeId, (std::time::Instant, u32)>>>,
 }
 
 /// A mirrored feed: the replica we keep current, and the signal fired when it grows.
@@ -159,6 +189,27 @@ impl Session {
             appended: Arc::new(tokio::sync::Notify::new()),
             mirrored,
             feed_store,
+            dial_failures: Arc::new(StdMutex::new(HashMap::new())),
+        }
+    }
+
+    /// Whether `id`'s last dial failed recently enough that we should skip it this round.
+    fn dialing_backed_off(&self, id: &swarm::NodeId) -> bool {
+        let map = self.dial_failures.lock().expect("dial_failures");
+        let Some((at, strikes)) = map.get(id) else {
+            return false;
+        };
+        at.elapsed() < dial_wait(*strikes)
+    }
+
+    /// Record the outcome of a dial: clear the peer on success, escalate its backoff on failure.
+    fn note_dial(&self, id: swarm::NodeId, reached: bool) {
+        let mut map = self.dial_failures.lock().expect("dial_failures");
+        if reached {
+            map.remove(&id);
+        } else {
+            let entry = map.entry(id).or_insert((std::time::Instant::now(), 0));
+            *entry = (std::time::Instant::now(), entry.1.saturating_add(1));
         }
     }
 
@@ -730,9 +781,15 @@ impl Session {
             if member.id == me {
                 continue;
             }
-            if let Some((blocks, pubkey)) =
-                protocol::fetch_feed(&self.node, member.id, protocol::REQ_FEED, &cfg).await
-            {
+            // Don't spend a connect timeout on a peer that just refused to answer. `members`
+            // still lists it, so callers see who is *there* — only the dial is skipped.
+            if self.dialing_backed_off(&member.id) {
+                continue;
+            }
+            let fetched =
+                protocol::fetch_feed(&self.node, member.id, protocol::REQ_FEED, &cfg).await;
+            self.note_dial(member.id, fetched.is_some());
+            if let Some((blocks, pubkey)) = fetched {
                 reached.push((member.id, pubkey));
                 for b in blocks {
                     if let Ok(rec) = serde_json::from_slice::<Record>(&b) {
@@ -925,5 +982,44 @@ impl Session {
             chunks.push(store.get(hash)?.to_vec());
         }
         Some(chunks)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dial_wait_backs_off_then_flattens_at_the_cap() {
+        assert_eq!(
+            dial_wait(0),
+            DIAL_BACKOFF_BASE,
+            "first failure waits the base"
+        );
+        assert_eq!(dial_wait(1), DIAL_BACKOFF_BASE * 2);
+        assert_eq!(
+            dial_wait(2),
+            DIAL_BACKOFF_CAP,
+            "doubling reaches the cap at 60s"
+        );
+        assert_eq!(dial_wait(3), DIAL_BACKOFF_CAP, "and stays there");
+        // Strikes only ever grow, so the shift must survive a peer that is unreachable for a
+        // very long session. `1u32 << 32` panics in debug; the clamp is what prevents it.
+        assert_eq!(
+            dial_wait(u32::MAX),
+            DIAL_BACKOFF_CAP,
+            "no overflow panic at the extreme"
+        );
+    }
+
+    #[test]
+    fn the_cap_bounds_how_long_a_recovered_peer_waits() {
+        // The cost of backing off is that a peer which just became reachable — the user moved
+        // to a working network — is skipped until its wait elapses. That delay is user-visible,
+        // so the cap is the ceiling on it and deserves to be asserted rather than drift upward.
+        assert!(
+            DIAL_BACKOFF_CAP <= std::time::Duration::from_secs(60),
+            "a recovered peer must not wait more than a minute to be retried"
+        );
     }
 }

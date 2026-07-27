@@ -208,6 +208,25 @@ impl Session {
         at.elapsed() < dial_wait(*strikes)
     }
 
+    /// Drop dial-failure entries that can no longer gate anything.
+    ///
+    /// Entries are otherwise only removed on a successful dial, so a peer that failed and then
+    /// vanished from discovery would sit in the map for the life of the process. Expiring by age
+    /// past [`DIAL_BACKOFF_CAP`] is free: `dialing_backed_off` already returns false once the
+    /// wait has elapsed, and the wait can never exceed the cap, so anything older is inert.
+    ///
+    /// Deliberately *not* "prune to the peers in `members`" — DHT lookups are flaky, so a peer
+    /// flickering out of one round would lose its accumulated backoff and get re-dialed
+    /// immediately, which is the cost this whole mechanism exists to avoid. Age-based expiry
+    /// can't do that: a peer still being retried has its timestamp refreshed on every attempt,
+    /// so only genuinely abandoned entries get old enough to drop.
+    fn prune_dial_failures(&self) {
+        self.dial_failures
+            .lock()
+            .expect("dial_failures")
+            .retain(|_, (at, _)| at.elapsed() < DIAL_BACKOFF_CAP);
+    }
+
     /// Record the outcome of a dial: clear the peer on success, escalate its backoff on failure.
     fn note_dial(&self, id: swarm::NodeId, reached: bool) {
         let mut map = self.dial_failures.lock().expect("dial_failures");
@@ -759,6 +778,7 @@ impl Session {
     /// record's encryption envelope for later decryption. Applies **no** filtering —
     /// the app layers its own (e.g. moderation) on the result.
     pub async fn discover(&self) -> Discovered {
+        self.prune_dial_failures();
         let cfg = transfer::Config::default();
         let e = channel::current_epoch();
         let mut members = self

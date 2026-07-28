@@ -80,6 +80,13 @@ pub struct Transmit {
 pub enum ConnectOutcome {
     /// A reachable (Open) peer, or two predictable peers: a plain direct path.
     Direct,
+    /// Established over the **LAN**, from a multicast beacon rather than a DHT lookup: no
+    /// coordinator brokered it and no hole was punched (a local segment needs none).
+    /// Distinct from [`Direct`](Self::Direct) so telemetry can tell a backbone-free local
+    /// connect apart from a lucky open-NAT one — on a network whose uplink is unusable, or
+    /// where both peers sit behind one symmetric NAT, this is the only outcome that can
+    /// succeed at all.
+    LanDirect,
     /// A hole was punched (one-sided-random birthday strategy).
     Punched,
     /// Both peers are symmetric, so no direct path can be punched. Reported as an

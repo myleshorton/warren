@@ -433,6 +433,11 @@ pub struct Node {
     /// punches, inbound connects, NAT classification, Noise handshakes). `None`
     /// unless the node was built with [`Node::bind_with_events`].
     events: Option<mpsc::Sender<NodeEvent>>,
+    /// LAN discovery + the local connect broker. `None` unless built with
+    /// [`Node::bind_with_lan`] (or if the multicast socket wouldn't bind). Behind an `Arc`
+    /// because `Node` is `Clone` and dropping a `LanBeacon` stops LAN immediately — so the
+    /// subsystem must outlive every clone but the last, like the node's own task.
+    lan: Option<Arc<LanBeacon>>,
 }
 
 /// A running periodic re-announce started by [`Node::keep_announced`]. Hold it
@@ -475,7 +480,7 @@ impl Node {
         identity: crypto::Keypair,
         tuning: PunchTuning,
     ) -> io::Result<Node> {
-        Node::bind_inner(bind_addr, identity, tuning, None).await
+        Node::bind_inner(bind_addr, identity, tuning, None, false).await
     }
 
     /// Like [`Node::bind_with`], but also attaches a telemetry sink that receives
@@ -489,7 +494,33 @@ impl Node {
         tuning: PunchTuning,
         events: mpsc::Sender<NodeEvent>,
     ) -> io::Result<Node> {
-        Node::bind_inner(bind_addr, identity, tuning, Some(events)).await
+        Node::bind_inner(bind_addr, identity, tuning, Some(events), false).await
+    }
+
+    /// Like [`bind_with_events`](Self::bind_with_events), plus **LAN discovery**: the node
+    /// beacons itself on a site-local multicast group and brokers inbound local connects, so
+    /// two devices on one network find and reach each other with no DHT and no coordinator.
+    ///
+    /// Opt-in, and deliberately not the default for the plain `bind*` constructors: it opens a
+    /// multicast socket and a control socket, which a library user embedding warren in a
+    /// server has no use for.
+    ///
+    /// **Degrades rather than fails.** A network with no multicast, or a node bound to an
+    /// unspecified address (no concrete IP to advertise), leaves LAN off and the node behaves
+    /// exactly as a plain bind. Ask [`lan_enabled`](Self::lan_enabled) rather than assuming —
+    /// a silent downgrade is why this returns `Ok` instead of an error, and why it's
+    /// inspectable.
+    ///
+    /// Starts with no topics, so nothing is advertised until
+    /// [`set_lan_topics`](Self::set_lan_topics) is called — a node broadcasting that it exists
+    /// before it has joined anything would leak its presence for no benefit.
+    pub async fn bind_with_lan(
+        bind_addr: SocketAddr,
+        identity: crypto::Keypair,
+        tuning: PunchTuning,
+        events: mpsc::Sender<NodeEvent>,
+    ) -> io::Result<Node> {
+        Node::bind_inner(bind_addr, identity, tuning, Some(events), true).await
     }
 
     async fn bind_inner(
@@ -497,6 +528,7 @@ impl Node {
         identity: crypto::Keypair,
         tuning: PunchTuning,
         events: Option<mpsc::Sender<NodeEvent>>,
+        lan: bool,
     ) -> io::Result<Node> {
         let (lo, hi) = tuning.birthday.range;
         if !(lo >= 1 && lo < hi) {
@@ -514,6 +546,22 @@ impl Node {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (incoming_tx, incoming_rx) = mpsc::channel(16);
         let rx = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // Started before the actor so a LAN channel and a DHT-punched one share the single
+        // `incoming` stream; the sender is cloned, not moved, so both producers stay live.
+        let lan = if lan && !local_addr.ip().is_unspecified() {
+            LanBeacon::start(
+                identity.clone(),
+                local_addr.ip(),
+                Vec::new(),
+                tuning.config,
+                incoming_tx.clone(),
+            )
+            .await
+            .ok()
+            .map(Arc::new)
+        } else {
+            None
+        };
         tokio::spawn(run(
             Dht::new(id),
             socket,
@@ -532,6 +580,62 @@ impl Node {
             incoming: Arc::new(Mutex::new(incoming_rx)),
             rx,
             events,
+            lan,
+        })
+    }
+
+    /// Whether LAN discovery is running. False for every plain `bind*`, and false after
+    /// [`bind_with_lan`](Self::bind_with_lan) on a network where the multicast socket wouldn't
+    /// bind — check it rather than inferring LAN from the constructor you called.
+    pub fn lan_enabled(&self) -> bool {
+        self.lan.is_some()
+    }
+
+    /// Advertise these blinded per-epoch topics on the LAN beacon, replacing any previous set.
+    /// Call on joining or leaving a channel, and when an epoch rotates. No-op without LAN.
+    pub fn set_lan_topics(&self, topics: Vec<crypto::Hash>) {
+        if let Some(lan) = &self.lan {
+            lan.set_topics(topics);
+        }
+    }
+
+    /// Same-channel peers heard on the LAN within the beacon TTL, as `(node_id, control_addr)`
+    /// — feed the address straight to [`connect_direct`](Self::connect_direct). Empty without
+    /// LAN, so a caller can treat "no LAN" and "no LAN peers" the same way.
+    pub fn lan_peers(&self) -> Vec<(NodeId, SocketAddr)> {
+        self.lan.as_ref().map(|l| l.peers()).unwrap_or_default()
+    }
+
+    /// Connect to a LAN-discovered peer directly: no DHT lookup, no coordinator, no hole punch
+    /// to traverse. `control_addr` comes from [`lan_peers`](Self::lan_peers).
+    ///
+    /// Reports [`ConnectOutcome::LanDirect`] on success. A `None` channel means the peer didn't
+    /// answer in time, reported as [`ConnectOutcome::TimedOut`] so a caller can fall back to
+    /// [`connect`](Self::connect) on the same signal it already handles.
+    ///
+    /// As with [`connect`](Self::connect), this establishes a *path*, not an identity — run the
+    /// usual Noise handshake over the channel, which pins `peer_id` regardless of what the
+    /// beacon or the request claimed.
+    pub async fn connect_direct(
+        &self,
+        control_addr: SocketAddr,
+    ) -> std::result::Result<Connection, ConnectError> {
+        let Some(lan) = &self.lan else {
+            return Err(ConnectError::UnspecifiedLocalAddr);
+        };
+        let t0 = Instant::now();
+        let channel = lan.dial(control_addr).await.map_err(ConnectError::Bind)?;
+        Ok(Connection {
+            outcome: if channel.is_some() {
+                ConnectOutcome::LanDirect
+            } else {
+                ConnectOutcome::TimedOut
+            },
+            channel,
+            stats: ConnectStats {
+                total_ms: t0.elapsed().as_millis() as u64,
+                ..Default::default()
+            },
         })
     }
 

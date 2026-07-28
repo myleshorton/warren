@@ -17,16 +17,43 @@ use transfer::{Link, NoiseLink};
 /// ciphertext and a peer is cryptographically bound to the node id it claims.
 type Secure = NoiseLink<Channel>;
 
-/// Connect to `target` over the DHT and upgrade the punched channel to an
-/// authenticated, encrypted Noise session pinned to `target`'s node id (see
+/// Reach `target`, preferring the LAN when it is beaconing on our segment.
+///
+/// A LAN path needs no DHT lookup and no coordinator, so it works where the DHT cannot: an
+/// uplink that drops our traffic, a captive network, or two devices behind one symmetric NAT.
+/// It's also simply faster and cheaper when both paths exist, which is why LAN is tried first
+/// rather than as a fallback.
+///
+/// Falls through to the DHT whenever LAN can't deliver a channel, so LAN can only ever add
+/// reachability. Note the fallback also covers a peer that beaconed and then vanished — the
+/// beacon TTL outlives the device by up to its length.
+///
+/// `docs/lan-direct-connect.md` reserves initiating for the lower node id, to stop a
+/// *discovery-driven* pair from opening two channels at once. That rule doesn't transfer here:
+/// this dial is demand-driven — something wants a feed or a blob *now* — so the higher-id side
+/// declining to initiate would just fail the request on exactly the networks LAN exists to
+/// rescue. Both sides may therefore initiate, and a simultaneous dial costs one redundant
+/// inbound channel, which the serve loop already handles as an ordinary inbound request.
+async fn dial_path(node: &Node, target: NodeId) -> Result<driver::Connection, String> {
+    if let Some((_, control)) = node.lan_peers().into_iter().find(|(id, _)| *id == target) {
+        if let Ok(conn) = node.connect_direct(control).await {
+            if conn.channel.is_some() {
+                return Ok(conn);
+            }
+        }
+    }
+    node.connect(target)
+        .await
+        .map_err(|e| format!("connect: {e:?}"))
+}
+
+/// Connect to `target` — over the LAN if it's local, else the DHT — and upgrade the channel to
+/// an authenticated, encrypted Noise session pinned to `target`'s node id (see
 /// [`NoiseLink::connect`]). `Err` if the peer is unreachable, yields no data
 /// channel, or the handshake fails — including a peer whose identity does not hash
 /// to `target` (then the error is `PermissionDenied`).
 async fn secure_dial(node: &Node, target: NodeId) -> Result<Secure, String> {
-    let conn = node
-        .connect(target)
-        .await
-        .map_err(|e| format!("connect: {e:?}"))?;
+    let conn = dial_path(node, target).await?;
     // The driver already emitted a `ConnectResolved` telemetry event carrying the
     // funnel stats; surface the outcome in the error so even the string path is
     // legible ("unreachable: TimedOut") instead of a bare "no data channel".

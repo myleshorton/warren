@@ -68,6 +68,9 @@ fn main() {
 
         let note = match outcome {
             ConnectOutcome::Direct => "dialed directly",
+            // Never produced here: this sim models coordinator-brokered connects across NATs,
+            // and a LAN connect involves neither a coordinator nor a NAT. Matched to compile.
+            ConnectOutcome::LanDirect => "dialed directly over the LAN",
             ConnectOutcome::Punched => "hole punched (birthday)",
             ConnectOutcome::Relayed => "via coordinator relay",
             ConnectOutcome::NotFound => "not found",

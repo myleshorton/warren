@@ -84,6 +84,12 @@ pub struct Discovered {
     pub records: Vec<(Record, crypto::PublicKey, swarm::NodeId)>,
     /// The members found online (including ourselves) — for the app's bootstrap
     /// cache; the caller filters out its own id.
+    ///
+    /// Mixes two sources. A DHT-discovered member carries its DHT address; a LAN-discovered one
+    /// carries its **LAN control address**, which is only meaningful on that segment and is not
+    /// a DHT endpoint. Caching one as a bootstrap peer is therefore useless rather than harmful
+    /// — it answers no DHT query and ages out — and is worth it so this list, and any count
+    /// taken from it, reflects every peer actually reachable.
     pub members: Vec<swarm::Contact>,
     /// Every member we connected to and downloaded a feed from, with its node id +
     /// feed key — **including members whose feed was empty**. An app resolving a
@@ -796,6 +802,29 @@ impl Session {
                 if !members.iter().any(|m| m.id == c.id) {
                     members.push(c);
                 }
+            }
+        }
+
+        // Tell the LAN beacon which channel we're in, so same-channel peers on this segment can
+        // recognise us. Set every round rather than once at join: the topic is per-epoch, so it
+        // rotates underneath us, and re-setting is a couple of hash copies. Both epochs ride
+        // along for the same reason `members` merges both — a peer that hasn't rolled over yet
+        // is still the same channel. No-op unless the node was built with LAN.
+        self.node.set_lan_topics(if e > 0 {
+            vec![
+                *self.channel_topic(e).as_bytes(),
+                *self.channel_topic(e - 1).as_bytes(),
+            ]
+        } else {
+            vec![*self.channel_topic(e).as_bytes()]
+        });
+
+        // Fold in peers heard on the LAN. Without this a local peer is invisible whenever the
+        // DHT can't see it — which is the whole case LAN discovery exists for, and it presents
+        // as "0 members discovered" even with the peer one hop away on the same subnet.
+        for (id, control_addr) in self.node.lan_peers() {
+            if !members.iter().any(|m| m.id == id) {
+                members.push(swarm::Contact::new(id, control_addr));
             }
         }
 

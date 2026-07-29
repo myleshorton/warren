@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use swarm::dht::{Dht, Event};
 use swarm::{Contact, Message, NodeId, Packet, QueryId, Strategy};
@@ -515,7 +515,7 @@ impl Node {
         let (incoming_tx, incoming_rx) = mpsc::channel(16);
         let rx = Arc::new(std::sync::atomic::AtomicU64::new(0));
         tokio::spawn(run(
-            Dht::with_identity(identity.clone()),
+            Dht::new(id),
             socket,
             cmd_rx,
             incoming_tx,
@@ -777,12 +777,6 @@ async fn run(
 ) {
     let start = Instant::now();
     let now = || start.elapsed().as_millis() as u64;
-    let record_now = || {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0)
-    };
     let mut buf = vec![0u8; RECV_BUF];
 
     // The interface to bind per-connection data sockets on: the same host as the
@@ -1003,7 +997,6 @@ async fn run(
                         let first = waiters.is_empty();
                         waiters.push(tx);
                         if first {
-                            dht.set_record_time(record_now());
                             dht.announce(topic, now());
                         }
                     }
@@ -1053,7 +1046,6 @@ async fn run(
                 match recv {
                     Ok((n, from)) => {
                         rx_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        dht.set_record_time(record_now());
                         dht.handle_input(from, &buf[..n], now());
                     }
                     // Transient, e.g. an ICMP error surfaced from a prior send;
@@ -1088,7 +1080,6 @@ async fn run(
                 }
             }
             _ = tokio::time::sleep(delay) => {
-                dht.set_record_time(record_now());
                 dht.handle_timeout(now());
             }
         }

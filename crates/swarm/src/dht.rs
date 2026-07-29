@@ -273,6 +273,7 @@ struct AuthState {
     records: AnnouncementStore,
     next_sequence: u64,
     pending: HashMap<u64, PendingCapability>,
+    announces_waiting: HashMap<NodeId, usize>,
     now: u64,
 }
 
@@ -397,6 +398,7 @@ impl Dht {
             records: AnnouncementStore::default(),
             next_sequence: 1,
             pending: HashMap::new(),
+            announces_waiting: HashMap::new(),
             now: 0,
         });
         dht
@@ -721,6 +723,7 @@ impl Dht {
                 }
             }
             Message::CapabilityGrant { capability } => {
+                let mut announce_finished = false;
                 let Some(auth) = &mut self.auth else {
                     return;
                 };
@@ -738,13 +741,25 @@ impl Dht {
                     WriteCapability::from_bytes(capability),
                 );
                 auth.next_sequence = auth.next_sequence.wrapping_add(1);
+                if let Some(waiting) = auth.announces_waiting.get_mut(&pending.topic) {
+                    *waiting = waiting.saturating_sub(1);
+                    if *waiting == 0 {
+                        auth.announces_waiting.remove(&pending.topic);
+                        announce_finished = true;
+                    }
+                }
+                let encoded = record.encode();
+                let _ = auth;
                 self.send(
                     from,
                     packet.rid,
-                    Message::AuthenticatedAnnounce {
-                        record: record.encode(),
-                    },
+                    Message::AuthenticatedAnnounce { record: encoded },
                 );
+                if announce_finished {
+                    self.events.push_back(Event::AnnounceFinished {
+                        topic: pending.topic,
+                    });
+                }
             }
             Message::AuthenticatedAnnounce { record } => {
                 let Ok(record) = SignedAnnouncement::decode(&record) else {
@@ -1210,6 +1225,9 @@ impl Dht {
                 if self.auth.is_some() {
                     // Authenticated nodes first obtain a recipient-scoped grant.
                     // The grant reply is correlated before a signed record is sent.
+                    if let Some(auth) = &mut self.auth {
+                        auth.announces_waiting.insert(target, closest.len());
+                    }
                     for c in &closest {
                         let rid = self.alloc_rid();
                         let expires_at = self
@@ -1246,8 +1264,10 @@ impl Dht {
                         self.send(c.addr, rid, Message::Announce { topic: target });
                     }
                 }
-                self.events
-                    .push_back(Event::AnnounceFinished { topic: target });
+                if self.auth.is_none() || closest.is_empty() {
+                    self.events
+                        .push_back(Event::AnnounceFinished { topic: target });
+                }
             }
             QueryKind::Connect => match coordinators.first().copied() {
                 Some(coord) => {

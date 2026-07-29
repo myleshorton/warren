@@ -26,6 +26,7 @@ pub mod msg;
 pub mod nat;
 pub mod natbox;
 pub mod punch;
+pub mod record;
 pub mod routing;
 pub mod sim;
 

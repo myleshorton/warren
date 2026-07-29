@@ -17,9 +17,17 @@ const KIND_PONG: u8 = 2;
 const KIND_FIND_NODE: u8 = 3;
 const KIND_NODES: u8 = 4;
 const KIND_ANNOUNCE: u8 = 5;
+const KIND_CAPABILITY_REQUEST: u8 = 6;
 const KIND_SIGNAL: u8 = 7;
 const KIND_REFLECT: u8 = 8;
 const KIND_REFLECTED: u8 = 9;
+const KIND_CAPABILITY_GRANT: u8 = 10;
+const KIND_AUTHENTICATED_ANNOUNCE: u8 = 11;
+
+/// Upper bound for a signed provider record, including its capability. This is
+/// deliberately much smaller than the driver receive buffer so decoding never
+/// turns a single packet into an unbounded allocation.
+const MAX_AUTH_RECORD_BYTES: usize = 512;
 
 const ADDR_V4: u8 = 4;
 const ADDR_V6: u8 = 6;
@@ -55,6 +63,20 @@ pub enum Message {
     /// Ask the recipient to store the sender as an announcer under `topic`.
     /// One-way (best-effort); the announcer does not wait for confirmation.
     Announce { topic: NodeId },
+    /// Request a recipient-scoped capability to write one signed provider
+    /// record. The reply echoes the packet request id.
+    CapabilityRequest {
+        topic: NodeId,
+        owner: NodeId,
+        expires_at: u64,
+    },
+    /// Reply to a [`Message::CapabilityRequest`]. The opaque value is only
+    /// meaningful to the recipient that minted it.
+    CapabilityGrant { capability: [u8; 32] },
+    /// A canonical [`crate::record::SignedAnnouncement`] encoding. The core
+    /// validates it before storage; the byte container here exists solely to
+    /// keep packet decoding independent from record evolution.
+    AuthenticatedAnnounce { record: Vec<u8> },
     /// Ask the recipient to echo the source address it observes (a STUN-like
     /// reflexive probe). Unlike [`Message::Ping`], a `Reflect` is *not* routing
     /// evidence: it comes from a transient data socket, not a routable peer, so
@@ -137,6 +159,25 @@ impl Packet {
                 enc.u8(KIND_ANNOUNCE);
                 enc.raw(topic.as_bytes());
             }
+            Message::CapabilityRequest {
+                topic,
+                owner,
+                expires_at,
+            } => {
+                enc.u8(KIND_CAPABILITY_REQUEST);
+                enc.raw(topic.as_bytes());
+                enc.raw(owner.as_bytes());
+                enc.uint(*expires_at);
+            }
+            Message::CapabilityGrant { capability } => {
+                enc.u8(KIND_CAPABILITY_GRANT);
+                enc.raw(capability);
+            }
+            Message::AuthenticatedAnnounce { record } => {
+                enc.u8(KIND_AUTHENTICATED_ANNOUNCE);
+                enc.uint(record.len() as u64);
+                enc.raw(record);
+            }
             Message::Reflect => {
                 enc.u8(KIND_REFLECT);
             }
@@ -188,6 +229,27 @@ impl Packet {
             KIND_ANNOUNCE => {
                 let topic = NodeId::from_bytes(dec.array::<ID_LEN>()?);
                 Message::Announce { topic }
+            }
+            KIND_CAPABILITY_REQUEST => Message::CapabilityRequest {
+                topic: NodeId::from_bytes(dec.array::<ID_LEN>()?),
+                owner: NodeId::from_bytes(dec.array::<ID_LEN>()?),
+                expires_at: dec.uint()?,
+            },
+            KIND_CAPABILITY_GRANT => Message::CapabilityGrant {
+                capability: dec.array::<32>()?,
+            },
+            KIND_AUTHENTICATED_ANNOUNCE => {
+                let len = dec.uint()?;
+                if len > MAX_AUTH_RECORD_BYTES as u64 || len > dec.remaining() as u64 {
+                    return Err(MsgError::Malformed(
+                        "authenticated record exceeds packet bound",
+                    ));
+                }
+                let mut record = vec![0; len as usize];
+                for byte in &mut record {
+                    *byte = dec.u8()?;
+                }
+                Message::AuthenticatedAnnounce { record }
             }
             KIND_REFLECT => Message::Reflect,
             KIND_REFLECTED => Message::Reflected {
@@ -357,6 +419,53 @@ mod tests {
             reachable: false,
             msg: Message::FindNode { target: id(9) },
         });
+    }
+
+    #[test]
+    fn authenticated_record_carriers_roundtrip_and_are_bounded() {
+        let request = Packet {
+            sender: id(1),
+            rid: 2,
+            reachable: false,
+            msg: Message::CapabilityRequest {
+                topic: id(3),
+                owner: id(4),
+                expires_at: 5,
+            },
+        };
+        roundtrip(&request);
+        roundtrip(&Packet {
+            sender: id(1),
+            rid: 2,
+            reachable: false,
+            msg: Message::CapabilityGrant {
+                capability: [6; 32],
+            },
+        });
+        roundtrip(&Packet {
+            sender: id(1),
+            rid: 2,
+            reachable: false,
+            msg: Message::AuthenticatedAnnounce {
+                record: vec![7; 128],
+            },
+        });
+
+        let too_large = Packet {
+            sender: id(1),
+            rid: 2,
+            reachable: false,
+            msg: Message::AuthenticatedAnnounce {
+                record: vec![7; MAX_AUTH_RECORD_BYTES + 1],
+            },
+        }
+        .encode();
+        assert_eq!(
+            Packet::decode(&too_large),
+            Err(MsgError::Malformed(
+                "authenticated record exceeds packet bound"
+            ))
+        );
     }
 
     fn addr4(port: u16) -> SocketAddr {

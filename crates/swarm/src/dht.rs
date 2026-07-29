@@ -16,7 +16,7 @@ use crate::id::NodeId;
 use crate::msg::{Message, Packet};
 use crate::nat::{Firewall, NatSampler};
 use crate::punch::{plan, Strategy};
-use crate::routing::{Contact, RoutingTable, K};
+use crate::routing::{Admission, Contact, RoutingTable, K};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 
@@ -250,6 +250,11 @@ struct NatPending {
     deadline: Millis,
 }
 
+struct ReplacementPending {
+    rid: u64,
+    deadline: Millis,
+}
+
 struct ConnectState {
     /// When this connect gives up if signaling hasn't completed.
     deadline: Millis,
@@ -293,6 +298,9 @@ pub struct Dht {
     pending: HashMap<u64, Pending>,
     nat: NatSampler,
     nat_pending: HashMap<u64, NatPending>,
+    /// One LRU liveness probe per full bucket incumbent. A candidate stays in
+    /// the routing table's bounded replacement cache until this probe resolves.
+    replacement_pending: HashMap<NodeId, ReplacementPending>,
     self_reachable: bool,
     /// This node's own firewall type, shared with peers during connect signaling.
     local_firewall: Firewall,
@@ -337,6 +345,7 @@ impl Dht {
             pending: HashMap::new(),
             nat: NatSampler::new(),
             nat_pending: HashMap::new(),
+            replacement_pending: HashMap::new(),
             self_reachable: false,
             local_firewall: Firewall::Open,
             pinned: None,
@@ -371,6 +380,23 @@ impl Dht {
     /// Seed a bootstrap contact into the routing table.
     pub fn add_contact(&mut self, contact: Contact) {
         self.table.insert(contact);
+    }
+
+    fn admit_contact(&mut self, contact: Contact, now: Millis) {
+        if let Admission::Probe(incumbent) = self.table.admit(contact) {
+            if self.replacement_pending.contains_key(&incumbent.id) {
+                return;
+            }
+            let rid = self.alloc_rid();
+            self.replacement_pending.insert(
+                incumbent.id,
+                ReplacementPending {
+                    rid,
+                    deadline: now + REQUEST_TIMEOUT_MS,
+                },
+            );
+            self.send(incumbent.addr, rid, Message::Ping);
+        }
     }
 
     /// Probe up to `count` known peers to learn our externally-observed address.
@@ -558,19 +584,6 @@ impl Dht {
         let Ok(packet) = Packet::decode(data) else {
             return;
         };
-        // Fold the sender into the routing table only if it advertises itself as a
-        // routable ("server") node — directly reachable for a cold query. A NAT'd
-        // "client" (reachable=false) can send us announces/signals/pings while its
-        // mapping is open, but a later cold FindNode won't reach it; adding it would
-        // poison routing with a dead contact that stalls every lookup on a
-        // REQUEST_TIMEOUT (the client/server split). Clients stay discoverable via
-        // announce records. A `Reflect` is never routing evidence (it comes from a
-        // transient reflexive-probe socket, not a routable endpoint).
-        if packet.sender != self.id && packet.reachable && !matches!(&packet.msg, Message::Reflect)
-        {
-            self.table.insert(Contact::new(packet.sender, from));
-        }
-
         match packet.msg {
             Message::Ping => {
                 // Echo back the source address we saw, so the sender can learn
@@ -578,6 +591,16 @@ impl Dht {
                 self.send(from, packet.rid, Message::Pong { observed: from });
             }
             Message::Pong { observed } => {
+                if self
+                    .replacement_pending
+                    .get(&packet.sender)
+                    .is_some_and(|probe| probe.rid == packet.rid)
+                {
+                    self.replacement_pending.remove(&packet.sender);
+                    // The LRU replacement probe reached the incumbent. Refresh
+                    // its recency without admitting any unrelated sender.
+                    self.table.insert(Contact::new(packet.sender, from));
+                }
                 let matches_probe = self
                     .nat_pending
                     .get(&packet.rid)
@@ -589,6 +612,13 @@ impl Dht {
                 }
             }
             Message::FindNode { target } => {
+                // A reachable peer that sent a lookup to this exact endpoint is
+                // an active DHT participant, unlike an unsolicited Ping or
+                // announce. Admit it so bootstrap nodes learn their callers;
+                // its declared reachability still gates the slot.
+                if packet.sender != self.id && packet.reachable {
+                    self.admit_contact(Contact::new(packet.sender, from), now);
+                }
                 self.prune_announces_if_due(now);
                 let contacts = self.table.closest(&target, K);
                 // Include any announce records we hold for the queried target,
@@ -671,6 +701,17 @@ impl Dht {
         self.nat_pending.retain(|_, pending| pending.deadline > now);
         self.maybe_finish_nat_round();
 
+        let stale_replacements: Vec<NodeId> = self
+            .replacement_pending
+            .iter()
+            .filter(|(_, pending)| pending.deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for incumbent in stale_replacements {
+            self.replacement_pending.remove(&incumbent);
+            self.table.replace_unresponsive(&incumbent);
+        }
+
         // Provider announcements are leases, not permanent reservations. Remove
         // expired records and their now-empty topic entries so departed providers
         // cannot occupy a topic's bounded K slots forever.
@@ -711,6 +752,7 @@ impl Dht {
             .values()
             .map(|p| p.deadline)
             .chain(self.nat_pending.values().map(|p| p.deadline))
+            .chain(self.replacement_pending.values().map(|p| p.deadline))
             .chain(self.connecting.values().map(|cs| cs.deadline))
             .chain(self.pending_incoming.values().map(|inc| inc.deadline))
             .min()
@@ -768,6 +810,11 @@ impl Dht {
         if p.contact != responder || p.addr != responder_addr {
             return;
         }
+        // A routing slot needs more than a peer-controlled `reachable` bit or
+        // an unsolicited packet. This reply proves that this exact ID/endpoint
+        // received one of our FindNode requests and answered it.
+        self.replacement_pending.remove(&responder);
+        self.admit_contact(Contact::new(responder, responder_addr), now);
         let p = self.pending.remove(&rid).expect("pending request exists");
         let Some(q) = self.queries.get_mut(&p.query) else {
             return;
@@ -1238,6 +1285,13 @@ mod tests {
         NodeId::from_bytes([b; 32])
     }
 
+    fn bucket_zero_id(n: u8) -> NodeId {
+        let mut bytes = [0u8; 32];
+        bytes[0] = 0x80;
+        bytes[1] = n;
+        NodeId::from_bytes(bytes)
+    }
+
     fn signal_request(initiator: NodeId, target: NodeId, data_addr: SocketAddr) -> Vec<u8> {
         Packet {
             sender: id(9),
@@ -1331,6 +1385,94 @@ mod tests {
     }
 
     #[test]
+    fn full_bucket_pings_lru_then_promotes_candidate_only_after_timeout() {
+        let local = NodeId::from_bytes([0u8; 32]);
+        let mut dht = Dht::new(local);
+        let first = Contact::new(bucket_zero_id(1), addr("10.0.0.1:10001"));
+        dht.add_contact(first);
+        for i in 2..=K as u8 {
+            dht.add_contact(Contact::new(
+                bucket_zero_id(i),
+                addr(&format!("10.0.0.{i}:{}", 10_000 + i as u16)),
+            ));
+        }
+
+        let candidate = bucket_zero_id(99);
+        let candidate_addr = addr("10.0.1.99:10999");
+        dht.admit_contact(Contact::new(candidate, candidate_addr), 0);
+
+        let sends: Vec<_> = std::iter::from_fn(|| dht.poll_transmit()).collect();
+        assert!(sends.iter().any(|tx| tx.to == first.addr));
+        assert!(dht.table.contains(&first.id));
+        assert!(!dht.table.contains(&candidate));
+
+        dht.handle_timeout(REQUEST_TIMEOUT_MS);
+        assert!(!dht.table.contains(&first.id));
+        assert!(dht.table.contains(&candidate));
+    }
+
+    #[test]
+    fn lru_probe_response_keeps_incumbent() {
+        let local = NodeId::from_bytes([0u8; 32]);
+        let mut dht = Dht::new(local);
+        let first = Contact::new(bucket_zero_id(1), addr("10.0.0.1:10001"));
+        dht.add_contact(first);
+        for i in 2..=K as u8 {
+            dht.add_contact(Contact::new(
+                bucket_zero_id(i),
+                addr(&format!("10.0.0.{i}:{}", 10_000 + i as u16)),
+            ));
+        }
+        let candidate = bucket_zero_id(99);
+        dht.admit_contact(Contact::new(candidate, addr("10.0.1.99:10999")), 0);
+        let probe = std::iter::from_fn(|| dht.poll_transmit())
+            .find(|tx| tx.to == first.addr)
+            .expect("LRU ping");
+        let pong = Packet {
+            sender: first.id,
+            rid: Packet::decode(&probe.data).unwrap().rid,
+            reachable: true,
+            msg: Message::Pong {
+                observed: first.addr,
+            },
+        }
+        .encode();
+        dht.handle_input(first.addr, &pong, 1);
+        dht.handle_timeout(REQUEST_TIMEOUT_MS);
+        assert!(dht.table.contains(&first.id));
+        assert!(!dht.table.contains(&candidate));
+    }
+
+    #[test]
+    fn unrelated_pong_cannot_keep_a_probed_incumbent() {
+        let local = NodeId::from_bytes([0u8; 32]);
+        let mut dht = Dht::new(local);
+        let first = Contact::new(bucket_zero_id(1), addr("10.0.0.1:10001"));
+        dht.add_contact(first);
+        for i in 2..=K as u8 {
+            dht.add_contact(Contact::new(
+                bucket_zero_id(i),
+                addr(&format!("10.0.0.{i}:{}", 10_000 + i as u16)),
+            ));
+        }
+        let candidate = bucket_zero_id(99);
+        dht.admit_contact(Contact::new(candidate, addr("10.0.1.99:10999")), 0);
+        let pong = Packet {
+            sender: first.id,
+            rid: 999,
+            reachable: true,
+            msg: Message::Pong {
+                observed: first.addr,
+            },
+        }
+        .encode();
+        dht.handle_input(first.addr, &pong, 1);
+        dht.handle_timeout(REQUEST_TIMEOUT_MS);
+        assert!(!dht.table.contains(&first.id));
+        assert!(dht.table.contains(&candidate));
+    }
+
+    #[test]
     fn a_fresh_announce_can_fill_a_previously_stale_topic() {
         let mut dht = Dht::new(id(1));
         let topic = id(100);
@@ -1381,15 +1523,18 @@ mod tests {
             dht.pending.contains_key(&rid),
             "wrong peer consumed request"
         );
+        assert_eq!(dht.routing_len(), 1, "wrong peer was not admitted");
 
         dht.handle_input(addr("10.0.0.9:900"), &response(peer), 1);
         assert!(
             dht.pending.contains_key(&rid),
             "wrong endpoint consumed request"
         );
+        assert_eq!(dht.routing_len(), 1, "wrong endpoint was not admitted");
 
         dht.handle_input(peer_addr, &response(peer), 1);
         assert!(!dht.pending.contains_key(&rid));
+        assert_eq!(dht.routing_len(), 1, "the correlated peer remains admitted");
         assert!(matches!(
             dht.poll_event(),
             Some(Event::QueryFinished { .. })
@@ -1512,9 +1657,8 @@ mod tests {
         );
     }
 
-    /// A `Reflect` is echoed to its source but, unlike a `Ping`, does not add the
-    /// (transient data-socket) sender to routing — otherwise a reflexive probe
-    /// would poison the table with an ephemeral address.
+    /// Neither a `Reflect` nor an unsolicited `Ping` is routing evidence:
+    /// both are controlled by the sender and could otherwise poison routing.
     #[test]
     fn reflect_is_echoed_without_poisoning_routing() {
         let mut dht = Dht::new(id(1));
@@ -1544,7 +1688,7 @@ mod tests {
             "a Reflect must not add the transient prober to routing"
         );
 
-        // Contrast: a Ping from the same peer *is* routing evidence.
+        // An unsolicited Ping is answered, but does not earn a routing slot.
         let ping = Packet {
             sender: id(2),
             rid: 6,
@@ -1553,19 +1697,13 @@ mod tests {
         }
         .encode();
         dht.handle_input(prober, &ping, 0);
-        assert_eq!(
-            dht.routing_len(),
-            1,
-            "a reachable node's Ping is routing evidence"
-        );
+        assert_eq!(dht.routing_len(), 0, "a Ping alone is not routing evidence");
     }
 
     #[test]
     fn client_packets_do_not_pollute_routing() {
-        // The client/server split: a packet from a node that advertises itself as
-        // reachable (a server) earns a routing slot; the same packet from a NAT'd
-        // client (reachable = false) does not — so departed/unreachable clients
-        // can't fill the table and stall lookups on their timeouts.
+        // Neither a server nor a client earns a routing slot merely by sending
+        // traffic. Only a correlated FindNode response proves reachability.
         let mut dht = Dht::new(id(1));
         let client = addr("198.51.100.9:7777");
         let server = addr("203.0.113.9:8888");
@@ -1598,8 +1736,8 @@ mod tests {
         dht.handle_input(server, &pkt, 0);
         assert_eq!(
             dht.routing_len(),
-            1,
-            "a reachable server must enter the routing table"
+            0,
+            "a server's self-asserted reachable flag is not sufficient admission evidence"
         );
     }
 }

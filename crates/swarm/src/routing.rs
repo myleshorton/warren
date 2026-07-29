@@ -15,10 +15,16 @@
 //! [`insert`]: RoutingTable::insert
 
 use crate::id::{NodeId, ID_LEN};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Bucket capacity — the Kademlia replication parameter.
 pub const K: usize = 20;
+
+/// Maximum number of globally-routable contacts from one IPv4 /24 or IPv6 /64
+/// in a bucket. Private and loopback addresses are deliberately exempt: they
+/// are common in deterministic tests and LAN discovery, and are not an
+/// internet eclipse boundary.
+pub const MAX_PER_PREFIX: usize = 2;
 
 /// Consecutive unanswered FindNodes (with no intervening packet from the peer)
 /// after which a contact is evicted. Three, not one: a lost datagram or a brief
@@ -33,6 +39,47 @@ pub struct Contact {
     pub id: NodeId,
     /// The peer's socket address.
     pub addr: SocketAddr,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublicPrefix {
+    V4([u8; 3]),
+    V6([u8; 8]),
+}
+
+fn public_prefix(ip: IpAddr) -> Option<PublicPrefix> {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            if ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || octets[0] == 0
+            {
+                None
+            } else {
+                Some(PublicPrefix::V4([octets[0], octets[1], octets[2]]))
+            }
+        }
+        IpAddr::V6(ip) => {
+            if ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+            {
+                None
+            } else {
+                let octets = ip.octets();
+                Some(PublicPrefix::V6([
+                    octets[0], octets[1], octets[2], octets[3], octets[4], octets[5], octets[6],
+                    octets[7],
+                ]))
+            }
+        }
+    }
 }
 
 impl Contact {
@@ -52,11 +99,23 @@ struct Entry {
     failures: u8,
 }
 
+/// Result of attempting to admit a routing contact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Admission {
+    Inserted,
+    Refreshed,
+    /// The candidate is retained in a bounded replacement cache; the caller
+    /// should ping the least-recently-seen incumbent before replacing it.
+    Probe(Contact),
+    Rejected,
+}
+
 /// A routing table owned by the node with id `local`.
 #[derive(Debug)]
 pub struct RoutingTable {
     local: NodeId,
     buckets: Vec<Vec<Entry>>,
+    replacements: Vec<Vec<Contact>>,
 }
 
 impl RoutingTable {
@@ -65,6 +124,7 @@ impl RoutingTable {
         Self {
             local,
             buckets: (0..(ID_LEN * 8)).map(|_| Vec::new()).collect(),
+            replacements: (0..(ID_LEN * 8)).map(|_| Vec::new()).collect(),
         }
     }
 
@@ -84,12 +144,24 @@ impl RoutingTable {
     /// Returns `true` if the contact is now present. A contact already known is
     /// moved to the most-recently-seen position, its address refreshed, and its
     /// failure count cleared — a fresh sighting is proof the peer is live. A new
-    /// contact for a full bucket is dropped (keeping older, presumed-live peers)
-    /// and `false` is returned.
+    /// contact for a full bucket is retained in the replacement cache and
+    /// `false` is returned; callers that need liveness probing should use
+    /// [`admit`].
     pub fn insert(&mut self, contact: Contact) -> bool {
+        matches!(
+            self.admit(contact),
+            Admission::Inserted | Admission::Refreshed
+        )
+    }
+
+    /// Admit or refresh a contact while retaining a bounded replacement
+    /// candidate for a full bucket. The actual LRU ping is driven by the DHT,
+    /// which owns request IDs and timeouts.
+    pub fn admit(&mut self, contact: Contact) -> Admission {
         let Some(idx) = self.bucket_index(&contact.id) else {
-            return false;
+            return Admission::Rejected;
         };
+        let prefix_allowed = self.prefix_allowed(idx, contact.addr);
         let bucket = &mut self.buckets[idx];
 
         if let Some(pos) = bucket.iter().position(|e| e.contact.id == contact.id) {
@@ -99,18 +171,64 @@ impl RoutingTable {
             existing.contact.addr = contact.addr;
             existing.failures = 0;
             bucket.push(existing);
-            return true;
+            self.replacements[idx].retain(|c| c.id != contact.id);
+            return Admission::Refreshed;
         }
 
-        if bucket.len() < K {
+        if bucket.len() < K && prefix_allowed {
             bucket.push(Entry {
                 contact,
                 failures: 0,
             });
-            true
+            Admission::Inserted
+        } else if bucket.len() == K {
+            let replacements = &mut self.replacements[idx];
+            replacements.retain(|c| c.id != contact.id);
+            replacements.push(contact);
+            if replacements.len() > K {
+                replacements.remove(0);
+            }
+            bucket
+                .first()
+                .map(|entry| Admission::Probe(entry.contact))
+                .unwrap_or(Admission::Rejected)
         } else {
-            false
+            // Diversity is an admission rule, not a reason to evict an
+            // unrelated live peer. This candidate cannot currently occupy a
+            // slot, so do not retain it as a replacement.
+            Admission::Rejected
         }
+    }
+
+    fn prefix_allowed(&self, bucket: usize, addr: SocketAddr) -> bool {
+        let Some(prefix) = public_prefix(addr.ip()) else {
+            return true;
+        };
+        self.buckets[bucket]
+            .iter()
+            .filter(|entry| public_prefix(entry.contact.addr.ip()) == Some(prefix))
+            .count()
+            < MAX_PER_PREFIX
+    }
+
+    /// Remove an unresponsive contact and promote the most-recent admissible
+    /// replacement. Returns the promoted contact, if any.
+    pub fn replace_unresponsive(&mut self, id: &NodeId) -> Option<Contact> {
+        let idx = self.bucket_index(id)?;
+        let pos = self.buckets[idx]
+            .iter()
+            .position(|entry| entry.contact.id == *id)?;
+        self.buckets[idx].remove(pos);
+        while let Some(candidate) = self.replacements[idx].pop() {
+            if self.prefix_allowed(idx, candidate.addr) {
+                self.buckets[idx].push(Entry {
+                    contact: candidate,
+                    failures: 0,
+                });
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// Record that a request to `id` went unanswered.
@@ -132,6 +250,15 @@ impl RoutingTable {
         bucket[pos].failures = bucket[pos].failures.saturating_add(1);
         if bucket[pos].failures >= EVICTION_THRESHOLD {
             bucket.remove(pos);
+            while let Some(candidate) = self.replacements[idx].pop() {
+                if self.prefix_allowed(idx, candidate.addr) {
+                    self.buckets[idx].push(Entry {
+                        contact: candidate,
+                        failures: 0,
+                    });
+                    break;
+                }
+            }
             true
         } else {
             false
@@ -178,6 +305,10 @@ mod tests {
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port))
+    }
+
+    fn public_addr(host: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(host), port))
     }
 
     #[test]
@@ -245,6 +376,66 @@ mod tests {
         for retained in &inserted {
             assert!(t.contains(retained));
         }
+    }
+
+    #[test]
+    fn full_bucket_keeps_bounded_replacement_and_names_lru_for_probe() {
+        let mut t = RoutingTable::new(NodeId::from_bytes([0u8; ID_LEN]));
+        let mut first = None;
+        for i in 1..=K {
+            let mut b = [0u8; ID_LEN];
+            b[0] = 0x80;
+            b[1] = i as u8;
+            let c = Contact::new(NodeId::from_bytes(b), addr(i as u16));
+            if i == 1 {
+                first = Some(c);
+            }
+            assert_eq!(t.admit(c), Admission::Inserted);
+        }
+        let mut b = [0u8; ID_LEN];
+        b[0] = 0x80;
+        b[1] = 99;
+        let candidate = Contact::new(NodeId::from_bytes(b), addr(99));
+        assert_eq!(t.admit(candidate), Admission::Probe(first.unwrap()));
+        assert_eq!(t.replace_unresponsive(&first.unwrap().id), Some(candidate));
+        assert!(!t.contains(&first.unwrap().id));
+        assert!(t.contains(&candidate.id));
+    }
+
+    #[test]
+    fn limits_public_v4_prefixes_but_not_private_test_addresses() {
+        let mut t = RoutingTable::new(id(0));
+        for i in 1..=MAX_PER_PREFIX {
+            let mut b = [0u8; ID_LEN];
+            b[0] = 0x40;
+            b[1] = i as u8;
+            assert_eq!(
+                t.admit(Contact::new(
+                    NodeId::from_bytes(b),
+                    public_addr([8, 8, 8, i as u8], i as u16)
+                )),
+                Admission::Inserted
+            );
+        }
+        let mut b = [0u8; ID_LEN];
+        b[0] = 0x40;
+        b[1] = 99;
+        assert_eq!(
+            t.admit(Contact::new(
+                NodeId::from_bytes(b),
+                public_addr([8, 8, 8, 99], 99)
+            )),
+            Admission::Rejected
+        );
+        assert_eq!(t.len(), MAX_PER_PREFIX);
+
+        // Private/LAN contacts are intentionally exempt from this public
+        // internet eclipse guard.
+        b[1] = 100;
+        assert_eq!(
+            t.admit(Contact::new(NodeId::from_bytes(b), addr(100))),
+            Admission::Inserted
+        );
     }
 
     #[test]

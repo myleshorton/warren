@@ -26,7 +26,7 @@ pub const MAX_RECORDS_PER_TOPIC: usize = 20;
 /// Its issuance and rotation protocol is intentionally kept out of this value
 /// type. A record binds it cryptographically so it cannot be transplanted to a
 /// different topic, owner, sequence, or expiry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WriteCapability([u8; CAPABILITY_LEN]);
 
 impl WriteCapability {
@@ -36,6 +36,77 @@ impl WriteCapability {
 
     pub fn to_bytes(self) -> [u8; CAPABILITY_LEN] {
         self.0
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CapabilityGrant {
+    topic: NodeId,
+    owner: NodeId,
+    expires_at: u64,
+}
+
+/// Recipient-owned, bounded authority for minting scoped write capabilities.
+///
+/// Capabilities are unpredictable Ed25519-signature output and are retained
+/// only by their issuing store. They are valid for exactly one `(topic, owner)`
+/// pair and cannot outlive the record lease. The DHT wire exchange will request
+/// one before sending an authenticated announcement.
+pub struct CapabilityIssuer {
+    signer: Keypair,
+    next_nonce: u64,
+    grants: HashMap<WriteCapability, CapabilityGrant>,
+}
+
+impl CapabilityIssuer {
+    pub fn new(signer: Keypair) -> Self {
+        Self {
+            signer,
+            next_nonce: 0,
+            grants: HashMap::new(),
+        }
+    }
+
+    pub fn issue(&mut self, topic: NodeId, owner: NodeId, expires_at: u64) -> WriteCapability {
+        let nonce = self.next_nonce;
+        self.next_nonce = self.next_nonce.wrapping_add(1);
+        let mut material = Vec::with_capacity(32 + 32 + 8);
+        material.extend_from_slice(topic.as_bytes());
+        material.extend_from_slice(owner.as_bytes());
+        material.extend_from_slice(&nonce.to_le_bytes());
+        let signature = self.signer.sign(&material).to_bytes();
+        let mut token = [0u8; CAPABILITY_LEN];
+        token.copy_from_slice(&signature[..CAPABILITY_LEN]);
+        let capability = WriteCapability(token);
+        self.grants.insert(
+            capability,
+            CapabilityGrant {
+                topic,
+                owner,
+                expires_at,
+            },
+        );
+        capability
+    }
+
+    fn authorizes(
+        &self,
+        capability: WriteCapability,
+        topic: NodeId,
+        owner: NodeId,
+        record_expiry: u64,
+        now: u64,
+    ) -> bool {
+        self.grants.get(&capability).is_some_and(|grant| {
+            grant.topic == topic
+                && grant.owner == owner
+                && grant.expires_at >= record_expiry
+                && grant.expires_at > now
+        })
+    }
+
+    pub fn prune(&mut self, now: u64) {
+        self.grants.retain(|_, grant| grant.expires_at > now);
     }
 }
 
@@ -65,6 +136,8 @@ pub enum RecordError {
     StaleSequence,
     #[error("provider record store is full")]
     StoreFull,
+    #[error("provider record lacks a valid scoped write capability")]
+    UnauthorizedCapability,
 }
 
 impl SignedAnnouncement {
@@ -187,6 +260,27 @@ pub struct AnnouncementStore {
 }
 
 impl AnnouncementStore {
+    /// Verify a record and its recipient-issued capability before storing it.
+    pub fn accept_authorized(
+        &mut self,
+        issuer: &CapabilityIssuer,
+        record: &SignedAnnouncement,
+        source: SocketAddr,
+        now: u64,
+    ) -> Result<(), RecordError> {
+        record.verify(now)?;
+        if !issuer.authorizes(
+            record.capability,
+            record.topic,
+            record.owner_id(),
+            record.expires_at,
+            now,
+        ) {
+            return Err(RecordError::UnauthorizedCapability);
+        }
+        self.store_verified(record, source, now)
+    }
+
     /// Verify and store a record. The endpoint is always taken from the packet
     /// source by the caller, never from signed peer-controlled bytes.
     pub fn accept(
@@ -196,6 +290,15 @@ impl AnnouncementStore {
         now: u64,
     ) -> Result<(), RecordError> {
         record.verify(now)?;
+        self.store_verified(record, source, now)
+    }
+
+    fn store_verified(
+        &mut self,
+        record: &SignedAnnouncement,
+        source: SocketAddr,
+        now: u64,
+    ) -> Result<(), RecordError> {
         self.prune(now);
         let owner = record.owner_id();
         if let Some(records) = self.topics.get_mut(&record.topic) {
@@ -305,6 +408,33 @@ mod tests {
         assert_eq!(
             store.contacts(topic(2)),
             vec![Contact::new(fresh.owner_id(), source(2000))]
+        );
+    }
+
+    #[test]
+    fn capability_is_scoped_to_one_owner_topic_and_lease() {
+        let issuer_key = key(9);
+        let mut issuer = CapabilityIssuer::new(issuer_key);
+        let mut store = AnnouncementStore::default();
+        let grant = issuer.issue(
+            topic(2),
+            NodeId::from_bytes(crypto::hash(key(1).public().as_bytes())),
+            1_000,
+        );
+        let allowed = SignedAnnouncement::sign(&key(1), topic(2), 1, 1_000, grant);
+        store
+            .accept_authorized(&issuer, &allowed, source(1000), 999)
+            .unwrap();
+
+        let wrong_topic = SignedAnnouncement::sign(&key(1), topic(3), 1, 1_000, grant);
+        assert_eq!(
+            store.accept_authorized(&issuer, &wrong_topic, source(1000), 999),
+            Err(RecordError::UnauthorizedCapability)
+        );
+        let wrong_owner = SignedAnnouncement::sign(&key(2), topic(2), 1, 1_000, grant);
+        assert_eq!(
+            store.accept_authorized(&issuer, &wrong_owner, source(1000), 999),
+            Err(RecordError::UnauthorizedCapability)
         );
     }
 }

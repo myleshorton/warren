@@ -32,8 +32,11 @@ The initial implementation deliberately starts at the mutable-record boundary:
 write capability under a domain-separated canonical encoding. Its
 `AnnouncementStore` verifies before admission, uses the packet's observed source
 endpoint rather than peer-supplied endpoint bytes, rejects non-increasing
-sequences, and caps retained topics and records per topic. It is not yet carried
-inside a DHT message, so legacy `Announce` traffic is still unauthenticated.
+sequences, and caps retained topics and records per topic. The recipient-owned
+`CapabilityIssuer` mints an unpredictable capability scoped to one `(topic,
+owner, expiry)` tuple; `accept_authorized` rejects a token copied into another
+owner's record, topic, or longer lease. It is not yet carried inside a DHT
+message, so legacy `Announce` traffic is still unauthenticated.
 
 ## Record authority and capability
 

@@ -640,6 +640,13 @@ impl Dht {
                     self.store_announce(topic, Contact::new(packet.sender, from), now);
                 }
             }
+            // These authenticated-record carriers are intentionally ignored by
+            // the legacy announcement state machine. They are enabled only once
+            // a capability request has been correlated and a signed identity is
+            // configured, avoiding an unsafe mixed-mode fallback.
+            Message::CapabilityRequest { .. }
+            | Message::CapabilityGrant { .. }
+            | Message::AuthenticatedAnnounce { .. } => {}
             Message::Reflect => {
                 // Echo the observed source so a peer can learn its externally
                 // mapped (post-NAT) address for the socket it probed from.

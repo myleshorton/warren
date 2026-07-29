@@ -35,8 +35,12 @@ endpoint rather than peer-supplied endpoint bytes, rejects non-increasing
 sequences, and caps retained topics and records per topic. The recipient-owned
 `CapabilityIssuer` mints an unpredictable capability scoped to one `(topic,
 owner, expiry)` tuple; `accept_authorized` rejects a token copied into another
-owner's record, topic, or longer lease. It is not yet carried inside a DHT
-message, so legacy `Announce` traffic is still unauthenticated.
+owner's record, topic, or longer lease. Authenticated DHT nodes now exchange a
+bounded capability request and correlated grant before they transmit a signed
+record; the real UDP driver supplies a shared Unix-epoch lease clock while the
+core remains sans-I/O. Legacy `Dht::new` instances retain the unsigned
+announcement path for deterministic compatibility; the production driver uses
+identity-backed authenticated mode.
 
 ## Record authority and capability
 

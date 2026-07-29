@@ -16,6 +16,10 @@ use crate::id::NodeId;
 use crate::msg::{Message, Packet};
 use crate::nat::{Firewall, NatSampler};
 use crate::punch::{plan, Strategy};
+use crate::record::{
+    AnnouncementStore, CapabilityIssuer, SignedAnnouncement, WriteCapability,
+    MAX_RECORD_LIFETIME_MS,
+};
 use crate::routing::{Admission, Contact, RoutingTable, K};
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
@@ -255,6 +259,23 @@ struct ReplacementPending {
     deadline: Millis,
 }
 
+struct PendingCapability {
+    contact: NodeId,
+    addr: SocketAddr,
+    topic: NodeId,
+    expires_at: u64,
+    deadline: Millis,
+}
+
+struct AuthState {
+    signer: crypto::Keypair,
+    issuer: CapabilityIssuer,
+    records: AnnouncementStore,
+    next_sequence: u64,
+    pending: HashMap<u64, PendingCapability>,
+    now: u64,
+}
+
 struct ConnectState {
     /// When this connect gives up if signaling hasn't completed.
     deadline: Millis,
@@ -301,6 +322,7 @@ pub struct Dht {
     /// One LRU liveness probe per full bucket incumbent. A candidate stays in
     /// the routing table's bounded replacement cache until this probe resolves.
     replacement_pending: HashMap<NodeId, ReplacementPending>,
+    auth: Option<AuthState>,
     self_reachable: bool,
     /// This node's own firewall type, shared with peers during connect signaling.
     local_firewall: Firewall,
@@ -346,6 +368,7 @@ impl Dht {
             nat: NatSampler::new(),
             nat_pending: HashMap::new(),
             replacement_pending: HashMap::new(),
+            auth: None,
             self_reachable: false,
             local_firewall: Firewall::Open,
             pinned: None,
@@ -359,6 +382,32 @@ impl Dht {
             events: VecDeque::new(),
             next_rid: 1,
             next_qid: 1,
+        }
+    }
+
+    /// Create an authenticated DHT whose identity is the hash of `signer`'s
+    /// public key. The core still owns no socket or clock; callers update record
+    /// time with [`Dht::set_record_time`].
+    pub fn with_identity(signer: crypto::Keypair) -> Self {
+        let id = NodeId::from_bytes(crypto::hash(signer.public().as_bytes()));
+        let mut dht = Self::new(id);
+        dht.auth = Some(AuthState {
+            issuer: CapabilityIssuer::new(signer.clone()),
+            signer,
+            records: AnnouncementStore::default(),
+            next_sequence: 1,
+            pending: HashMap::new(),
+            now: 0,
+        });
+        dht
+    }
+
+    /// Set shared-epoch time used exclusively for signed provider leases.
+    pub fn set_record_time(&mut self, now: u64) {
+        if let Some(auth) = &mut self.auth {
+            auth.now = now;
+            auth.issuer.prune(now);
+            auth.records.prune(now);
         }
     }
 
@@ -623,11 +672,18 @@ impl Dht {
                 let contacts = self.table.closest(&target, K);
                 // Include any announce records we hold for the queried target,
                 // so a lookup discovers announcers as it converges.
-                let peers = self
+                let mut peers: Vec<Contact> = self
                     .announces
                     .get(&target)
                     .map(|records| records.iter().map(|r| r.contact).collect())
                     .unwrap_or_default();
+                if let Some(auth) = &self.auth {
+                    for contact in auth.records.contacts(target) {
+                        if !peers.iter().any(|existing| existing.id == contact.id) {
+                            peers.push(contact);
+                        }
+                    }
+                }
                 self.send(from, packet.rid, Message::Nodes { contacts, peers });
             }
             Message::Nodes { contacts, peers } => {
@@ -640,13 +696,71 @@ impl Dht {
                     self.store_announce(topic, Contact::new(packet.sender, from), now);
                 }
             }
-            // These authenticated-record carriers are intentionally ignored by
-            // the legacy announcement state machine. They are enabled only once
-            // a capability request has been correlated and a signed identity is
-            // configured, avoiding an unsafe mixed-mode fallback.
-            Message::CapabilityRequest { .. }
-            | Message::CapabilityGrant { .. }
-            | Message::AuthenticatedAnnounce { .. } => {}
+            Message::CapabilityRequest {
+                topic,
+                owner,
+                expires_at,
+            } => {
+                let responsible = self.responsible_for(&topic);
+                if let Some(auth) = &mut self.auth {
+                    if packet.sender == owner
+                        && responsible
+                        && expires_at > auth.now
+                        && expires_at - auth.now <= MAX_RECORD_LIFETIME_MS
+                    {
+                        if let Some(capability) = auth.issuer.issue(topic, owner, expires_at) {
+                            self.send(
+                                from,
+                                packet.rid,
+                                Message::CapabilityGrant {
+                                    capability: capability.to_bytes(),
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            Message::CapabilityGrant { capability } => {
+                let Some(auth) = &mut self.auth else {
+                    return;
+                };
+                let Some(pending) = auth.pending.remove(&packet.rid) else {
+                    return;
+                };
+                if pending.contact != packet.sender || pending.addr != from {
+                    return;
+                }
+                let record = SignedAnnouncement::sign(
+                    &auth.signer,
+                    pending.topic,
+                    auth.next_sequence,
+                    pending.expires_at,
+                    WriteCapability::from_bytes(capability),
+                );
+                auth.next_sequence = auth.next_sequence.wrapping_add(1);
+                self.send(
+                    from,
+                    packet.rid,
+                    Message::AuthenticatedAnnounce {
+                        record: record.encode(),
+                    },
+                );
+            }
+            Message::AuthenticatedAnnounce { record } => {
+                let Ok(record) = SignedAnnouncement::decode(&record) else {
+                    return;
+                };
+                let responsible = self.responsible_for(&record.topic());
+                let Some(auth) = &mut self.auth else {
+                    return;
+                };
+                if packet.sender != record.owner_id() || !responsible {
+                    return;
+                }
+                let _ = auth
+                    .records
+                    .accept_authorized(&auth.issuer, &record, from, auth.now);
+            }
             Message::Reflect => {
                 // Echo the observed source so a peer can learn its externally
                 // mapped (post-NAT) address for the socket it probed from.
@@ -719,6 +833,10 @@ impl Dht {
             self.table.replace_unresponsive(&incumbent);
         }
 
+        if let Some(auth) = &mut self.auth {
+            auth.pending.retain(|_, pending| pending.deadline > now);
+        }
+
         // Provider announcements are leases, not permanent reservations. Remove
         // expired records and their now-empty topic entries so departed providers
         // cannot occupy a topic's bounded K slots forever.
@@ -760,6 +878,11 @@ impl Dht {
             .map(|p| p.deadline)
             .chain(self.nat_pending.values().map(|p| p.deadline))
             .chain(self.replacement_pending.values().map(|p| p.deadline))
+            .chain(
+                self.auth
+                    .iter()
+                    .flat_map(|auth| auth.pending.values().map(|pending| pending.deadline)),
+            )
             .chain(self.connecting.values().map(|cs| cs.deadline))
             .chain(self.pending_incoming.values().map(|inc| inc.deadline))
             .min()
@@ -1044,7 +1167,16 @@ impl Dht {
                 .map(|q| now.saturating_sub(q.started))
                 .unwrap_or(0);
             self.queries.remove(&qid);
-            self.finish_query(qid, kind, target, closest, coordinators, peers, lookup_ms);
+            self.finish_query(
+                qid,
+                kind,
+                target,
+                closest,
+                coordinators,
+                peers,
+                lookup_ms,
+                now,
+            );
         }
     }
 
@@ -1058,6 +1190,7 @@ impl Dht {
         coordinators: Vec<Contact>,
         peers: Vec<Contact>,
         lookup_ms: u64,
+        now: Millis,
     ) {
         match kind {
             QueryKind::FindNode => {
@@ -1074,10 +1207,44 @@ impl Dht {
                 });
             }
             QueryKind::Announce => {
-                // Register ourselves with the closest nodes we found.
-                for c in &closest {
-                    let rid = self.alloc_rid();
-                    self.send(c.addr, rid, Message::Announce { topic: target });
+                if self.auth.is_some() {
+                    // Authenticated nodes first obtain a recipient-scoped grant.
+                    // The grant reply is correlated before a signed record is sent.
+                    for c in &closest {
+                        let rid = self.alloc_rid();
+                        let expires_at = self
+                            .auth
+                            .as_ref()
+                            .map(|auth| auth.now.saturating_add(ANNOUNCE_TTL_MS))
+                            .unwrap_or(0);
+                        if let Some(auth) = &mut self.auth {
+                            auth.pending.insert(
+                                rid,
+                                PendingCapability {
+                                    contact: c.id,
+                                    addr: c.addr,
+                                    topic: target,
+                                    expires_at,
+                                    deadline: now + REQUEST_TIMEOUT_MS,
+                                },
+                            );
+                        }
+                        self.send(
+                            c.addr,
+                            rid,
+                            Message::CapabilityRequest {
+                                topic: target,
+                                owner: self.id,
+                                expires_at,
+                            },
+                        );
+                    }
+                } else {
+                    // Legacy nodes retain the original unsigned announcement path.
+                    for c in &closest {
+                        let rid = self.alloc_rid();
+                        self.send(c.addr, rid, Message::Announce { topic: target });
+                    }
                 }
                 self.events
                     .push_back(Event::AnnounceFinished { topic: target });
@@ -1448,6 +1615,45 @@ mod tests {
         dht.handle_timeout(REQUEST_TIMEOUT_MS);
         assert!(dht.table.contains(&first.id));
         assert!(!dht.table.contains(&candidate));
+    }
+
+    #[test]
+    fn authenticated_announce_requires_a_correlated_capability_grant() {
+        let a_key = crypto::Keypair::from_seed(&[1; 32]);
+        let b_key = crypto::Keypair::from_seed(&[2; 32]);
+        let mut a = Dht::with_identity(a_key);
+        let mut b = Dht::with_identity(b_key);
+        let a_addr = addr("10.0.0.1:10001");
+        let b_addr = addr("10.0.0.2:10002");
+        a.add_contact(Contact::new(b.id(), b_addr));
+        b.add_contact(Contact::new(a.id(), a_addr));
+        a.set_record_time(10_000);
+        b.set_record_time(10_000);
+
+        let topic = id(42);
+        a.announce(topic, 0);
+        let lookup = a.poll_transmit().unwrap();
+        b.handle_input(a_addr, &lookup.data, 0);
+        let nodes = b.poll_transmit().unwrap();
+        a.handle_input(b_addr, &nodes.data, 0);
+        let request = a.poll_transmit().unwrap();
+        assert!(matches!(
+            Packet::decode(&request.data).unwrap().msg,
+            Message::CapabilityRequest { .. }
+        ));
+        b.handle_input(a_addr, &request.data, 0);
+        let grant = b.poll_transmit().unwrap();
+        a.handle_input(b_addr, &grant.data, 0);
+        let announce = a.poll_transmit().unwrap();
+        assert!(matches!(
+            Packet::decode(&announce.data).unwrap().msg,
+            Message::AuthenticatedAnnounce { .. }
+        ));
+        b.handle_input(a_addr, &announce.data, 0);
+        assert_eq!(
+            b.auth.as_ref().unwrap().records.contacts(topic),
+            vec![Contact::new(a.id(), a_addr)]
+        );
     }
 
     #[test]

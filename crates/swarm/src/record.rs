@@ -20,6 +20,8 @@ pub const MAX_RECORD_LIFETIME_MS: u64 = 60 * 60 * 1000;
 pub const MAX_STORED_TOPICS: usize = 4_096;
 /// Bound the number of providers held for one topic.
 pub const MAX_RECORDS_PER_TOPIC: usize = 20;
+/// Bound outstanding retained capabilities under a request flood.
+pub const MAX_CAPABILITIES: usize = 4_096;
 
 /// An opaque write capability issued by the responsible store.
 ///
@@ -67,7 +69,15 @@ impl CapabilityIssuer {
         }
     }
 
-    pub fn issue(&mut self, topic: NodeId, owner: NodeId, expires_at: u64) -> WriteCapability {
+    pub fn issue(
+        &mut self,
+        topic: NodeId,
+        owner: NodeId,
+        expires_at: u64,
+    ) -> Option<WriteCapability> {
+        if self.grants.len() >= MAX_CAPABILITIES {
+            return None;
+        }
         let nonce = self.next_nonce;
         self.next_nonce = self.next_nonce.wrapping_add(1);
         let mut material = Vec::with_capacity(32 + 32 + 8);
@@ -86,7 +96,7 @@ impl CapabilityIssuer {
                 expires_at,
             },
         );
-        capability
+        Some(capability)
     }
 
     fn authorizes(
@@ -416,11 +426,13 @@ mod tests {
         let issuer_key = key(9);
         let mut issuer = CapabilityIssuer::new(issuer_key);
         let mut store = AnnouncementStore::default();
-        let grant = issuer.issue(
-            topic(2),
-            NodeId::from_bytes(crypto::hash(key(1).public().as_bytes())),
-            1_000,
-        );
+        let grant = issuer
+            .issue(
+                topic(2),
+                NodeId::from_bytes(crypto::hash(key(1).public().as_bytes())),
+                1_000,
+            )
+            .unwrap();
         let allowed = SignedAnnouncement::sign(&key(1), topic(2), 1, 1_000, grant);
         store
             .accept_authorized(&issuer, &allowed, source(1000), 999)

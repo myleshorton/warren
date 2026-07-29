@@ -1,6 +1,8 @@
 # Authenticated DHT records and signaling
 
-**Status:** proposed wire-format change; not implemented.
+**Status:** the pure signed-record primitive and its bounded replay store are
+implemented in `swarm::record`; DHT packet carriage, capability issuance, and
+authenticated signaling remain to be integrated.
 
 ## Problem
 
@@ -24,6 +26,14 @@ Introduce a versioned DHT packet envelope containing:
 Receivers must reject an envelope unless `hash(public_key) == sender_id`, the
 signature verifies, the expiry is within bounds, and its sequence number is not
 older than the highest accepted value for that sender and record class.
+
+The initial implementation deliberately starts at the mutable-record boundary:
+`SignedAnnouncement` signs the topic, public owner key, sequence, expiry, and
+write capability under a domain-separated canonical encoding. Its
+`AnnouncementStore` verifies before admission, uses the packet's observed source
+endpoint rather than peer-supplied endpoint bytes, rejects non-increasing
+sequences, and caps retained topics and records per topic. It is not yet carried
+inside a DHT message, so legacy `Announce` traffic is still unauthenticated.
 
 ## Record authority and capability
 

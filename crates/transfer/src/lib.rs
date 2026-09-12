@@ -337,6 +337,17 @@ pub async fn replicate_feed<L: Link>(
     appended: &tokio::sync::Notify,
     cfg: &Config,
 ) -> Result<(), TransferError> {
+    replicate_feed_with_progress(channel, public_key, into, appended, cfg, || {}).await
+}
+
+pub(crate) async fn replicate_feed_with_progress<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    into: &std::sync::Mutex<feed::Replica>,
+    appended: &tokio::sync::Notify,
+    cfg: &Config,
+    mut progress: impl FnMut(),
+) -> Result<(), TransferError> {
     let mut wire = Wire::new(
         channel,
         cfg.initial_rtt,
@@ -360,6 +371,7 @@ pub async fn replicate_feed<L: Link>(
                 appended.notify_waiters(); // wake subscribers tailing *this* mirror
             }
         }
+        progress();
     }
 }
 
@@ -1340,6 +1352,28 @@ mod tests {
             drop: server_drops.iter().copied().collect(),
         };
         (client, server)
+    }
+
+    #[tokio::test]
+    async fn noise_ignores_queued_punch_controls_on_both_sides() {
+        let (client_link, server_link) = lossy_pair(&[], &[]);
+        for _ in 0..32 {
+            client_link.tx.send(vec![puncher::PROBE]).unwrap();
+            server_link.tx.send(vec![puncher::ACK]).unwrap();
+        }
+        let client_key = Keypair::from_seed(&[191; 32]);
+        let server_key = Keypair::from_seed(&[192; 32]);
+        let (client, server) = tokio::join!(
+            NoiseLink::connect(client_link, &client_key, node_id_of(&server_key)),
+            NoiseLink::accept(server_link, &server_key),
+        );
+        let client = client.unwrap();
+        let (server, identity) = server.unwrap();
+        assert_eq!(identity, node_id_of(&client_key));
+        client.send(b"authenticated").await.unwrap();
+        let mut bytes = [0; 32];
+        let n = server.recv(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..n], b"authenticated");
     }
 
     fn fast_cfg() -> Config {

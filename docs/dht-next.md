@@ -77,6 +77,9 @@ the initial request and allocates no per-peer state. Cookies accept the current
 or previous 30-second epoch. The caller caches the grant for at most 30 local
 seconds and reuses it for that exact peer/endpoint, saving one round trip on warm
 RPCs. A changed receiver secret or invalid grant triggers a bounded refresh.
+New DHT packet, record, signal and mutable-value boundaries, plus Noise identity
+certificates, use strict Ed25519 verification, rejecting weak-key/small-order
+forgeries. Existing legacy feed verification semantics are unchanged.
 Every request still has a fresh RPC nonce and either a verified Ed25519 envelope
 or a session authentication tag: a stolen grant alone cannot authenticate a request.
 Response packets must match the outstanding request's
@@ -93,11 +96,14 @@ the same identity. This lets a caller use a peer's fresh endpoint after a port o
 network change. The seed remains an unverified candidate: it does not rewrite the
 routing table, bypass identity authentication, or replace an in-flight candidate.
 
-Accepted request nonces cache their response until their cookie can no longer be
+Accepted state-changing request nonces cache their response until their cookie can no longer be
 accepted. Retries return the cached result without repeating side effects. Handshake
 replies retain their exact bytes; compact replies are re-encrypted with a fresh
 counter so a busy connection cannot age a cached ciphertext out of its replay window.
 A full replay cache rejects new effects rather than evicting replay protection.
+Side-effect-free reads do not occupy that cache. A separate bounded cache retains
+exact read-only handshake replies; when it fills, reads still receive signed
+responses without allocating another handshake. Neither cache evicts live entries.
 
 ## Compact peer sessions
 
@@ -122,6 +128,8 @@ without handshake bytes). Records and signals retain their independent signature
 Session keys are directional; counters never wrap or reset. A 1024-packet sliding
 window accepts reordering once and advances only after successful authentication.
 Sessions bind an exact endpoint and expire after five local monotonic minutes.
+Sending stops ten seconds before local expiry, covering the installation skew
+within the eight-second maximum RPC deadline; receiving continues until expiry.
 Parallel handshakes may coexist; installing one does not destroy another's keys.
 Responders select new keys for sending only after receiving an authenticated transport
 packet with those keys. A lost handshake reply cannot replace a confirmed session.
@@ -652,7 +660,9 @@ The driver exposes publication, pagination, encrypted offer/answer, key rotation
 and single-replica value operations. `store(value, cas, seeds)` looks up the key and
 writes up to three responsive replicas, preferring different IPs and networks with
 XOR distance as the tie breaker. It reports acknowledgements, rejections and timeouts
-separately. Unlike managed publication, this one-shot API does not perform readback. CAS is evaluated independently at each replica, not as a
+separately. A later enqueue failure does not discard earlier replica outcomes;
+unconfirmed issued writes remain indeterminate and appear in `timed_out`.
+Unlike managed publication, this one-shot API does not perform readback. CAS is evaluated independently at each replica, not as a
 global transaction. `fetch(key, seeds)` uses the integrated value traversal described
 below. Immutable reads return the first verified match; mutable reads compare the
 responding traversal frontier. A fork at the highest observed sequence produces an
@@ -729,8 +739,8 @@ has completed the following path:
 
 1. Bind a fresh data socket and obtain candidates through authenticated DHT
    reflection on that exact socket. A different DHT socket's NAT mapping is never
-   advertised as the data mapping. Up to three reflectors run within a 750 ms
-   budget. Concrete local candidates are retained; wildcard binds need a valid
+   advertised as the data mapping. Up to three reflectors run within a four-second
+   budget, allowing a cold cookie exchange and retransmission. Concrete local candidates are retained; wildcard binds need a valid
    observation. IPv4-mapped addresses are normalized and IPv6 sockets are dual-stack.
 2. Exchange versioned candidate offers and answers inside the existing end-to-end
    encrypted, signed DHT signaling. No separate STUN or signaling service is used.
@@ -870,9 +880,12 @@ measure Internet NAT success rates or establish whole-Endpoint behavior behind
 real routers. Mixed-family connections have separate real-loopback tests.
 
 The legacy birthday helper now also takes full peer endpoints and sends from
-every bound socket. Its spray path preserves the socket advertised in signaling.
-A regression test observes outbound traffic from all four test sockets before
-acknowledging one; binding alone cannot satisfy it.
+every bound socket. Each socket sends at most three probes per advertised endpoint,
+at least 250 ms apart, then only listens. Its spray path preserves the socket
+advertised in signaling. Regression tests observe traffic from every test socket
+and bound unanswered traffic. Noise ignores exact one-byte punch controls queued
+at handoff, within the existing handshake deadline; malformed Noise messages
+still fail authentication.
 
 Run the isolated, bidirectional public-key connection example:
 
@@ -905,9 +918,11 @@ this API does not transparently migrate an existing data socket.
 
 ### Network changes and resumable transfers
 
-`Endpoint::network_changed(bind, seeds).await` replaces the DHT UDP socket while
-keeping the actor and listener alive. Use port zero for a fresh socket. Binding
-happens before replacement, so a bind failure preserves the existing endpoint.
+`Endpoint::network_changed(bind, seeds).await` refreshes the DHT network generation
+while keeping the actor and listener alive. The exact current bind address reuses
+the socket, avoiding a conflicting bind to its own explicit port. Other addresses
+replace the socket; port zero requests a fresh port. Binding happens before
+replacement, so a bind failure preserves the existing endpoint.
 Once committed, cancellation does not undo the replacement. A listener remains
 published and the call waits for its first fresh registration acknowledgement;
 that acknowledgement is not a redundancy guarantee. Calls through one endpoint
@@ -918,7 +933,9 @@ pending RPCs/lookups, and signaling exchanges. It uses fresh cookie entropy,
 retains identity and signaling keys, preserves stored values with their existing
 expiry, and restarts active topic publications from new seeds and previous hints.
 Keeping the signaling key allows still-live discovery records to coexist with
-renewed registrations during recovery. Query/nonce counters are not reset.
+renewed registrations during recovery. Manually managed registrations retain
+their renewal intent and become immediately due. Routing maintenance keeps its
+previous opt-in state. Query/nonce counters are not reset.
 `Event::NetworkChanged(generation)` interrupts old operations; consumers should
 retry on the new network. Existing remote routing caches still follow their
 normal expiry policy; this is not immediate migration of a public routing server.
@@ -946,11 +963,12 @@ without an automatic retry policy. Each replacement link starts fresh wire messa
 IDs. `recover_feed` tails from the replica's verified length and uses the replica's
 feed-signing key, which need not equal the provider's connection identity.
 Verification failures and identity-authentication failures are terminal. Network
-failures during the Noise exchange may retry. `RecoveryConfig` bounds total
-attempts and elapsed time; canceling leaves already-verified progress available.
-The default total budget is eight attempts over five minutes, including healthy
-feed streaming time. Applications wanting longer-lived subscriptions can call again
-with the same replica after that budget ends.
+failures during the Noise exchange may retry. `RecoveryConfig` defaults to eight
+attempts over five minutes. For finite blob recovery, this bounds the entire
+operation. For live feeds, it bounds connecting and reaching verified progress;
+a healthy feed has no lifetime deadline. A verified replication round, including
+a verified unchanged head, resets attempts and backoff for the next outage.
+Canceling leaves already-verified progress available.
 
 Tests force a new bind on both endpoints and kill a coordinator after a blob chunk
 has been verified, then assert that the manifest/chunk are not requested again.
@@ -968,8 +986,11 @@ lookup diversity only. IPv4 /24 and IPv6 /64 prefixes share canonicalization rul
 
 | Resource | Per identity | Per source prefix | Global |
 | --- | ---: | ---: | ---: |
-| Incoming packets per monotonic second | — | 64 | 256 |
-| Cached request replies | 256 | 512 | 2,048 |
+| New-caller signature verifications per monotonic second | — | 64 | 256 |
+| Expected-response signature verifications per monotonic second | 8 per pending RPC | — | 1,024 |
+| Compact AEAD verifications per monotonic second | 64 per session | — | 327,680 |
+| Cached state-changing replies | 256 | 512 | 2,048 |
+| Cached read-only handshake replies | 8 | 64 | 512 |
 | Hosted provider registrations | 16 | 64 | 256 |
 | Hosted values | 16 | 64 | 1,024 |
 | Coordinator signaling exchanges | 8 | 32 | 128 |
@@ -988,13 +1009,22 @@ Hard ceilings: 16 publications with one lookup and up to three owned renewals ea
 128 pending RPCs (including at most three routing-maintenance probes), 2048 routing
 replacement candidates, 5120 Noise sessions, 5120 endpoint validation/RTT cache entries, 16 lookups with 128 candidates each, 256 hosted
 registrations, 256 distinct local registration pairs (including managed intents), 128 each of coordinator,
-incoming, and outgoing signaling sessions, 2048 replay-cache entries, and 20 routing
-contacts per bucket (5120 total). Input parsing/verification has a global 256-packet
-budget per supplied monotonic second and a 64-packet budget per source prefix;
-output is returned immediately instead of queued forever.
+incoming, and outgoing signaling sessions, 2048 side-effect replay entries, 512
+read-only handshake entries, and 20 routing contacts per bucket (5120 total).
+Malformed lengths/magic are rejected before signature work. New callers share
+256 signature verifications per supplied monotonic second and 64 per source
+prefix. Headers matching a pending RPC's nonce, identity, endpoint and destination
+receive a separate eight-verification allowance per RPC; full authentication
+remains mandatory. Known endpoint/session pairs instead receive 64 AEAD attempts
+per second per session. Forged packets cannot advance their replay windows.
+Output is returned immediately instead of queued forever.
 These are conservative experiment constants, not tuned production defaults. The
 prefix budget preserves capacity against one flooding subnet, but does not ensure
-fairness against attackers spread across many prefixes.
+fairness against attackers spread across many prefixes. Such attackers can still
+exhaust new-peer admission or actual side-effect capacity. Established sessions
+and pending responses do not share the new-caller budget, though an attacker
+knowing their exact identifiers and spoofing the endpoint can target those
+bounded allowances. These controls do not prevent link saturation.
 
 RPCs start with a 500 ms retry interval when no RTT estimate exists. Clean replies
 update a smoothed RTT and variation estimate; retry intervals stay within 200–4000

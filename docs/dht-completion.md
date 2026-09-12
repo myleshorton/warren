@@ -45,8 +45,8 @@ fuzz seed in `crates/dht-next/tests/lifecycle/`.
 The lifecycle fuzz target is included in the CI matrix, seeded from the operation
 matrix and saved property regressions. The first remote fuzz run also exposed the
 repository's stable toolchain overriding the installed nightly; fuzz commands now
-select the pinned nightly explicitly. Normal workspace tests enable lifecycle
-properties through the driver's `test-support` dev dependency.
+select the pinned nightly explicitly. Both `make test` and CI explicitly run `cargo test -p dht-next --features
+test-support`, so lifecycle properties do not depend on feature unification.
 
 ### Dual-stack ephemeral port collisions
 
@@ -90,14 +90,50 @@ seed. The original crashing input passes after the fix.
 Fuzzing now exercises both arbitrary datagrams and signed, cookie-authorized bodies,
 including replay, output sizes and state bounds. The separate workspace uses
 AddressSanitizer and does not change production dependencies. Seeds are reconstructed
-from checked-in v5/v6 vectors. CI jobs are configured for bounded fuzz campaigns and
-the UDP soak; their remote execution has not been observed in this local session.
+from checked-in v5/v6 vectors. All five remote checks passed on PR #60 at
+`503c1bf`, including all three fuzz targets and the UDP soak. The workflow now
+also runs on pushes to main and daily schedules; scheduled fuzz campaigns run
+600 seconds per target, with 120-second PR/push campaigns. These remain bounded
+campaigns rather than evidence of continuous public-network operation.
 
 External benchmark metadata now includes source hashes for the relevant Rust crates,
 runner scripts and dependency locks, plus runtime versions and the executable hash.
 Historical comparison reports remain historical; they are not silently overwritten.
 
+## Review hardening
+
+The follow-up separates pending-response and established-session verification from
+new-caller admission. Read-only requests cannot fill the side-effect replay cache;
+handshake replies have independent bounded retention. Network changes preserve
+routing opt-in and manual renewals. Same-address refresh reuses the bound socket,
+transient UDP errors preserve reception, and multi-replica writes report partial
+results. Reflection permits a cold exchange with loss. Healthy feed replication
+outlives its recovery deadline and resets its retry budget after verified progress.
+
+Legacy birthday probes are capped at three per socket/endpoint with 250 ms spacing;
+Noise tolerates queued one-byte controls. New authentication boundaries use strict
+Ed25519 verification and compact sessions stop sending ten seconds before expiry.
+Shared routing types now live in `routing-types`; `dht-next` depends on `swarm`
+only for development comparisons. Its example is named `compare_core`, avoiding
+the driver's `compare_dht` executable collision.
+
 ## Validation results
+
+PR-review follow-up on September 12, 2026:
+
+- `make verify`: formatting, warning-free workspace Clippy, 604 workspace
+  tests (2 opt-in tests ignored), explicit test-support tests, and warning-free
+  documentation generation passed.
+
+- DHT with `test-support`: 110 unit tests and 21 integration tests passed,
+  including all five lifecycle tests and the new saturation regressions.
+- `PROPTEST_CASES=10000 cargo test -p dht-next --features test-support attacks::`:
+  all 66 currently selected adversarial/property tests passed in 25.63 seconds.
+- Explicit real-UDP signaling soak: all 100 trials passed in 84.07 seconds.
+- AddressSanitizer fuzz campaigns, 121 seconds each: raw packets 978,263
+  executions, signed bodies 163,272, lifecycle 6,031; no failures.
+- Fuzz workspace formatting and warning-free Clippy passed.
+
 
 PR-readiness follow-up on September 11, 2026 (local date): all five lifecycle
 tests passed after the fixes above, including the saved property regression and
@@ -115,7 +151,7 @@ Local completion run on September 11, 2026:
   181 seconds, with no further failure; original crash replay also passed.
 - Raw-packet fuzzing against the repaired decoder: 981,528 executions in
   121 seconds, with no failure.
-- `PROPTEST_CASES=10000 cargo test -p dht-next attacks::`: all 60 selected
+- `PROPTEST_CASES=10000 cargo test -p dht-next attacks::`: all 60 then-selected
   adversarial/property tests passed in 23.18 seconds.
 - Fuzz workspace formatting and warning-free Clippy: passed.
 

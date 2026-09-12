@@ -164,7 +164,7 @@ impl NodeCert {
         }
         let pk = crypto::PublicKey::from_bytes(&self.ed_pub)
             .map_err(|_| denied("node cert has an invalid Ed25519 public key"))?;
-        pk.verify(
+        pk.verify_strict(
             &cert_message(role, &self.noise_static_pub),
             &crypto::Signature::from_bytes(self.sig),
         )
@@ -622,7 +622,17 @@ fn remote_static(hs: &snow::HandshakeState) -> io::Result<[u8; 32]> {
 
 /// Receive one datagram, or `None` if the resend interval elapses first.
 async fn recv_timeout<T: Link>(inner: &T, buf: &mut [u8]) -> io::Result<Option<usize>> {
-    match tokio::time::timeout(HS_TIMEOUT, inner.recv(buf)).await {
+    match tokio::time::timeout(HS_TIMEOUT, async {
+        loop {
+            let n = inner.recv(buf).await?;
+            if matches!(&buf[..n], [puncher::PROBE] | [puncher::ACK]) {
+                continue;
+            }
+            return Ok::<_, io::Error>(n);
+        }
+    })
+    .await
+    {
         Ok(Ok(n)) => Ok(Some(n)),
         Ok(Err(e)) => Err(e),
         Err(_) => Ok(None),

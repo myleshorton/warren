@@ -27,9 +27,9 @@ pub use timing::Time;
 use crypto::Keypair;
 use protocol::{encode_addr, Body, Packet};
 pub use protocol::{node_id, Record, Signal};
+pub use routing_types::{Contact, NodeId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
-pub use swarm::{Contact, NodeId};
 use wire::Encoder;
 
 pub const MAX_PENDING: usize = 128;
@@ -39,6 +39,7 @@ pub const MAX_REGISTRATIONS: usize = 256;
 pub const MAX_SESSIONS: usize = 128;
 pub const MAX_COORDINATORS: usize = 3;
 pub const MAX_REPLAYS: usize = 2048;
+pub const MAX_HANDSHAKE_REPLAYS: usize = 512;
 const MAX_ROUTING: usize = 5120;
 const COOKIE_MS: u64 = 30_000;
 const QUERY_MS: u64 = 40_000;
@@ -357,6 +358,8 @@ pub struct Dht {
     transport: session::Sessions,
     pending: BTreeMap<[u8; 32], Pending>,
     replay: BTreeMap<(NodeId, [u8; 32]), Replay>,
+    handshake_replay: BTreeMap<(NodeId, [u8; 32]), Replay>,
+    response_budget: BTreeMap<[u8; 32], u8>,
     registrations: BTreeMap<(NodeId, NodeId), Registration>,
     authorizations: BTreeMap<(NodeId, NodeId), Registration>,
     managed: BTreeMap<(NodeId, NodeId), ManagedRegistration>,
@@ -417,6 +420,8 @@ impl Dht {
             transport: session::Sessions::new(),
             pending: BTreeMap::new(),
             replay: BTreeMap::new(),
+            handshake_replay: BTreeMap::new(),
+            response_budget: BTreeMap::new(),
             registrations: BTreeMap::new(),
             authorizations: BTreeMap::new(),
             managed: BTreeMap::new(),
@@ -457,12 +462,22 @@ impl Dht {
         self.secret.zeroize();
         self.secret = secret;
         self.routes.clear();
-        self.routing = None;
+        let routing_enabled = self.routing.take().is_some();
         self.peers.clear();
         self.transport = session::Sessions::new();
+        self.replay.clear();
+        self.handshake_replay.clear();
+        self.response_budget.clear();
         self.pending.clear();
         self.queries.clear();
-        self.managed.clear();
+        self.managed
+            .retain(|_, intent| intent.publication.is_none());
+        for intent in self.managed.values_mut() {
+            intent.pending = None;
+            intent.next_at = now.monotonic_ms;
+            intent.failures = 0;
+            intent.lease_expires = None;
+        }
         self.exchanges.clear();
         self.incoming.clear();
         self.outgoing.clear();
@@ -474,7 +489,9 @@ impl Dht {
             self.network_generation,
         ))];
         actions.extend(self.restart_publications(seeds, now));
-        actions.extend(self.maintain_routing(now));
+        if routing_enabled {
+            actions.extend(self.maintain_routing(now));
+        }
         if !hints.is_empty() {
             if let Ok((_, sent)) = self.bootstrap(&hints, now) {
                 actions.extend(sent);
@@ -1020,33 +1037,59 @@ impl Dht {
         Ok(out)
     }
 
-    /// Deliver one datagram. A fixed budget limits parsing/signature work per
-    /// monotonic second, with a 64-packet allowance per network prefix.
-    /// Invalid/oversized traffic consumes that allowance too.
+    /// Deliver one datagram. New callers share bounded signature work per
+    /// monotonic second; pending responses and known sessions have independent
+    /// bounded allowances. Invalid lengths/magic are rejected before verification.
     pub fn receive(&mut self, from: SocketAddr, bytes: &[u8], now: Time) -> Vec<Action> {
         let mut out = Vec::new();
         if now.monotonic_ms / 1000 > self.budget_second {
             self.budget_second = now.monotonic_ms / 1000;
             self.budget_used = 0;
             self.budget_prefixes.clear();
+            self.response_budget.clear();
         }
-        if self.budget_used >= 256 || !usable(from) {
+        if !usable(from) {
             return out;
         }
-        let allowance = self
-            .budget_prefixes
-            .entry(routing::network_prefix(from))
-            .or_default();
-        if *allowance >= 64 {
-            return out;
-        }
-        *allowance += 1;
-        self.budget_used += 1;
-        let Some(packet) = self
-            .transport
-            .decode(bytes, from, self.id(), now)
-            .or_else(|| Packet::decode(bytes))
-        else {
+        let packet = if bytes.starts_with(session::MAGIC) {
+            // Known endpoint/session pairs have their own bounded AEAD budget.
+            self.transport.decode(bytes, from, self.id(), now)
+        } else {
+            if !Packet::plausible(bytes) {
+                return out;
+            }
+            let nonce: [u8; 32] = bytes[70..102].try_into().expect("header");
+            let expected = self.pending.get(&nonce).is_some_and(|pending| {
+                pending.contact.addr == from
+                    && pending.contact.id.as_bytes() == &crypto::hash(&bytes[5..37])
+                    && self.id().as_bytes() == &bytes[37..69]
+                    && pending.deadline > now.monotonic_ms
+            });
+            if expected {
+                self.response_budget
+                    .retain(|nonce, _| self.pending.contains_key(nonce));
+                let used = self.response_budget.entry(nonce).or_default();
+                if *used >= 8 {
+                    return out;
+                }
+                *used += 1;
+            } else {
+                if self.budget_used >= 256 {
+                    return out;
+                }
+                let allowance = self
+                    .budget_prefixes
+                    .entry(routing::network_prefix(from))
+                    .or_default();
+                if *allowance >= 64 {
+                    return out;
+                }
+                *allowance += 1;
+                self.budget_used += 1;
+            }
+            Packet::decode(bytes)
+        };
+        let Some(packet) = packet else {
             return out;
         };
         if packet.destination != self.id() || node_id(packet.key) == self.id() {
@@ -1070,7 +1113,11 @@ impl Dht {
                 return out;
             }
             let replay_key = (peer, packet.nonce);
-            if let Some(replay) = self.replay.get(&replay_key) {
+            if let Some(replay) = self
+                .replay
+                .get(&replay_key)
+                .or_else(|| self.handshake_replay.get(&replay_key))
+            {
                 if replay.from == from {
                     out.push(Action::Send {
                         to: from,
@@ -1083,14 +1130,18 @@ impl Dht {
                 }
                 return out;
             }
-            if self.replay.len() >= MAX_REPLAYS
-                || self.replay.keys().filter(|(id, _)| *id == peer).count() >= 256
-                || self
-                    .replay
-                    .values()
-                    .filter(|r| routing::network_prefix(r.from) == routing::network_prefix(from))
-                    .count()
-                    >= 512
+            let read_only = packet.body.read_only();
+            if !read_only
+                && (self.replay.len() >= MAX_REPLAYS
+                    || self.replay.keys().filter(|(id, _)| *id == peer).count() >= 256
+                    || self
+                        .replay
+                        .values()
+                        .filter(|r| {
+                            routing::network_prefix(r.from) == routing::network_prefix(from)
+                        })
+                        .count()
+                        >= 512)
             {
                 return out;
             }
@@ -1101,23 +1152,48 @@ impl Dht {
             }
             if let Some(body) = self.handle_request(sender, &packet.body, now, &mut out) {
                 let mut reply = self.reply(&packet, body);
-                if let Some(exchange) = self.transport.accept(&packet, from, now) {
-                    reply.exchange = exchange;
+                let handshake_room = self.handshake_replay.len() < MAX_HANDSHAKE_REPLAYS
+                    && self
+                        .handshake_replay
+                        .keys()
+                        .filter(|(id, _)| *id == peer)
+                        .count()
+                        < 8
+                    && self
+                        .handshake_replay
+                        .values()
+                        .filter(|r| {
+                            routing::network_prefix(r.from) == routing::network_prefix(from)
+                        })
+                        .count()
+                        < 64;
+                if !read_only || handshake_room {
+                    if let Some(exchange) = self.transport.accept(&packet, from, now) {
+                        reply.exchange = exchange;
+                    }
                 }
                 let response = self
                     .transport
                     .encode(&reply, from, now)
                     .unwrap_or_else(|| reply.encode(&self.identity));
                 debug_assert!(response.len() <= protocol::MAX_PACKET);
-                self.replay.insert(
-                    replay_key,
-                    Replay {
-                        from,
-                        response: response.clone(),
-                        packet: reply.exchange.is_empty().then_some(reply),
-                        expires: packet.epoch.saturating_add(2).saturating_mul(COOKIE_MS),
-                    },
-                );
+                let cache_handshake = !reply.exchange.is_empty();
+                if !read_only || cache_handshake {
+                    let cache = if read_only {
+                        &mut self.handshake_replay
+                    } else {
+                        &mut self.replay
+                    };
+                    cache.insert(
+                        replay_key,
+                        Replay {
+                            from,
+                            response: response.clone(),
+                            packet: reply.exchange.is_empty().then_some(reply),
+                            expires: packet.epoch.saturating_add(2).saturating_mul(COOKIE_MS),
+                        },
+                    );
+                }
                 out.push(Action::Send {
                     to: from,
                     bytes: response,
@@ -1731,6 +1807,10 @@ impl Dht {
         self.authorizations
             .retain(|_, r| r.record.expires > now.unix_secs);
         self.replay.retain(|_, r| r.expires > now.monotonic_ms);
+        self.handshake_replay
+            .retain(|_, r| r.expires > now.monotonic_ms);
+        self.response_budget
+            .retain(|nonce, _| self.pending.contains_key(nonce));
         self.exchanges.retain(|_, e| e.expires > now.unix_secs);
         self.incoming.retain(|_, i| i.offer.expires > now.unix_secs);
     }

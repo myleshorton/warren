@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+puncher = { path = "../puncher" }
 dht-next = { path = "../dht-next" }
 crypto = { path = "../crypto" }
 feed = { path = "../feed" }

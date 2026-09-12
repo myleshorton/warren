@@ -76,10 +76,12 @@ type Operation = Box<dyn FnOnce(&mut Dht, Time) -> Vec<Action> + Send>;
 enum Command {
     Apply(Operation),
     Stop(oneshot::Sender<()>),
+    #[cfg(test)]
+    ReceiveError(io::ErrorKind, oneshot::Sender<()>),
     Rebind(
-        UdpSocket,
+        SocketAddr,
         Vec<Contact>,
-        oneshot::Sender<Result<SocketAddr, Error>>,
+        oneshot::Sender<io::Result<SocketAddr>>,
     ),
 }
 /// Current bind address and monotonically increasing local network generation.
@@ -149,7 +151,8 @@ impl Node {
     pub fn network(&self) -> watch::Receiver<NetworkState> {
         self.inner.network.subscribe()
     }
-    /// Atomically replace the UDP socket and restart active publications. A bind
+    /// Refresh network state and restart active publications. The exact current
+    /// address reuses its socket; other addresses bind before replacing it, so a
     /// failure leaves the old socket intact. Port zero requests a fresh port.
     pub async fn rebind(&self, address: SocketAddr, seeds: &[Contact]) -> io::Result<SocketAddr> {
         if seeds.len() > 8 {
@@ -158,17 +161,15 @@ impl Node {
                 "at most eight recovery seeds",
             ));
         }
-        let socket = bind_socket(address)?;
         let (send, receive) = oneshot::channel();
         self.inner
             .commands
-            .send(Command::Rebind(socket, seeds.to_vec(), send))
+            .send(Command::Rebind(address, seeds.to_vec(), send))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "DHT stopped"))?;
         receive
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "DHT stopped"))?
-            .map_err(io::Error::other)
     }
     pub fn subscribe(&self) -> broadcast::Receiver<Notice> {
         self.inner.events.subscribe()
@@ -314,17 +315,32 @@ impl Node {
         }
         let key = value.key();
         let replicas = self.replicas(key, seeds).await?;
+        self.store_replicas(value, cas, replicas).await
+    }
+
+    async fn store_replicas(
+        &self,
+        value: dht_next::Value,
+        cas: Option<u64>,
+        replicas: Vec<Contact>,
+    ) -> Result<StoreResult, Error> {
+        let key = value.key();
         let mut events = self.subscribe();
         let mut pending = std::collections::BTreeMap::new();
-        for peer in replicas {
-            pending.insert(self.put_value(peer, value.clone(), cas).await?, peer);
-        }
         let mut result = StoreResult {
             key,
             acknowledged: vec![],
             rejected: vec![],
             timed_out: vec![],
         };
+        for peer in replicas {
+            match self.put_value(peer, value.clone(), cas).await {
+                Ok(request) => {
+                    pending.insert(request, peer);
+                }
+                Err(_) => result.rejected.push(peer),
+            }
+        }
         let completion = tokio::time::timeout(Duration::from_secs(10), async {
             while !pending.is_empty() {
                 match next_event(&mut events).await? {
@@ -350,9 +366,8 @@ impl Node {
             Ok::<(), Error>(())
         })
         .await;
-        if let Ok(outcome) = completion {
-            outcome?;
-        }
+        // An event-channel failure leaves the issued writes indeterminate.
+        let _ = completion;
         result.timed_out.extend(pending.into_values());
         Ok(result)
     }
@@ -528,21 +543,33 @@ async fn run(
         actions = tokio::select! {
             command = commands.recv() => match command {
                 Some(Command::Apply(operation)) => operation(&mut core, time(start)),
-                Some(Command::Rebind(replacement, seeds, reply)) => {
+                Some(Command::Rebind(address, seeds, reply)) => {
                     if reply.is_closed() { vec![] } else {
-                        match core.network_changed(Keypair::generate().seed(), &seeds, time(start)) {
-                            Ok(actions) => {
-                                let address = replacement.local_addr().expect("bound UDP socket");
-                                socket = replacement;
-                                receive_enabled = true;
-                                dual_stack = address.is_ipv6();
-                                network.send_modify(|state| { state.address = address; state.generation += 1; });
-                                let _ = reply.send(Ok(address));
-                                actions
+                        let replacement = if socket.local_addr().ok() == Some(address) {
+                            Ok(None)
+                        } else { bind_socket(address).map(Some) };
+                        match replacement {
+                            Err(error) => { let _ = reply.send(Err(error)); vec![] }
+                            Ok(replacement) => match core.network_changed(Keypair::generate().seed(), &seeds, time(start)) {
+                                Ok(actions) => {
+                                    if let Some(replacement) = replacement { socket = replacement; }
+                                    let address = socket.local_addr().expect("bound UDP socket");
+                                    receive_enabled = true;
+                                    dual_stack = address.is_ipv6();
+                                    network.send_modify(|state| { state.address = address; state.generation += 1; });
+                                    let _ = reply.send(Ok(address));
+                                    actions
+                                }
+                                Err(error) => { let _ = reply.send(Err(io::Error::other(format!("{error:?}")))); vec![] }
                             }
-                            Err(error) => { let _ = reply.send(Err(Error::Core(error))); vec![] }
                         }
                     }
+                }
+                #[cfg(test)]
+                Some(Command::ReceiveError(kind, reply)) => {
+                    receive_enabled = transient_receive_error(kind);
+                    let _ = reply.send(());
+                    vec![]
                 }
                 Some(Command::Stop(reply)) => { stopped = Some(reply); break 'actor; }
                 None => break 'actor,
@@ -559,7 +586,7 @@ async fn run(
                     let _ = events.send(Notice::IoError(error.kind()));
                     // Keep accepting recovery commands without spinning on a
                     // failed interface. Rebinding enables receives again.
-                    receive_enabled = false;
+                    receive_enabled = transient_receive_error(error.kind());
                     vec![]
                 }
             },
@@ -570,5 +597,126 @@ async fn run(
     let _ = events.send(Notice::Stopped);
     if let Some(reply) = stopped {
         let _ = reply.send(());
+    }
+}
+
+fn transient_receive_error(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+    )
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn transient_receive_errors_and_same_port_refresh_preserve_service() {
+        let a = Node::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Keypair::from_seed(&[231; 32]),
+            false,
+        )
+        .await
+        .unwrap();
+        let b = Node::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Keypair::from_seed(&[232; 32]),
+            true,
+        )
+        .await
+        .unwrap();
+        let contact = Contact::new(b.id(), b.local_addr());
+        for kind in [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionRefused,
+        ] {
+            let (tx, rx) = oneshot::channel();
+            a.inner
+                .commands
+                .send(Command::ReceiveError(kind, tx))
+                .await
+                .unwrap();
+            rx.await.unwrap();
+            let mut events = a.subscribe();
+            a.probe(contact).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if matches!(next_event(&mut events).await.unwrap(), Event::Ready(_)) {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let before = *a.network().borrow();
+        assert_eq!(
+            a.rebind(before.address, &[contact]).await.unwrap(),
+            before.address
+        );
+        assert_eq!(a.network().borrow().generation, before.generation + 1);
+        let mut events = a.subscribe();
+        a.probe(contact).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(next_event(&mut events).await.unwrap(), Event::Ready(_)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_store_reports_issued_replicas_after_capacity_failure() {
+        let a = Node::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Keypair::from_seed(&[233; 32]),
+            false,
+        )
+        .await
+        .unwrap();
+        let b = Node::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Keypair::from_seed(&[234; 32]),
+            true,
+        )
+        .await
+        .unwrap();
+        let holder = Contact::new(b.id(), b.local_addr());
+        let dead = Contact::new(
+            NodeId::from_bytes([241; 32]),
+            "127.0.0.1:9".parse().unwrap(),
+        );
+        a.apply(move |core, now| {
+            let mut actions = vec![];
+            for _ in 0..dht_next::MAX_PENDING - 1 {
+                actions.extend(core.probe(dead, now)?);
+            }
+            Ok(((), actions))
+        })
+        .await
+        .unwrap();
+        let result = a
+            .store_replicas(
+                dht_next::Value::Immutable(b"partial".to_vec()),
+                None,
+                vec![holder, holder, holder],
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.acknowledged, vec![holder]);
+        assert_eq!(result.rejected, vec![holder, holder]);
+        assert!(result.timed_out.is_empty());
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
     }
 }

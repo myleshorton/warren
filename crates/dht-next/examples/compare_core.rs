@@ -1,5 +1,5 @@
 //! Paired, seeded lookup and DHT-signaling measurements. No real network traffic.
-//! Run: cargo run --release -p dht-next --example compare_dht -- 20
+//! Run: cargo run --release -p dht-next --example compare_core -- 20
 use crypto::Keypair;
 use dht_next::Time;
 use dht_next::{node_id, Action, Contact, Dht, Event, NodeId};

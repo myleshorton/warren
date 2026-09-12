@@ -58,7 +58,7 @@ impl MutableValue {
             && self.expires <= now.unix_secs.saturating_add(VALUE_TTL_SECS)
             && self
                 .publisher
-                .verify(
+                .verify_strict(
                     &mutable_message(
                         self.publisher,
                         &self.salt,

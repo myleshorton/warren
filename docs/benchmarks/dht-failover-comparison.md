@@ -8,10 +8,10 @@ new verified return paths. `signal` remains the single-coordinator convenience A
 ## Reproduce
 
 ```sh
-cargo run --release -p dht-next --example compare_dht -- failover 100 > docs/benchmarks/dht-failover-comparison.csv
+cargo run --release -p dht-next --example compare_core -- failover 100 > docs/benchmarks/dht-failover-comparison.csv
 ```
 
-[Harness](../../crates/dht-next/examples/compare_dht.rs) ·
+[Harness](../../crates/dht-next/examples/compare_core.rs) ·
 [Raw results](dht-failover-comparison.csv) · [Protocol](../dht-next.md#signaling-flow)
 
 ## Method

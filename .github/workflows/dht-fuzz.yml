@@ -2,9 +2,14 @@ name: dht-fuzz
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 4 * * *'
   pull_request:
     paths:
       - 'crates/dht-next/**'
+      - 'crates/routing-types/**'
       - 'crates/driver/**'
       - 'crates/puncher/**'
       - 'crates/portmap/**'
@@ -42,7 +47,7 @@ jobs:
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - run: python3 fuzz/seed_corpus.py
-      - run: cargo +nightly-2026-09-11 fuzz run ${{ matrix.target }} -- -max_total_time=120 -max_len=${{ matrix.max_len }} -timeout=5
+      - run: cargo +nightly-2026-09-11 fuzz run ${{ matrix.target }} -- -max_total_time=${{ github.event_name == 'schedule' && '600' || '120' }} -max_len=${{ matrix.max_len }} -timeout=5
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

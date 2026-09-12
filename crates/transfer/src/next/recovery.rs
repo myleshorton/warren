@@ -179,7 +179,8 @@ impl Endpoint {
     /// Report a platform network change (including resume after sleep). Rebinds
     /// the same actor, revalidates contacts, and renews existing publications.
     /// Existing connections fail with ConnectionAborted and must authenticate anew.
-    /// Port zero is recommended; a bind failure leaves the old socket untouched.
+    /// The exact current bind address reuses its socket; port zero requests a
+    /// fresh port. A bind failure leaves the old socket untouched.
     /// With a listener, waits for the first new registration acknowledgement.
     pub async fn network_changed(
         &self,
@@ -253,7 +254,8 @@ impl Endpoint {
     }
 
     /// Reconnect a live feed mirror from the replica's last verified length.
-    /// Runs until cancellation, a non-retryable error, or the recovery budget.
+    /// Healthy replication has no lifetime limit. Verified progress resets the
+    /// reconnection budget; cancellation and non-retryable errors still terminate it.
     pub async fn recover_feed(
         &self,
         peer: PublicKey,
@@ -265,36 +267,59 @@ impl Endpoint {
     ) -> Result<(), RecoveryError> {
         let policy = policy.validate()?;
         let public_key = replica.lock().expect("replica").public_key();
-        tokio::time::timeout(policy.deadline, async {
-            for attempt in 0..policy.attempts {
-                if attempt > 0 {
-                    policy.pause(attempt - 1).await;
-                }
-                let result = match self.connect(peer, seeds).await {
-                    Ok(mut connection) => crate::replicate_feed(
+        let mut attempts = 0;
+        let mut deadline = tokio::time::Instant::now() + policy.deadline;
+        loop {
+            attempts += 1;
+            let mut progressed = false;
+            let result = match tokio::time::timeout_at(deadline, self.connect(peer, seeds)).await {
+                Err(_) => return Err(RecoveryError::Deadline),
+                Ok(Err(error)) => Err(RecoveryError::Connection(error)),
+                Ok(Ok(mut connection)) => {
+                    let (progress, mut updates) = tokio::sync::watch::channel(0u64);
+                    let replication = crate::replicate_feed_with_progress(
                         &mut connection,
                         public_key,
                         replica,
                         appended,
                         transfer,
-                    )
-                    .await
-                    .map_err(RecoveryError::Transfer),
-                    Err(error) => Err(RecoveryError::Connection(error)),
-                };
-                let retry = match &result {
-                    Err(RecoveryError::Connection(error)) => retry_connect(error),
-                    Err(RecoveryError::Transfer(error)) => retry_transfer(error),
-                    _ => false,
-                };
-                if !retry || attempt + 1 == policy.attempts {
-                    return result;
+                        || {
+                            progress
+                                .send_modify(|generation| *generation = generation.wrapping_add(1));
+                        },
+                    );
+                    tokio::pin!(replication);
+                    loop {
+                        tokio::select! {
+                            biased;
+                            changed = updates.changed() => {
+                                if changed.is_ok() { progressed = true; }
+                            }
+                            result = &mut replication => {
+                                progressed |= *updates.borrow() > 0;
+                                break result.map_err(RecoveryError::Transfer);
+                            },
+                            _ = tokio::time::sleep_until(deadline), if !progressed => return Err(RecoveryError::Deadline),
+                        }
+                    }
                 }
+            };
+            if progressed {
+                attempts = 0;
+                deadline = tokio::time::Instant::now() + policy.deadline;
             }
-            unreachable!("validated attempts")
-        })
-        .await
-        .map_err(|_| RecoveryError::Deadline)?
+            let retry = match &result {
+                Err(RecoveryError::Connection(error)) => retry_connect(error),
+                Err(RecoveryError::Transfer(error)) => retry_transfer(error),
+                _ => false,
+            };
+            if !retry || attempts >= policy.attempts {
+                return result;
+            }
+            tokio::time::timeout_at(deadline, policy.pause(attempts.saturating_sub(1)))
+                .await
+                .map_err(|_| RecoveryError::Deadline)?;
+        }
     }
 }
 
@@ -516,7 +541,7 @@ mod lifecycle_tests {
             let config = crate::Config { initial_rtt: Duration::from_millis(1), request_timeout: Duration::from_millis(100), retries: 2, idle: Duration::from_secs(1) };
             let recovering = async {
                 tokio::select! {
-                    result = client.recover_feed(server.public_key(), &seeds, &replica, &appended, &config, RecoveryConfig::default()) => panic!("premature end: {result:?}"),
+                    result = client.recover_feed(server.public_key(), &seeds, &replica, &appended, &config, RecoveryConfig { attempts: 1, deadline: Duration::from_secs(2), ..RecoveryConfig::default() }) => panic!("premature end: {result:?}"),
                     _ = async {
                         loop {
                             let changed = appended.notified();
@@ -532,7 +557,7 @@ mod lifecycle_tests {
                 let stop = tokio::sync::Notify::new();
                 tokio::select! {
                     biased;
-                    _ = stop.notified() => {},
+                    _ = async { stop.notified().await; tokio::time::sleep(Duration::from_secs(3)).await; } => {},
                     result = crate::serve(&first, &config, None, |request| {
                         if matches!(request, sync::Message::Tail { have: 2 }) { stop.notify_one(); }
                         sync::serve_feed(request, &*source.lock().unwrap())

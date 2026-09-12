@@ -167,7 +167,13 @@ fn coordinator_cannot_forge_an_answer_or_redirect_the_return_path() {
 #[test]
 fn saturated_replay_cache_rejects_new_effects_instead_of_forgetting_old_ones() {
     let mut receiver = core(2);
-    let p = challenged(&mut receiver, packet(Body::Probe));
+    let p = challenged(
+        &mut receiver,
+        packet(Body::PutValue {
+            value: Value::Immutable(b"cached write".to_vec()),
+            cas: None,
+        }),
+    );
     for i in 0..MAX_REPLAYS {
         let mut nonce = [0; 32];
         nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
@@ -308,7 +314,7 @@ fn monotonic_deadlines_and_rate_limits_ignore_wall_clock_jumps() {
     assert_eq!(d.pending_len(), 0);
     assert_eq!(d.poll_timeout(), None);
     for _ in 0..256 {
-        d.receive(addr(1), &[0], Time::new(110_000, 100));
+        d.receive(addr(1), &invalid_envelope(), Time::new(110_000, 100));
     }
     assert!(d
         .receive(
@@ -353,14 +359,16 @@ fn lost_encrypted_reply_recovers_with_fresh_counters_and_one_registration_effect
     assert!(Packet::decode(&request).is_none());
     let lost = sent(&b.receive(addr(1), &request, at(101)));
     assert_eq!(b.registration_len(), 1);
-    assert_eq!(b.replay.len(), 2);
+    assert_eq!(b.replay.len(), 1);
+    assert_eq!(b.handshake_replay.len(), 1);
     assert!(b.receive(addr(1), &request, at(101)).is_empty());
     let retry = sent(&a.tick(Time::new(101_200, 101)));
     assert_ne!(request, retry);
     let reply = sent(&b.receive(addr(1), &retry, Time::new(101_200, 101)));
     assert_ne!(lost, reply);
     assert_eq!(b.registration_len(), 1);
-    assert_eq!(b.replay.len(), 2);
+    assert_eq!(b.replay.len(), 1);
+    assert_eq!(b.handshake_replay.len(), 1);
     let events = a.receive(addr(2), &reply, Time::new(101_200, 101));
     assert!(events
         .iter()
@@ -1105,7 +1113,7 @@ fn one_prefix_cannot_exhaust_global_packet_budget() {
     let mut d = core(2);
     for port in 4000..5000 {
         let from = format!("[::ffff:203.0.113.1]:{port}").parse().unwrap();
-        assert!(d.receive(from, &[0], at(100)).is_empty());
+        assert!(d.receive(from, &invalid_envelope(), at(100)).is_empty());
     }
     assert_eq!(d.budget_used, 64);
     assert_eq!(d.budget_prefixes.len(), 1);
@@ -1135,11 +1143,11 @@ fn many_prefixes_cannot_grow_ingress_accounting_past_global_budget() {
     let mut d = core(2);
     for n in 0..1024 {
         let from = SocketAddr::from(([10, (n / 256) as u8, (n % 256) as u8, 1], 4000));
-        d.receive(from, &[0], at(100));
+        d.receive(from, &invalid_envelope(), at(100));
     }
     assert_eq!(d.budget_used, 256);
     assert_eq!(d.budget_prefixes.len(), 256);
-    d.receive(addr(1), &[0], at(101));
+    d.receive(addr(1), &invalid_envelope(), at(101));
     assert_eq!(d.budget_prefixes.len(), 1);
 }
 
@@ -1293,7 +1301,13 @@ fn provider_quota_preserves_renewal_and_other_providers_capacity() {
 #[test]
 fn replay_quota_keeps_cached_replies_and_room_for_other_peers() {
     let mut receiver = core(2);
-    let p = challenged(&mut receiver, packet(Body::Probe));
+    let p = challenged(
+        &mut receiver,
+        packet(Body::PutValue {
+            value: Value::Immutable(b"cached write".to_vec()),
+            cas: None,
+        }),
+    );
     for i in 0..256u16 {
         let mut nonce = [0; 32];
         nonce[..2].copy_from_slice(&i.to_le_bytes());
@@ -1317,7 +1331,10 @@ fn replay_quota_keeps_cached_replies_and_room_for_other_peers() {
         vec![7]
     );
     assert_eq!(receiver.replay.len(), 256);
-    let mut other = packet(Body::Probe);
+    let mut other = packet(Body::PutValue {
+        value: Value::Immutable(b"cached write".to_vec()),
+        cas: None,
+    });
     other.key = key(3).public();
     let challenge = Packet::decode(&sent(&receiver.receive(
         addr(3),
@@ -1335,7 +1352,7 @@ fn replay_quota_keeps_cached_replies_and_room_for_other_peers() {
         )))
         .unwrap()
         .body,
-        Body::Ack
+        Body::ValueStored(true)
     ));
     assert_eq!(receiver.replay.len(), 257);
 }
@@ -2034,4 +2051,162 @@ fn cached_routes_do_not_expand_the_completion_frontier() {
     d.drive_queries(at(100), &mut actions);
     assert!(!actions.iter().any(|a| matches!(a, Action::Send { .. })));
     assert!(actions.iter().any(|a| matches!(a, Action::Event(e) if matches!(&**e, Event::LookupDone { query, .. } if *query == id))));
+}
+
+fn invalid_envelope() -> Vec<u8> {
+    let mut bytes = packet(Body::Probe).encode(&key(1));
+    *bytes.last_mut().unwrap() ^= 1;
+    bytes
+}
+
+#[test]
+fn junk_and_new_caller_floods_do_not_starve_responses_or_sessions() {
+    let mut a = core(1);
+    let mut b = core(2);
+    for n in 0..1024u16 {
+        let from = SocketAddr::from(([10, (n / 256) as u8, (n % 256) as u8, 1], 4000));
+        assert!(a.receive(from, &[0], at(100)).is_empty());
+    }
+    assert_eq!(a.budget_used, 0);
+    for n in 0..1024u16 {
+        let from = SocketAddr::from(([10, (n / 256) as u8, (n % 256) as u8, 1], 4000));
+        a.receive(from, &invalid_envelope(), at(100));
+    }
+    assert_eq!(a.budget_used, 256);
+    let actions = a.probe(contact(2), at(100)).unwrap();
+    pair(&mut a, &mut b, actions, at(100));
+    assert_eq!(
+        a.pending_len(),
+        0,
+        "cold signed replies have reserved capacity"
+    );
+    b.budget_used = 256;
+    let actions = a.probe(contact(2), at(100)).unwrap();
+    assert!(Packet::decode(&sent(&actions)).is_none());
+    pair(&mut a, &mut b, actions, at(100));
+    assert_eq!(
+        a.pending_len(),
+        0,
+        "authenticated sessions survive the new-caller flood"
+    );
+}
+
+#[test]
+fn forged_expected_responses_have_a_bounded_verification_budget() {
+    let mut a = core(1);
+    let mut b = core(2);
+    let actions = a.probe(contact(2), at(100)).unwrap();
+    let reply = sent(&b.receive(addr(1), &sent(&actions), at(100)));
+    let mut forged = reply.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    for _ in 0..100 {
+        assert!(a.receive(addr(2), &forged, at(100)).is_empty());
+    }
+    assert_eq!(
+        a.response_budget.values().copied().collect::<Vec<_>>(),
+        vec![8]
+    );
+    assert_eq!(a.pending_len(), 1);
+    assert!(!a.receive(addr(2), &reply, at(101)).is_empty());
+}
+
+#[test]
+fn read_only_flood_does_not_consume_effect_replays_and_full_caches_still_answer_reads() {
+    let mut d = core(2);
+    let mut p = challenged(&mut d, packet(Body::Probe));
+    for i in 0..100u64 {
+        p.nonce[..8].copy_from_slice(&i.to_le_bytes());
+        assert!(matches!(
+            Packet::decode(&sent(&d.receive(
+                addr(1),
+                &p.encode(&key(1)),
+                at(100 + i / 16)
+            )))
+            .unwrap()
+            .body,
+            Body::Ack
+        ));
+    }
+    assert!(d.replay.is_empty());
+    assert!(d.handshake_replay.is_empty());
+    for i in 0..MAX_REPLAYS {
+        let mut nonce = [0; 32];
+        nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        d.replay.insert(
+            (contact(3).id, nonce),
+            Replay {
+                from: addr(3),
+                expires: 120_000,
+                response: vec![],
+                packet: None,
+            },
+        );
+    }
+    p.nonce = [99; 32];
+    assert!(matches!(
+        Packet::decode(&sent(&d.receive(addr(1), &p.encode(&key(1)), at(107))))
+            .unwrap()
+            .body,
+        Body::Ack
+    ));
+    assert_eq!(d.replay.len(), MAX_REPLAYS);
+}
+
+#[test]
+fn network_change_preserves_routing_choice_and_manual_renewal_intents() {
+    for enabled in [false, true] {
+        let mut d = core(1);
+        if enabled {
+            d.maintain_routing(at(100));
+        }
+        d.maintain_registration(contact(2), contact(1).id, at(100))
+            .unwrap();
+        let actions = d.network_changed([221; 32], &[], at(101)).unwrap();
+        assert_eq!(d.routing.is_some(), enabled);
+        assert_eq!(d.managed.len(), 1);
+        let intent = &d.managed[&(contact(1).id, contact(2).id)];
+        assert!(intent.pending.is_none());
+        assert_eq!(intent.next_at, 101_000);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Event(e) if matches!(**e, Event::NetworkChanged(_)))));
+        let renewed = d.tick(at(101));
+        assert!(!renewed.is_empty());
+        assert!(d.managed[&(contact(1).id, contact(2).id)].pending.is_some());
+    }
+}
+
+#[test]
+fn full_handshake_cache_preserves_retransmits_and_allows_signed_reads() {
+    let mut a = core(1);
+    let mut b = core(2);
+    let first = a.probe(contact(2), at(100)).unwrap();
+    let challenge = b.receive(addr(1), &sent(&first), at(100));
+    let validated = a.receive(addr(2), &sent(&challenge), at(100));
+    let original = sent(&b.receive(addr(1), &sent(&validated), at(100)));
+    for i in 0..MAX_HANDSHAKE_REPLAYS - 1 {
+        let mut nonce = [0; 32];
+        nonce[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        b.handshake_replay.insert(
+            (contact(3).id, nonce),
+            Replay {
+                from: addr(3),
+                expires: 120_000,
+                response: vec![],
+                packet: None,
+            },
+        );
+    }
+    assert_eq!(
+        sent(&b.receive(addr(1), &sent(&validated), at(100))),
+        original
+    );
+    let mut fresh = Packet::decode(&sent(&validated)).unwrap();
+    fresh.nonce = [99; 32];
+    session::start(&mut fresh).unwrap();
+    let response =
+        Packet::decode(&sent(&b.receive(addr(1), &fresh.encode(&key(1)), at(100)))).unwrap();
+    assert!(matches!(response.body, Body::Ack));
+    assert!(response.exchange.is_empty());
+    assert_eq!(b.handshake_replay.len(), MAX_HANDSHAKE_REPLAYS);
 }

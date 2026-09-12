@@ -16,10 +16,10 @@ See the [peer-session comparison](dht-session-comparison.md) for current results
 ## Original command
 
 ```sh
-cargo run --release -p dht-next --example compare_dht -- 100 > docs/benchmarks/dht-adaptive-comparison.csv
+cargo run --release -p dht-next --example compare_core -- 100 > docs/benchmarks/dht-adaptive-comparison.csv
 ```
 
-[Harness](../../crates/dht-next/examples/compare_dht.rs) ·
+[Harness](../../crates/dht-next/examples/compare_core.rs) ·
 [Raw results](dht-adaptive-comparison.csv) ·
 [Original baseline](dht-comparison.md)
 

@@ -15,10 +15,10 @@ includes that next phase and produces different signaling byte counts. See the
 ## Original command
 
 ```sh
-cargo run --release -p dht-next --example compare_dht -- 100 > docs/benchmarks/dht-session-comparison.csv
+cargo run --release -p dht-next --example compare_core -- 100 > docs/benchmarks/dht-session-comparison.csv
 ```
 
-[Harness](../../crates/dht-next/examples/compare_dht.rs) ·
+[Harness](../../crates/dht-next/examples/compare_core.rs) ·
 [Raw results](dht-session-comparison.csv) ·
 [Prior phase](dht-adaptive-comparison.md) ·
 [Protocol and limitations](../dht-next.md#compact-peer-sessions)

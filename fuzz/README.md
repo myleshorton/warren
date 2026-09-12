@@ -21,7 +21,8 @@ no sockets or public bootstrap services are used. The signed-body helper exists
 only behind `test-support`, which production builds do not enable.
 
 `lifecycle` runs up to 32 operations across four nodes, including cancellation,
-restart, address changes, partitions, dishonest storage, and damaged or reordered
+restart, explicit routing-maintenance toggles, address changes, partitions,
+dishonest storage, and damaged or reordered
 traffic. It checks state bounds throughout, then restores delivery and services
 `poll_timeout()` deadlines to require successful storage, lookup, and signaling.
 The disruption phase deliberately permits late timers; recovery does not skip
@@ -37,3 +38,8 @@ an overlong integer decoded successfully but changed on re-encoding. DHT decodin
 now rejects these encodings, with signed and compact packet regression tests.
 For longer campaigns, increase `-max_total_time` and retain the corpus between runs.
 A short successful campaign is evidence about exercised inputs, not a security audit.
+
+CI explicitly runs the test-support suite, all three fuzz targets, and the real-UDP
+signaling soak. Fuzz campaigns run for 120 seconds per target on PRs and main
+pushes, and 600 seconds per target on the daily schedule. The schedule takes effect
+once the workflow reaches the default branch.

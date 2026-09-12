@@ -293,6 +293,8 @@ pub async fn open_birthday_sockets(
 
 /// Like [`open_birthday_sockets`], but opens return mappings to all advertised
 /// peer endpoints and accepts controls from their IPs.
+/// Each socket sends at most three probes per endpoint, at least 250 ms apart,
+/// then only listens until the overall deadline.
 pub async fn open_birthday_sockets_any(
     host: IpAddr,
     peers: &[SocketAddr],
@@ -327,14 +329,16 @@ pub async fn open_birthday_sockets_any(
         if let Ok(socket) = UdpSocket::bind((host, port)).await {
             opened += 1;
             let peers = Arc::clone(&peers);
-            let interval = cfg.probe_interval.max(Duration::from_millis(50));
+            let interval = cfg.probe_interval.max(Duration::from_millis(250));
             set.spawn(async move {
                 let mut buf = [0u8; 64];
                 let mut timer = tokio::time::interval(interval);
+                let mut transmissions = 0;
                 timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
-                        _ = timer.tick() => {
+                        _ = timer.tick(), if transmissions < 3 => {
+                            transmissions += 1;
                             for peer in peers.iter() { let _ = socket.send_to(&[PROBE], peer).await; }
                         }
                         received = socket.recv_from(&mut buf) => match received {

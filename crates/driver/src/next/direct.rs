@@ -42,7 +42,7 @@ impl DirectSocket {
                 actions.extend(sent);
             }
         }
-        let deadline = tokio::time::Instant::now() + Duration::from_millis(750);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
         let mut bytes = [0; dht_next::protocol::MAX_PACKET + 1];
         loop {
             for action in actions.drain(..) {
@@ -79,8 +79,11 @@ impl DirectSocket {
             });
             tokio::select! {
                 received = socket.recv_from(&mut bytes) => {
-                    let (len, from) = received?;
-                    actions = core.receive(canonical(from), &bytes[..len], time(start));
+                    match received {
+                        Ok((len, from)) => actions = core.receive(canonical(from), &bytes[..len], time(start)),
+                        Err(error) if super::transient_receive_error(error.kind()) => {},
+                        Err(error) => return Err(error),
+                    }
                 }
                 _ = tokio::time::sleep_until(wake) => {
                     if tokio::time::Instant::now() >= deadline { break; }
@@ -240,5 +243,37 @@ impl DirectChannel {
                 return Ok(len);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+    #[tokio::test]
+    async fn reflection_tolerates_loss_and_two_slow_round_trips() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut core = Dht::new(Keypair::from_seed(&[235; 32]), [236; 32], true);
+        let reflector = Contact::new(core.id(), server.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            let start = Instant::now();
+            let mut buf = [0; 1201];
+            let _ = server.recv_from(&mut buf).await.unwrap();
+            loop {
+                let (n, from) = server.recv_from(&mut buf).await.unwrap();
+                let actions = core.receive(from, &buf[..n], time(start));
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                for action in actions {
+                    if let Action::Send { to, bytes } = action {
+                        server.send_to(&bytes, to).await.unwrap();
+                    }
+                }
+            }
+        });
+        let direct = DirectSocket::bind("0.0.0.0:0".parse().unwrap(), &[reflector])
+            .await
+            .unwrap();
+        assert!(!direct.candidates().is_empty());
+        assert!(direct.candidates()[0].ip().is_loopback());
+        task.abort();
     }
 }

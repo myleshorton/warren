@@ -7,11 +7,11 @@ verifying signatures and routing metadata without receiving the plaintext.
 ## Reproduce
 
 ```sh
-cargo run --release -p dht-next --example compare_dht -- 100 > docs/benchmarks/dht-encrypted-signaling-comparison.csv
+cargo run --release -p dht-next --example compare_core -- 100 > docs/benchmarks/dht-encrypted-signaling-comparison.csv
 ```
 
 [Raw results](dht-encrypted-signaling-comparison.csv) ·
-[Harness](../../crates/dht-next/examples/compare_dht.rs) ·
+[Harness](../../crates/dht-next/examples/compare_core.rs) ·
 [Prior peer-session phase](dht-session-comparison.md) ·
 [Protocol and limitations](../dht-next.md#signaling-flow)
 

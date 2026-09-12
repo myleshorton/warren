@@ -289,6 +289,7 @@ dependencies = [
  "blake3",
  "crypto",
  "proptest",
+ "routing-types",
  "snow",
  "swarm",
  "wire",
@@ -720,6 +721,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "routing-types"
+version = "0.0.0"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -877,6 +882,7 @@ version = "0.0.0"
 dependencies = [
  "crypto",
  "proptest",
+ "routing-types",
  "thiserror",
  "wire",
 ]
@@ -972,6 +978,7 @@ dependencies = [
  "dht-next",
  "driver",
  "feed",
+ "puncher",
  "snow",
  "swarm",
  "sync",

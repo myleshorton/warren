@@ -290,3 +290,27 @@ async fn every_birthday_socket_sends_to_the_advertised_peer_before_accepting() {
     assert_eq!(established.socket.local_addr().unwrap(), selected);
     assert_eq!(established.peer, destination);
 }
+
+#[tokio::test]
+async fn birthday_probes_are_bounded_when_the_peer_never_replies() {
+    let peer = UdpSocket::bind(addr(0)).await.unwrap();
+    let endpoint = peer.local_addr().unwrap();
+    let cfg = Config {
+        overall: Duration::from_millis(900),
+        probe_interval: Duration::from_millis(1),
+    };
+    let attempt = tokio::spawn(async move {
+        open_birthday_sockets(LO, endpoint, (20000, 60000), 4, 912, &cfg)
+            .await
+            .unwrap()
+    });
+    let mut packets = 0;
+    let mut buf = [0; 16];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1100);
+    while let Ok(Ok((n, _))) = tokio::time::timeout_at(deadline, peer.recv_from(&mut buf)).await {
+        assert_eq!(&buf[..n], &[puncher::PROBE]);
+        packets += 1;
+    }
+    assert!(attempt.await.unwrap().is_none());
+    assert!((4..=12).contains(&packets), "{packets} probes");
+}

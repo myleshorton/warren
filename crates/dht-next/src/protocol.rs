@@ -1,7 +1,7 @@
 //! Versioned, bounded, signed datagrams for the experimental DHT.
 use crypto::{Keypair, PublicKey, Signature};
+use routing_types::{Contact, NodeId};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use swarm::{Contact, NodeId};
 use wire::{Decoder, Encoder};
 
 pub const MAX_PACKET: usize = 1200;
@@ -64,7 +64,7 @@ impl Record {
             && self.expires <= now.saturating_add(LEASE_SECS)
             && self
                 .provider
-                .verify(&self.signing_bytes(), &self.signature)
+                .verify_strict(&self.signing_bytes(), &self.signature)
                 .is_ok()
     }
 }
@@ -125,7 +125,7 @@ impl Signal {
             && self.expires <= now.saturating_add(SIGNAL_SECS)
             && self
                 .author
-                .verify(&self.signing_bytes(), &self.signature)
+                .verify_strict(&self.signing_bytes(), &self.signature)
                 .is_ok()
     }
 }
@@ -172,6 +172,18 @@ pub(crate) enum Body {
 }
 
 impl Body {
+    pub(crate) fn read_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Probe
+                | Self::Reflect
+                | Self::Find(_)
+                | Self::GetProviders { .. }
+                | Self::GetValue(_)
+                | Self::FindValue(_)
+        )
+    }
+
     pub fn response(&self) -> bool {
         matches!(
             self,
@@ -220,6 +232,10 @@ impl Packet {
         e.into_vec()
     }
 
+    pub(crate) fn plausible(bytes: &[u8]) -> bool {
+        (208..=MAX_PACKET).contains(&bytes.len()) && bytes.starts_with(MAGIC)
+    }
+
     pub fn decode(bytes: &[u8]) -> Option<Self> {
         if bytes.len() > MAX_PACKET || bytes.len() < 64 {
             return None;
@@ -245,7 +261,7 @@ impl Packet {
         {
             #[cfg(feature = "diagnostics")]
             let _span = crate::diagnostics::span(crate::diagnostics::Region::Verify);
-            key.verify(content, &Signature::from_bytes(signature.try_into().ok()?))
+            key.verify_strict(content, &Signature::from_bytes(signature.try_into().ok()?))
                 .ok()?;
         }
         Some(Self {

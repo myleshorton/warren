@@ -104,6 +104,8 @@ impl Network {
             assert!(n.routes.len() <= MAX_ROUTING);
             assert!(n.peers.len() <= MAX_PEERS);
             assert!(n.replay.len() <= MAX_REPLAYS);
+            assert!(n.handshake_replay.len() <= MAX_HANDSHAKE_REPLAYS);
+            assert!(n.response_budget.len() <= MAX_PENDING);
             assert!(n.registrations.len() <= MAX_REGISTRATIONS);
             assert!(n.authorizations.len() <= MAX_REGISTRATIONS);
             assert!(n.managed.len() <= MAX_REGISTRATIONS);
@@ -178,10 +180,17 @@ impl Network {
         if self.online[source] {
             match op % 16 {
                 0 => {
-                    actions = self.nodes[source]
-                        .bootstrap(&[contact], now)
-                        .map(|(_, a)| a)
-                        .unwrap_or_default()
+                    if arg & 1 != 0 {
+                        actions.extend(self.nodes[source].maintain_routing(now));
+                    } else {
+                        self.nodes[source].stop_routing_maintenance();
+                    }
+                    actions.extend(
+                        self.nodes[source]
+                            .bootstrap(&[contact], now)
+                            .map(|(_, a)| a)
+                            .unwrap_or_default(),
+                    );
                 }
                 1 => {
                     if let Ok((q, a)) = self.nodes[source].lookup(topic, &[contact], now) {

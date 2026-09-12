@@ -12,13 +12,14 @@ test-support = []
 diagnostics = []
 
 [dependencies]
+routing-types = { path = "../routing-types" }
 crypto = { path = "../crypto" }
 wire = { path = "../wire" }
-swarm = { path = "../swarm" }
 blake3 = "1"
 snow = "0.10"
 zeroize = "1.9"
 
 [dev-dependencies]
+swarm = { path = "../swarm" }
 proptest.workspace = true
 

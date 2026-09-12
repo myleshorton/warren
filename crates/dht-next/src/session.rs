@@ -7,10 +7,11 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 
 const PARAMS: &str = "Noise_NN_25519_ChaChaPoly_BLAKE2s";
-const MAGIC: &[u8] = b"WRE3\x01";
+pub(crate) const MAGIC: &[u8] = b"WRE3\x01";
 const HEADER: usize = 5 + 16 + 8;
 const LIFETIME: u64 = 300_000;
 const LIMIT: usize = 5120;
+const RENEW_MARGIN: u64 = 10_000;
 
 type Id = [u8; 16];
 
@@ -25,6 +26,8 @@ struct Session {
     address: SocketAddr,
     expires: u64,
     sent: u64,
+    receive_second: u64,
+    receive_attempts: u16,
     replay: Window,
 }
 
@@ -99,7 +102,9 @@ impl Sessions {
         self.preferred
             .get(&(peer, addr))
             .and_then(|id| self.entries.get(id))
-            .is_some_and(|s| s.expires > now.monotonic_ms && s.sent < u64::MAX)
+            .is_some_and(|s| {
+                s.expires > now.monotonic_ms.saturating_add(RENEW_MARGIN) && s.sent < u64::MAX
+            })
     }
 
     pub fn forget_preferred(&mut self, peer: NodeId, addr: SocketAddr) {
@@ -151,6 +156,8 @@ impl Sessions {
                 address,
                 expires: now.monotonic_ms.saturating_add(LIFETIME),
                 sent: 0,
+                receive_second: 0,
+                receive_attempts: 0,
                 replay: Window::default(),
             },
         );
@@ -202,7 +209,7 @@ impl Sessions {
         }
         let id = *self.preferred.get(&(packet.destination, address))?;
         let s = self.entries.get_mut(&id)?;
-        if s.expires <= now.monotonic_ms || s.sent == u64::MAX {
+        if s.expires <= now.monotonic_ms.saturating_add(RENEW_MARGIN) || s.sent == u64::MAX {
             return None;
         }
         let payload = packet.compact();
@@ -243,6 +250,14 @@ impl Sessions {
         if s.address != address || s.expires <= now.monotonic_ms || s.replay.rejects(nonce) {
             return None;
         }
+        if now.monotonic_ms / 1000 > s.receive_second {
+            s.receive_second = now.monotonic_ms / 1000;
+            s.receive_attempts = 0;
+        }
+        if s.receive_attempts >= 64 {
+            return None;
+        }
+        s.receive_attempts += 1;
         let mut payload = vec![0; bytes.len() - HEADER - 16];
         let n = {
             #[cfg(feature = "diagnostics")]
@@ -307,6 +322,46 @@ mod tests {
         a.finish(state, &reply, addr(2), now).unwrap();
         p.exchange.clear();
         (a, b, p)
+    }
+
+    #[test]
+    fn renewal_margin_covers_delayed_handshake_completion() {
+        let now = Time::new(100_000, 100);
+        let mut a = Sessions::new();
+        let mut b = Sessions::new();
+        let mut p = packet();
+        let state = start(&mut p).unwrap();
+        let exchange = b.accept(&p, addr(1), now).unwrap();
+        let reply = Packet {
+            key: key(2),
+            destination: node_id(key(1)),
+            body: Body::Ack,
+            exchange,
+            ..p.clone()
+        };
+        a.finish(state, &reply, addr(2), Time::new(107_999, 107))
+            .unwrap();
+        p.exchange.clear();
+        let late = Time::new(400_001, 400);
+        b.expire(late);
+        assert!(!a.available(node_id(key(2)), addr(2), late));
+        assert!(a.encode(&p, addr(2), late).is_none());
+    }
+
+    #[test]
+    fn forged_session_packets_have_bounded_work_and_do_not_poison_counters() {
+        let (mut a, mut b, p) = connected();
+        let now = Time::new(100_100, 100);
+        let good = a.encode(&p, addr(2), now).unwrap();
+        let mut bad = good.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        for _ in 0..1000 {
+            assert!(b.decode(&bad, addr(1), node_id(key(2)), now).is_none());
+        }
+        assert_eq!(b.entries.values().next().unwrap().receive_attempts, 64);
+        assert!(b
+            .decode(&good, addr(1), node_id(key(2)), Time::new(101_000, 101))
+            .is_some());
     }
 
     #[test]

@@ -7,7 +7,7 @@ These are deterministic simulation results, not public-internet measurements.
 ## Historical baseline command
 
 ```sh
-cargo run --release -p dht-next --example compare_dht -- 20 > docs/benchmarks/dht-comparison.csv
+cargo run --release -p dht-next --example compare_core -- 20 > docs/benchmarks/dht-comparison.csv
 ```
 
 These results were captured before the adaptive scheduler and reusable grants.
@@ -15,7 +15,7 @@ The current command runs the updated core; it will not regenerate this historica
 CSV. See the [new results](dht-adaptive-comparison.md) for the current command and
 paired comparison. The original data is retained unchanged.
 
-Harness: [`compare_dht.rs`](../../crates/dht-next/examples/compare_dht.rs).
+Harness: [`compare_core.rs`](../../crates/dht-next/examples/compare_core.rs).
 Raw results: [`dht-comparison.csv`](dht-comparison.csv).
 The trial-count argument selects seeds `0..count`; default 20. No real network
 traffic is generated. The benchmark does not change either implementation.

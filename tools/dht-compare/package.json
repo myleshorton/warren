@@ -1,0 +1,6 @@
+{
+  "name": "warren-dht-comparison",
+  "private": true,
+  "type": "module",
+  "dependencies": { "hyperdht": "6.34.0" }
+}

@@ -1,0 +1,41 @@
+{
+  "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "trials": 12,
+  "commands": [
+    [
+      "/Users/afisk/go/src/github.com/myleshorton/warren/target/release/examples/compare_dht",
+      "8",
+      "12"
+    ],
+    [
+      "node",
+      "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/hyperdht.mjs",
+      "8",
+      "12"
+    ],
+    [
+      "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/.venv/bin/python",
+      "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/libtorrent_bench.py",
+      "8",
+      "12"
+    ],
+    [
+      "/Users/afisk/go/src/github.com/myleshorton/warren/target/release/examples/compare_dht",
+      "32",
+      "12"
+    ],
+    [
+      "node",
+      "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/hyperdht.mjs",
+      "32",
+      "12"
+    ],
+    [
+      "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/.venv/bin/python",
+      "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/libtorrent_bench.py",
+      "32",
+      "12"
+    ]
+  ]
+}

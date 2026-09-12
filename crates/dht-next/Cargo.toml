@@ -1,0 +1,24 @@
+[package]
+name = "dht-next"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+test-support = []
+diagnostics = []
+
+[dependencies]
+crypto = { path = "../crypto" }
+wire = { path = "../wire" }
+swarm = { path = "../swarm" }
+blake3 = "1"
+snow = "0.10"
+zeroize = "1.9"
+
+[dev-dependencies]
+proptest.workspace = true
+

@@ -33,6 +33,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
 mod lan;
+pub mod next;
 
 pub use lan::LanBeacon;
 pub use puncher::Config as PunchConfig;
@@ -953,7 +954,7 @@ async fn run(
                                     local,
                                     reflectors,
                                     initiator,
-                                    peer_hosts,
+                                    peer_addresses: initiator_data_addrs,
                                     strategy,
                                     seed: local.port() as u64,
                                     port_mapping,
@@ -1068,7 +1069,7 @@ async fn run(
                     spawn_accept_punch(AcceptJob {
                         data_sock: done.data_sock,
                         own_host: data_ip,
-                        peer_hosts: done.peer_hosts,
+                        peer_addresses: done.peer_addresses,
                         strategy: done.strategy,
                         cfg: punch_cfg,
                         birthday,
@@ -1116,9 +1117,9 @@ struct PunchJob {
 struct AcceptJob {
     data_sock: UdpSocket,
     own_host: IpAddr,
-    /// The initiator's candidate data hosts — the only sources we accept a punch
-    /// from / spray toward.
-    peer_hosts: Vec<IpAddr>,
+    /// Preserve ports as well as hosts so birthday sockets can open filters to
+    /// the initiator's advertised data endpoint.
+    peer_addresses: Vec<SocketAddr>,
     strategy: Strategy,
     cfg: PunchConfig,
     birthday: BirthdayParams,
@@ -1136,7 +1137,7 @@ struct ReflexiveProbe {
     local: SocketAddr,
     reflectors: Vec<SocketAddr>,
     initiator: NodeId,
-    peer_hosts: Vec<IpAddr>,
+    peer_addresses: Vec<SocketAddr>,
     strategy: Strategy,
     seed: u64,
     /// Whether to also attempt a port mapping when gathering candidates.
@@ -1150,7 +1151,7 @@ struct ReflexiveDone {
     /// Our own data-socket candidate addresses, to advertise to the initiator.
     external_addrs: Vec<SocketAddr>,
     data_sock: UdpSocket,
-    peer_hosts: Vec<IpAddr>,
+    peer_addresses: Vec<SocketAddr>,
     strategy: Strategy,
     seed: u64,
 }
@@ -1170,7 +1171,7 @@ fn spawn_reflexive_probe(p: ReflexiveProbe) {
                 initiator: p.initiator,
                 external_addrs,
                 data_sock: p.data_sock,
-                peer_hosts: p.peer_hosts,
+                peer_addresses: p.peer_addresses,
                 strategy: p.strategy,
                 seed: p.seed,
             })
@@ -1213,14 +1214,13 @@ fn spawn_connect_punch(job: PunchJob) {
             }
             Some(Strategy::Direct) => punch_direct(data_sock, &peers, &cfg).await,
             Some(Strategy::SprayRandomPorts) => {
-                // The birthday primitives bind their own sockets; free the
-                // pre-bound one now so its FD/port can't collide with them.
-                drop(data_sock);
-                punch_spray(own_host, &hosts, &cfg, birthday, seed).await
+                // Keep the advertised socket: the peer opens return filters
+                // toward this exact endpoint.
+                punch_spray(data_sock, &hosts, &cfg, birthday, seed).await
             }
             Some(Strategy::OpenBirthdaySockets) => {
                 drop(data_sock);
-                punch_open(own_host, &hosts, &cfg, birthday, seed).await
+                punch_open(own_host, &peers, &cfg, birthday, seed).await
             }
             // Relay (symmetric↔symmetric: no direct path, and relaying is not
             // built by design) / no strategy.
@@ -1258,7 +1258,7 @@ fn spawn_accept_punch(job: AcceptJob) {
     let AcceptJob {
         data_sock,
         own_host,
-        peer_hosts,
+        peer_addresses,
         strategy,
         cfg,
         birthday,
@@ -1268,17 +1268,17 @@ fn spawn_accept_punch(job: AcceptJob) {
         events,
     } = job;
     tokio::spawn(async move {
+        let peer_hosts = candidate_hosts(&peer_addresses);
         let punch_start = Instant::now();
         let channel = match strategy {
             Strategy::Direct => punch_accept(data_sock, &peer_hosts, &cfg).await,
             Strategy::SprayRandomPorts => {
-                // Birthday primitives bind their own sockets (see connect side).
-                drop(data_sock);
-                punch_spray(own_host, &peer_hosts, &cfg, birthday, seed).await
+                // Preserve the advertised endpoint for the peer's filters.
+                punch_spray(data_sock, &peer_hosts, &cfg, birthday, seed).await
             }
             Strategy::OpenBirthdaySockets => {
                 drop(data_sock);
-                punch_open(own_host, &peer_hosts, &cfg, birthday, seed).await
+                punch_open(own_host, &peer_addresses, &cfg, birthday, seed).await
             }
             Strategy::Relay => {
                 drop(data_sock);
@@ -1629,31 +1629,28 @@ async fn punch_accept(
 /// The Consistent side of a birthday punch: spray random ports at every candidate
 /// host in `peer_hosts`.
 async fn punch_spray(
-    own_host: IpAddr,
+    socket: UdpSocket,
     peer_hosts: &[IpAddr],
     cfg: &PunchConfig,
     b: BirthdayParams,
     seed: u64,
 ) -> Option<Channel> {
-    let bind = SocketAddr::new(own_host, 0);
-    match puncher::spray_any(bind, peer_hosts, b.range, b.probes, seed, cfg).await {
+    match puncher::spray_socket_any(socket, peer_hosts, b.range, b.probes, seed, cfg).await {
         Ok(est) => connect_channel(est).await.ok().flatten(),
         Err(_) => None,
     }
 }
 
-/// The Random side of a birthday punch: open many sockets and await a probe from
-/// any of `peer_hosts`.
+/// The Random side: send from many sockets to the peer's candidate endpoints,
+/// then wait for a probe or acknowledgement on one of those mappings.
 async fn punch_open(
     own_host: IpAddr,
-    peer_hosts: &[IpAddr],
+    peers: &[SocketAddr],
     cfg: &PunchConfig,
     b: BirthdayParams,
     seed: u64,
 ) -> Option<Channel> {
-    match puncher::open_birthday_sockets_any(own_host, peer_hosts, b.range, b.sockets, seed, cfg)
-        .await
-    {
+    match puncher::open_birthday_sockets_any(own_host, peers, b.range, b.sockets, seed, cfg).await {
         Ok(est) => connect_channel(est).await.ok().flatten(),
         Err(_) => None,
     }

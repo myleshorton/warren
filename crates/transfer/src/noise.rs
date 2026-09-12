@@ -48,10 +48,10 @@
 //! datagrams carry distinct one-byte type tags, so delayed handshake traffic never
 //! enters the transport cipher.
 //!
-//! Warren's dialer always speaks first after connecting, so the responder promptly
-//! enters [`Link::recv`] and can answer a repeated message 3 if the completion ACK
-//! was lost. A future responder-first protocol must likewise drive `recv` while the
-//! dialer is awaiting that ACK, or move completion replay into a background task.
+//! Bare `NoiseLink` users must drive responder [`Link::recv`] while the dialer
+//! awaits the completion ACK, so a lost ACK can be replayed. The opt-in
+//! [`crate::next::Connection`] starts a bounded receive task immediately and
+//! handles this even before the application begins receiving.
 //!
 //! Handshake authentication failures are intentionally fatal, unlike invalid
 //! transport datagrams: snow's handshake state is not safely resumable after a
@@ -279,8 +279,27 @@ impl<T: Link> NoiseLink<T> {
         identity: &crypto::Keypair,
         target: NodeId,
     ) -> io::Result<NoiseLink<T>> {
+        Self::connect_inner(inner, identity, target, None).await
+    }
+
+    /// Authenticate the target and bind the transport to one DHT signaling session.
+    pub async fn connect_session(
+        inner: T,
+        identity: &crypto::Keypair,
+        target: NodeId,
+        session: [u8; 32],
+    ) -> io::Result<NoiseLink<T>> {
+        Self::connect_inner(inner, identity, target, Some(session)).await
+    }
+
+    async fn connect_inner(
+        inner: T,
+        identity: &crypto::Keypair,
+        target: NodeId,
+        session: Option<[u8; 32]>,
+    ) -> io::Result<NoiseLink<T>> {
         let statik = gen_static()?;
-        let mut hs = build(&statik.private, true)?;
+        let mut hs = build(&statik.private, true, session)?;
         let cert = NodeCert::create(identity, &statik.public, Role::Initiator)?.encode();
 
         let mut wbuf = [0u8; 2048];
@@ -358,8 +377,28 @@ impl<T: Link> NoiseLink<T> {
         inner: T,
         identity: &crypto::Keypair,
     ) -> io::Result<(NoiseLink<T>, NodeId)> {
+        Self::accept_inner(inner, identity, None, None).await
+    }
+
+    /// Require the identity named in the DHT offer before acknowledging the
+    /// handshake, and bind this transport to that offer's session.
+    pub async fn accept_session(
+        inner: T,
+        identity: &crypto::Keypair,
+        target: NodeId,
+        session: [u8; 32],
+    ) -> io::Result<(NoiseLink<T>, NodeId)> {
+        Self::accept_inner(inner, identity, Some(target), Some(session)).await
+    }
+
+    async fn accept_inner(
+        inner: T,
+        identity: &crypto::Keypair,
+        target: Option<NodeId>,
+        session: Option<[u8; 32]>,
+    ) -> io::Result<(NoiseLink<T>, NodeId)> {
         let statik = gen_static()?;
-        let mut hs = build(&statik.private, false)?;
+        let mut hs = build(&statik.private, false, session)?;
         let cert = NodeCert::create(identity, &statik.public, Role::Responder)?.encode();
 
         let mut wbuf = [0u8; 2048];
@@ -411,6 +450,12 @@ impl<T: Link> NoiseLink<T> {
 
         peer_cert.verify(&remote_static, Role::Initiator)?;
         let peer_id = NodeId::from_bytes(crypto::hash(&peer_cert.ed_pub));
+        if target.is_some_and(|expected| expected != peer_id) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Noise initiator differs from signaling author",
+            ));
+        }
         let ack = encrypt_transport(&noise, 0, ACK)?;
         inner.send(&ack).await?;
         let recv_buf = receive_buffer(&inner);
@@ -543,12 +588,21 @@ fn gen_static() -> io::Result<snow::Keypair> {
 }
 
 /// Build the `XX` handshake state with our generated static as the local private key.
-fn build(private: &[u8], initiator: bool) -> io::Result<snow::HandshakeState> {
+fn build(
+    private: &[u8],
+    initiator: bool,
+    session: Option<[u8; 32]>,
+) -> io::Result<snow::HandshakeState> {
     let params = PARAMS.parse().map_err(noise_err)?;
+    let mut prologue = PROLOGUE.to_vec();
+    if let Some(session) = session {
+        prologue.extend_from_slice(b"/dht-next-session/v1");
+        prologue.extend_from_slice(&session);
+    }
     let builder = snow::Builder::new(params)
         .local_private_key(private)
         .map_err(noise_err)?
-        .prologue(PROLOGUE)
+        .prologue(&prologue)
         .map_err(noise_err)?;
     if initiator {
         builder.build_initiator()

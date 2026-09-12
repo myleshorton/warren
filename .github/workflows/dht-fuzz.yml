@@ -1,0 +1,54 @@
+name: dht-fuzz
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'crates/dht-next/**'
+      - 'crates/driver/**'
+      - 'crates/puncher/**'
+      - 'crates/crypto/**'
+      - 'crates/wire/**'
+      - 'fuzz/**'
+      - '.github/workflows/dht-fuzz.yml'
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: packet
+            max_len: 19216
+          - target: signed-body
+            max_len: 1200
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-11
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: 'fuzz -> target'
+      - run: cargo install cargo-fuzz --version 0.13.2 --locked
+      - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
+      - run: python3 fuzz/seed_corpus.py
+      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=120 -max_len=${{ matrix.max_len }} -timeout=5
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: dht-fuzz-${{ matrix.target }}
+          path: fuzz/artifacts/
+          if-no-files-found: ignore
+
+  signaling-soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p driver --test next signaling_soak -- --ignored --nocapture

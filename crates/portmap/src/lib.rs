@@ -27,7 +27,9 @@ use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
+mod lease;
 mod upnp;
+pub use lease::{Gateway, Lease};
 pub use upnp::{map_port_upnp, UpnpError};
 
 /// The PCP (and NAT-PMP) server port on the gateway.
@@ -325,53 +327,101 @@ pub async fn map_port(
     internal_port: u16,
     lifetime: Duration,
 ) -> Result<Mapping, PcpError> {
-    // Bind to the unspecified address of the gateway's family and `connect`, so
-    // the OS picks the source IP of the interface that actually routes to the
-    // gateway. That source IP is the client address PCP wants in the request — a
-    // caller's own `local.ip()` might be a wildcard (`0.0.0.0`/`[::]`, which a
-    // gateway rejects) or the wrong interface on a multi-homed host. Connecting
-    // also filters received datagrams to the gateway for us.
-    let unspecified = if gateway.is_ipv4() {
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-    } else {
-        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-    };
-    let sock = UdpSocket::bind(SocketAddr::new(unspecified, 0)).await?;
-    sock.connect(gateway).await?;
-    let client_ip = as_v6(sock.local_addr()?.ip());
+    let mut lease = PcpLease::new(
+        gateway,
+        SocketAddr::new(
+            if gateway.is_ipv4() {
+                Ipv4Addr::UNSPECIFIED.into()
+            } else {
+                Ipv6Addr::UNSPECIFIED.into()
+            },
+            internal_port,
+        ),
+        lifetime,
+    )
+    .await?;
+    lease.renew().await
+}
 
-    let nonce = random_nonce();
-    // Clamp to at least 1s: PCP reads a zero lifetime as "delete the mapping", so
-    // a sub-second `lifetime` (which `as_secs` would truncate to 0) must not turn
-    // a map request into an unmap.
-    let secs = lifetime.as_secs().clamp(1, u32::MAX as u64) as u32;
-    let request = MapRequest::map_udp(nonce, internal_port, secs, client_ip).encode();
-
-    let mut buf = [0u8; 1100];
-    for attempt in 0..ATTEMPTS {
-        sock.send(&request).await?;
-        // Backoff 250ms, 500ms, 1s, ... between retransmits.
-        let wait = Duration::from_millis(250u64 << attempt);
-        match timeout(wait, recv_matching(&sock, &mut buf, &nonce)).await {
-            Ok(Ok(resp)) => {
-                if resp.result_code != RESULT_SUCCESS {
-                    return Err(PcpError::Rejected(resp.result_code));
-                }
-                let ip = resp
-                    .external_ip
-                    .to_ipv4_mapped()
-                    .map(IpAddr::V4)
-                    .unwrap_or(IpAddr::V6(resp.external_ip));
-                return Ok(Mapping {
-                    external: SocketAddr::new(ip, resp.external_port),
-                    lifetime: Duration::from_secs(resp.lifetime as u64),
-                });
-            }
-            Ok(Err(e)) => return Err(e), // socket error — not recoverable by retrying
-            Err(_) => continue,          // no answer in time — retransmit
+/// A PCP mapping transaction; renewals retain the mapping nonce and suggested
+/// external endpoint. The data socket itself remains owned by the caller.
+pub struct PcpLease {
+    socket: UdpSocket,
+    request: MapRequest,
+}
+impl PcpLease {
+    pub async fn new(
+        gateway: SocketAddr,
+        internal: SocketAddr,
+        lifetime: Duration,
+    ) -> Result<Self, PcpError> {
+        let unspecified: IpAddr = if gateway.is_ipv4() {
+            Ipv4Addr::UNSPECIFIED.into()
+        } else {
+            Ipv6Addr::UNSPECIFIED.into()
+        };
+        let socket = UdpSocket::bind(SocketAddr::new(unspecified, 0)).await?;
+        socket.connect(gateway).await?;
+        let client = socket.local_addr()?.ip();
+        if internal.port() == 0
+            || (!internal.ip().is_unspecified() && as_v6(internal.ip()) != as_v6(client))
+        {
+            return Err(PcpError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "data socket does not bind the gateway-facing interface",
+            )));
         }
+        let request = MapRequest::map_udp(
+            random_nonce(),
+            internal.port(),
+            lifetime.as_secs().clamp(1, u32::MAX as u64) as u32,
+            as_v6(client),
+        );
+        Ok(Self { socket, request })
     }
-    Err(PcpError::Timeout)
+    pub async fn renew(&mut self) -> Result<Mapping, PcpError> {
+        let response = self.exchange().await?;
+        if response.lifetime == 0
+            || response.external_port == 0
+            || response.external_ip.is_unspecified()
+            || response.external_ip.is_multicast()
+        {
+            return Err(PcpError::Malformed);
+        }
+        self.request.suggested_external_ip = response.external_ip;
+        self.request.suggested_external_port = response.external_port;
+        let ip = response
+            .external_ip
+            .to_ipv4_mapped()
+            .map_or(IpAddr::V6(response.external_ip), IpAddr::V4);
+        Ok(Mapping {
+            external: SocketAddr::new(ip, response.external_port),
+            lifetime: Duration::from_secs(response.lifetime as u64),
+        })
+    }
+    pub async fn remove(&mut self) -> Result<(), PcpError> {
+        self.request.lifetime = 0;
+        self.exchange().await.map(|_| ())
+    }
+    async fn exchange(&self) -> Result<MapResponse, PcpError> {
+        let request = self.request.encode();
+        let mut bytes = [0; 1100];
+        for attempt in 0..ATTEMPTS {
+            self.socket.send(&request).await?;
+            match timeout(
+                Duration::from_millis(250 << attempt),
+                recv_matching(&self.socket, &mut bytes, &self.request),
+            )
+            .await
+            {
+                Ok(Ok(response)) if response.result_code == RESULT_SUCCESS => return Ok(response),
+                Ok(Ok(response)) => return Err(PcpError::Rejected(response.result_code)),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {}
+            }
+        }
+        Err(PcpError::Timeout)
+    }
 }
 
 /// Receive datagrams (from the connected gateway) until one is a PCP MAP response
@@ -379,12 +429,15 @@ pub async fn map_port(
 async fn recv_matching(
     sock: &UdpSocket,
     buf: &mut [u8],
-    nonce: &[u8; NONCE_LEN],
+    request: &MapRequest,
 ) -> Result<MapResponse, PcpError> {
     loop {
         let n = sock.recv(buf).await?; // connected: only the gateway's datagrams
         if let Ok(resp) = MapResponse::decode(&buf[..n]) {
-            if resp.nonce == *nonce {
+            if resp.nonce == request.nonce
+                && resp.protocol == request.protocol
+                && resp.internal_port == request.internal_port
+            {
                 return Ok(resp);
             }
         }
@@ -610,5 +663,57 @@ mod tests {
             mapping.external,
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77)), 40004)
         );
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+    #[tokio::test]
+    async fn pcp_renewal_reuses_nonce_and_delete_targets_the_granted_endpoint() {
+        let gateway = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = gateway.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let mut bytes = [0; 128];
+            let mut nonce = None;
+            for round in 0..3 {
+                let (len, from) = gateway.recv_from(&mut bytes).await.unwrap();
+                let request = MapRequest::decode(&bytes[..len]).unwrap();
+                assert_eq!(request.internal_port, 12345);
+                if let Some(nonce) = nonce {
+                    assert_eq!(request.nonce, nonce);
+                } else {
+                    nonce = Some(request.nonce);
+                }
+                if round > 0 {
+                    assert_eq!(request.suggested_external_port, 54321);
+                }
+                assert_eq!(request.lifetime, if round == 2 { 0 } else { 600 });
+                let mut response = MapResponse {
+                    result_code: 0,
+                    lifetime: request.lifetime,
+                    epoch: if round == 1 { 0 } else { 100 },
+                    nonce: request.nonce,
+                    protocol: 6,
+                    internal_port: request.internal_port,
+                    external_port: 54321,
+                    external_ip: Ipv4Addr::new(8, 8, 4, 4).to_ipv6_mapped(),
+                };
+                gateway.send_to(&response.encode(), from).await.unwrap();
+                response.protocol = 17;
+                gateway.send_to(&response.encode(), from).await.unwrap();
+            }
+        });
+        let mut lease = PcpLease::new(
+            address,
+            "127.0.0.1:12345".parse().unwrap(),
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        let first = lease.renew().await.unwrap();
+        assert_eq!(first, lease.renew().await.unwrap());
+        lease.remove().await.unwrap();
+        server.await.unwrap();
     }
 }

@@ -65,6 +65,7 @@ use tokio::time::{sleep, timeout, Instant};
 
 pub use frame::MAX_MESSAGE;
 pub use noise::NoiseLink;
+pub mod next;
 
 /// Largest datagram we'll read into the receive buffer — UDP's theoretical
 /// maximum payload on **both** IPv4 and IPv6 (65535 − 40-byte IPv6 header −
@@ -336,6 +337,17 @@ pub async fn replicate_feed<L: Link>(
     appended: &tokio::sync::Notify,
     cfg: &Config,
 ) -> Result<(), TransferError> {
+    replicate_feed_with_progress(channel, public_key, into, appended, cfg, || {}).await
+}
+
+pub(crate) async fn replicate_feed_with_progress<L: Link>(
+    channel: &mut L,
+    public_key: PublicKey,
+    into: &std::sync::Mutex<feed::Replica>,
+    appended: &tokio::sync::Notify,
+    cfg: &Config,
+    mut progress: impl FnMut(),
+) -> Result<(), TransferError> {
     let mut wire = Wire::new(
         channel,
         cfg.initial_rtt,
@@ -359,6 +371,7 @@ pub async fn replicate_feed<L: Link>(
                 appended.notify_waiters(); // wake subscribers tailing *this* mirror
             }
         }
+        progress();
     }
 }
 
@@ -370,6 +383,17 @@ pub async fn download_blob<L: Link>(
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
     let mut dl = BlobDownload::new(id);
+    resume_blob(channel, &mut dl, cfg).await
+}
+
+/// Continue a verified blob download on a fresh link. Transport counters restart;
+/// accepted manifest/chunks remain in `download`, including after cancellation.
+pub async fn resume_blob<L: Link>(
+    channel: &mut L,
+    download: &mut BlobDownload,
+    cfg: &Config,
+) -> Result<Vec<u8>, TransferError> {
+    let dl = download;
     let mut wire = Wire::new(
         channel,
         cfg.initial_rtt,
@@ -1330,6 +1354,28 @@ mod tests {
         (client, server)
     }
 
+    #[tokio::test]
+    async fn noise_ignores_queued_punch_controls_on_both_sides() {
+        let (client_link, server_link) = lossy_pair(&[], &[]);
+        for _ in 0..32 {
+            client_link.tx.send(vec![puncher::PROBE]).unwrap();
+            server_link.tx.send(vec![puncher::ACK]).unwrap();
+        }
+        let client_key = Keypair::from_seed(&[191; 32]);
+        let server_key = Keypair::from_seed(&[192; 32]);
+        let (client, server) = tokio::join!(
+            NoiseLink::connect(client_link, &client_key, node_id_of(&server_key)),
+            NoiseLink::accept(server_link, &server_key),
+        );
+        let client = client.unwrap();
+        let (server, identity) = server.unwrap();
+        assert_eq!(identity, node_id_of(&client_key));
+        client.send(b"authenticated").await.unwrap();
+        let mut bytes = [0; 32];
+        let n = server.recv(&mut bytes).await.unwrap();
+        assert_eq!(&bytes[..n], b"authenticated");
+    }
+
     fn fast_cfg() -> Config {
         Config {
             request_timeout: Duration::from_millis(50),
@@ -1510,6 +1556,32 @@ mod tests {
             expected,
             "the feed round-trips byte-for-byte through the encrypted channel"
         );
+    }
+
+    #[tokio::test]
+    async fn noise_session_rejects_an_initiator_other_than_the_signaling_author() {
+        let client = Keypair::from_seed(&[0x11; 32]);
+        let server = Keypair::from_seed(&[0x22; 32]);
+        let impostor = Keypair::from_seed(&[0x33; 32]);
+        let (left, right) = lossy_pair(&[], &[]);
+        let (a, b) = tokio::join!(
+            NoiseLink::connect_session(left, &impostor, node_id_of(&server), [4; 32]),
+            NoiseLink::accept_session(right, &server, node_id_of(&client), [4; 32]),
+        );
+        assert!(a.is_err());
+        assert!(matches!(b, Err(error) if error.kind() == io::ErrorKind::PermissionDenied));
+    }
+
+    #[tokio::test]
+    async fn noise_session_rejects_crossed_signaling_sessions() {
+        let client = Keypair::from_seed(&[0x11; 32]);
+        let server = Keypair::from_seed(&[0x22; 32]);
+        let (left, right) = lossy_pair(&[], &[]);
+        let (a, b) = tokio::join!(
+            NoiseLink::connect_session(left, &client, node_id_of(&server), [4; 32]),
+            NoiseLink::accept_session(right, &server, node_id_of(&client), [5; 32]),
+        );
+        assert!(a.is_err() && b.is_err());
     }
 
     #[tokio::test]

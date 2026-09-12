@@ -14,6 +14,10 @@ pub enum WireError {
     #[error("varint overflows u64")]
     Overflow,
 
+    /// Strict decoding encountered a varint longer than its minimal representation.
+    #[error("non-canonical varint")]
+    NonCanonicalVarint,
+
     /// A length prefix claimed more bytes than the buffer could ever hold.
     #[error("length prefix {len} exceeds remaining buffer {remaining}")]
     LengthTooLarge { len: u64, remaining: usize },

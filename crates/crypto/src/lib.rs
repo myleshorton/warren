@@ -175,6 +175,14 @@ impl PublicKey {
             .map_err(|_| CryptoError::VerificationFailed)
     }
 
+    /// Verify with rejection of small-order points and noncanonical signatures.
+    pub fn verify_strict(&self, message: &[u8], signature: &Signature) -> Result<(), CryptoError> {
+        let sig = ed25519_dalek::Signature::from_bytes(&signature.0);
+        self.0
+            .verify_strict(message, &sig)
+            .map_err(|_| CryptoError::VerificationFailed)
+    }
+
     /// Derive the discovery key: a topic id announceable without conferring the
     /// ability to read whatever this key protects.
     ///
@@ -266,6 +274,23 @@ impl core::fmt::Debug for Signature {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_verification_rejects_small_order_identity_forgery() {
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        let key = PublicKey::from_bytes(&identity).unwrap();
+        let mut signature = [0; 64];
+        signature[0] = 1;
+        assert!(key
+            .verify_strict(b"arbitrary", &Signature::from_bytes(signature))
+            .is_err());
+        let signer = Keypair::from_seed(&[42; 32]);
+        assert!(signer
+            .public()
+            .verify_strict(b"real", &signer.sign(b"real"))
+            .is_ok());
+    }
 
     // RFC 8032, Test 1: seed -> public key derivation. This pins our identity
     // scheme to the standard; a wrong derivation fails here immediately.

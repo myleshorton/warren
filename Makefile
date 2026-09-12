@@ -9,6 +9,7 @@ build:
 
 test:
 	cargo test --workspace --all-targets
+	cargo test -p dht-next --features test-support
 
 # Property/roundtrip suites can be scaled up locally for deeper fuzzing.
 test-deep:

@@ -283,6 +283,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dht-next"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "crypto",
+ "proptest",
+ "routing-types",
+ "snow",
+ "swarm",
+ "wire",
+ "zeroize",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -298,6 +312,7 @@ name = "driver"
 version = "0.0.0"
 dependencies = [
  "crypto",
+ "dht-next",
  "portmap",
  "puncher",
  "socket2",
@@ -597,6 +612,8 @@ dependencies = [
 name = "puncher"
 version = "0.0.0"
 dependencies = [
+ "socket2",
+ "swarm",
  "tokio",
 ]
 
@@ -702,6 +719,10 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "routing-types"
+version = "0.0.0"
 
 [[package]]
 name = "rustc_version"
@@ -861,6 +882,7 @@ version = "0.0.0"
 dependencies = [
  "crypto",
  "proptest",
+ "routing-types",
  "thiserror",
  "wire",
 ]
@@ -953,8 +975,10 @@ version = "0.0.0"
 dependencies = [
  "blob",
  "crypto",
+ "dht-next",
  "driver",
  "feed",
+ "puncher",
  "snow",
  "swarm",
  "sync",

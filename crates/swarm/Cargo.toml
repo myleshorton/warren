@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+routing-types = { path = "../routing-types" }
 wire = { path = "../wire" }
 crypto = { path = "../crypto" }
 thiserror.workspace = true

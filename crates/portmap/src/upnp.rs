@@ -125,6 +125,27 @@ pub(crate) async fn discover_location() -> Result<String, UpnpError> {
     }
 }
 
+pub(crate) async fn remove_via_location(location: &str, port: u16) -> Result<(), UpnpError> {
+    let (status, xml) = http_request("GET", location, &[], "").await?;
+    if status != 200 {
+        return Err(UpnpError::Http(status));
+    }
+    let service = parse_igd_service(&xml).ok_or(UpnpError::BadDescription)?;
+    let control = resolve_url(location, &service.control_url).ok_or(UpnpError::BadDescription)?;
+    if !same_http_origin(location, &control) {
+        return Err(UpnpError::UntrustedControlUrl);
+    }
+    let args = format!("<NewRemoteHost></NewRemoteHost><NewExternalPort>{port}</NewExternalPort><NewProtocol>UDP</NewProtocol>");
+    soap_call(
+        &control,
+        &service.service_type,
+        "DeletePortMapping",
+        &soap_body(&service.service_type, "DeletePortMapping", &args),
+    )
+    .await?;
+    Ok(())
+}
+
 /// Given a device-description URL, add the mapping and return the external address.
 pub(crate) async fn map_via_location(
     location: &str,
@@ -132,6 +153,22 @@ pub(crate) async fn map_via_location(
     lifetime: Duration,
     description: &str,
 ) -> Result<Mapping, UpnpError> {
+    map_for_socket(
+        location,
+        SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), internal_port),
+        lifetime,
+        description,
+    )
+    .await
+}
+
+pub(crate) async fn map_for_socket(
+    location: &str,
+    internal: SocketAddr,
+    lifetime: Duration,
+    description: &str,
+) -> Result<Mapping, UpnpError> {
+    let internal_port = internal.port();
     let (status, xml) = http_request("GET", location, &[], "").await?;
     if status != 200 {
         return Err(UpnpError::Http(status));
@@ -152,6 +189,9 @@ pub(crate) async fn map_via_location(
     // Our LAN address on the interface toward the gateway — the internal client
     // the mapping forwards to.
     let internal_client = local_ip_towards(&host).await?;
+    if internal_port == 0 || (!internal.ip().is_unspecified() && internal.ip() != internal_client) {
+        return Err(UpnpError::Malformed);
+    }
 
     // IGDv1 lease is a u32 of seconds. Clamp to at least 1s: a gateway reads 0 as
     // "until reboot", so a sub-second Duration truncating to 0 would silently
@@ -707,6 +747,28 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn managed_upnp_lease_renews_and_removes_on_the_same_gateway() {
+        let addr = fake_igd("8.8.4.4").await;
+        let gateway = crate::Gateway::Upnp(format!("http://{addr}/root.xml"));
+        let (mut lease, first) = crate::Lease::acquire(
+            &gateway,
+            "127.0.0.1:40000".parse().unwrap(),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert_eq!(lease.renew().await.unwrap(), first);
+        lease.remove().await.unwrap();
+        assert!(crate::Lease::acquire(
+            &gateway,
+            "[::1]:40000".parse().unwrap(),
+            Duration::from_secs(60)
+        )
+        .await
+        .is_err());
     }
 
     #[tokio::test]

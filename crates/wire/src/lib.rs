@@ -118,12 +118,27 @@ impl Encoder {
 pub struct Decoder<'a> {
     buf: &'a [u8],
     pos: usize,
+    canonical: bool,
 }
 
 impl<'a> Decoder<'a> {
     /// Wrap a buffer for reading.
     pub fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            canonical: false,
+        }
+    }
+
+    /// Reject non-minimal LEB128 encodings, including byte-slice length prefixes.
+    /// `new` retains permissive decoding for existing protocols.
+    pub fn canonical(buf: &'a [u8]) -> Self {
+        Self {
+            buf,
+            pos: 0,
+            canonical: true,
+        }
     }
 
     /// Byte offset of the cursor.
@@ -156,6 +171,9 @@ impl<'a> Decoder<'a> {
     /// Read an unsigned LEB128 varint.
     pub fn uint(&mut self) -> Result<u64> {
         let (value, used) = decode_uint(&self.buf[self.pos..])?;
+        if self.canonical && used != encoded_len(value) {
+            return Err(WireError::NonCanonicalVarint);
+        }
         self.pos += used;
         Ok(value)
     }
@@ -219,6 +237,30 @@ impl<'a> Decoder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_decoder_rejects_redundant_lengths_without_changing_legacy_decoding() {
+        for (bytes, expected) in [
+            (vec![0x80, 0], 0),
+            (vec![0x81, 0], 1),
+            (vec![0xff, 0], 127),
+            (vec![0x80, 0x81, 0], 128),
+        ] {
+            assert_eq!(Decoder::new(&bytes).uint(), Ok(expected));
+            let mut strict = Decoder::canonical(&bytes);
+            assert_eq!(strict.uint(), Err(WireError::NonCanonicalVarint));
+            assert_eq!(strict.position(), 0);
+        }
+        for value in [0, 1, 127, 128, 16383, 16384, u64::MAX] {
+            let mut encoded = Encoder::new();
+            encoded.uint(value);
+            assert_eq!(Decoder::canonical(encoded.as_slice()).uint(), Ok(value));
+        }
+        assert_eq!(
+            Decoder::canonical(&[0x81, 0, b'x']).bytes(),
+            Err(WireError::NonCanonicalVarint)
+        );
+    }
 
     #[test]
     fn varint_boundaries_roundtrip() {

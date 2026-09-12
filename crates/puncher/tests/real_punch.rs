@@ -1,17 +1,13 @@
 //! Hole punching over real `tokio` UDP sockets on loopback.
 //!
-//! The direct case is fully faithful (no NAT changes a direct dial). The
-//! birthday case reproduces a symmetric NAT's essential property on one host:
-//! the random side binds many sockets to unpredictable ports and never sends
-//! first, so the spraying side can't observe them and must find one by chance —
-//! a real port-collision search over real sockets, governed by the same
-//! birthday math the `swarm` model verifies.
+//! These verify socket ownership and bidirectional traffic. Loopback does not
+//! model NAT filtering; restrictive mappings and birthday collisions are checked
+//! by the deterministic packet-network tests in `rendezvous_network.rs`.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 use puncher::{
-    accept, accept_any, connect_to, connect_to_any, open_birthday_sockets, spray, Config,
-    Established,
+    accept, accept_any, connect_to, connect_to_any, open_birthday_sockets, Config, Established,
 };
 use tokio::net::UdpSocket;
 use tokio::time::{timeout, Duration};
@@ -148,12 +144,16 @@ async fn birthday_punch_over_real_sockets() {
     // both common OS ephemeral ranges (Linux 32768+, macOS 49152+), so parallel
     // tests' ephemeral sockets don't land in it. spray also skips its own port
     // and only accepts a control reply from the target host, so a stray hit on
-    // an unrelated socket can't establish. The collision is real UDP.
+    // an unrelated socket can't establish. Outbound probes may establish early
+    // on loopback; the packet-network suite separately verifies collisions.
     let range = (20_000u16, 30_000u16);
     let cfg = Config::fast();
 
-    let random = open_birthday_sockets(LO, LO, range, 256, 0xB1_2345, &cfg);
-    let consistent = spray(addr(0), LO, range, 5_000, 0x5B_9876, &cfg);
+    let socket = UdpSocket::bind(addr(0)).await.unwrap();
+    let peer = socket.local_addr().unwrap();
+    let random = open_birthday_sockets(LO, peer, range, 256, 0xB1_2345, &cfg);
+    let hosts = [LO];
+    let consistent = puncher::spray_socket_any(socket, &hosts, range, 5_000, 0x5B_9876, &cfg);
 
     let (rr, rc) = tokio::join!(random, consistent);
     let r = rr
@@ -260,4 +260,57 @@ async fn accept_any_honors_any_listed_host() {
     let c = rc.unwrap().expect("client connects");
     assert_eq!(c.peer, server_addr);
     assert_bidirectional(&c, &s).await;
+}
+
+#[tokio::test]
+async fn every_birthday_socket_sends_to_the_advertised_peer_before_accepting() {
+    let peer = UdpSocket::bind(addr(0)).await.unwrap();
+    let destination = peer.local_addr().unwrap();
+    let cfg = Config {
+        overall: Duration::from_secs(2),
+        probe_interval: Duration::from_millis(50),
+    };
+    let opening = tokio::spawn(async move {
+        open_birthday_sockets(LO, destination, (20_000, 30_000), 4, 123, &cfg).await
+    });
+    let mut sources = std::collections::BTreeSet::new();
+    timeout(Duration::from_secs(1), async {
+        let mut bytes = [0; 64];
+        while sources.len() < 4 {
+            let (len, source) = peer.recv_from(&mut bytes).await.unwrap();
+            assert_eq!(&bytes[..len], &[puncher::PROBE]);
+            sources.insert(source);
+        }
+    })
+    .await
+    .expect("each bound socket must create an outgoing mapping");
+    let selected = *sources.first().unwrap();
+    peer.send_to(&[puncher::ACK], selected).await.unwrap();
+    let established = opening.await.unwrap().unwrap().unwrap();
+    assert_eq!(established.socket.local_addr().unwrap(), selected);
+    assert_eq!(established.peer, destination);
+}
+
+#[tokio::test]
+async fn birthday_probes_are_bounded_when_the_peer_never_replies() {
+    let peer = UdpSocket::bind(addr(0)).await.unwrap();
+    let endpoint = peer.local_addr().unwrap();
+    let cfg = Config {
+        overall: Duration::from_millis(900),
+        probe_interval: Duration::from_millis(1),
+    };
+    let attempt = tokio::spawn(async move {
+        open_birthday_sockets(LO, endpoint, (20000, 60000), 4, 912, &cfg)
+            .await
+            .unwrap()
+    });
+    let mut packets = 0;
+    let mut buf = [0; 16];
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1100);
+    while let Ok(Ok((n, _))) = tokio::time::timeout_at(deadline, peer.recv_from(&mut buf)).await {
+        assert_eq!(&buf[..n], &[puncher::PROBE]);
+        packets += 1;
+    }
+    assert!(attempt.await.unwrap().is_none());
+    assert!((4..=12).contains(&packets), "{packets} probes");
 }

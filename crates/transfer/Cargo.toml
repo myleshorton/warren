@@ -8,6 +8,8 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+puncher = { path = "../puncher" }
+dht-next = { path = "../dht-next" }
 crypto = { path = "../crypto" }
 feed = { path = "../feed" }
 blob = { path = "../blob" }
@@ -23,7 +25,7 @@ snow = "0.10"
 thiserror.workspace = true
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync", "test-util"] }
 
 [[example]]
 name = "stream"

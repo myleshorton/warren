@@ -21,4 +21,5 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --all-targets
+      - run: cargo test -p dht-next --features test-support
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps

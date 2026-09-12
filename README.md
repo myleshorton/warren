@@ -11,6 +11,41 @@ the system's advantages and its censorship threat model are in
 This repo is built layer by layer, and **every layer ships with the means to
 verify it**. Correctness is not asserted; it is demonstrated.
 
+## Experimental replacement DHT
+
+[`dht-next`](docs/dht-next.md) develops a new, signed DHT protocol alongside the
+existing core. It includes reusable address validation, adaptive lookup timing,
+compact peer sessions, and **end-to-end encrypted DHT signaling** through independent
+coordinators, with [automatic failover](docs/benchmarks/dht-failover-comparison.md)
+across supplied registrations. Providers can use [automatic publication](docs/dht-next.md#automatic-publication-and-coordinator-discovery)
+to discover coordinators, replace failed candidates, and renew their leases.
+Opt-in [routing maintenance](docs/dht-next.md#routing-liveness-and-replacements) keeps
+quiet contacts alive, revalidates cached replacements, and explores randomized bucket targets.
+Default [routing admission quotas](docs/dht-next.md#routing-admission-diversity) limit
+IP and network-prefix concentration in routes, replacement caches, and lookup candidates.
+Lookups also track referral ancestry, bound each seed’s descendants, and balance
+requests across available discovery chains. [Encrypted-signaling measurements](docs/benchmarks/dht-encrypted-signaling-comparison.md)
+track confidentiality overhead. [Measured session tradeoffs](docs/benchmarks/dht-session-comparison.md)
+include lower signaling bandwidth and higher cold-lookup overhead.
+The replacement also supports [immutable and signed mutable storage](docs/dht-next.md#immutable-and-signed-mutable-storage),
+provider pagination, per-source resource limits, and signaling-key rotation.
+[`driver::next::Node`](docs/dht-next.md#explicit-udp-driver) runs it over dual-stack UDP
+and provides three-replica writes and [integrated value lookup](docs/dht-next.md#integrated-value-traversal).
+Opt-in managed values renew signed leases, verify writes through readback, and audit
+and repair replicas after holder loss;
+status exposes the current signed value for application-owned restart storage.
+[`transfer::next::Endpoint`](docs/dht-next.md#public-key-connections-and-authenticated-transfers)
+connects by public key through encrypted DHT signaling, direct candidate nomination,
+and identity/session-bound Noise. Its authenticated links support existing feed/blob transfers.
+Optional PCP/UPnP maps the data socket, renews finite router leases, and detects
+expiry or endpoint changes so connections can recover through DHT signaling.
+[Network recovery](docs/dht-next.md#network-changes-and-resumable-transfers) rebinds
+and republishes on platform notifications, then resumes verified transfers through fresh sessions.
+Run `cargo run -p transfer --example dht_connect` for an isolated connection/recovery example.
+The legacy `driver::Node` still uses `swarm`; data-plane migration remains separate.
+See the [topology evaluation](docs/benchmarks/dht-topology.md) and
+[HyperDHT/libtorrent comparison](docs/benchmarks/dht-value-lookup-comparison.md).
+
 ## Verify
 
 One command runs the same gate CI runs:

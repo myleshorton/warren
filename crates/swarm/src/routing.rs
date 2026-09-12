@@ -15,6 +15,7 @@
 //! [`insert`]: RoutingTable::insert
 
 use crate::id::{NodeId, ID_LEN};
+#[cfg(test)]
 use std::net::SocketAddr;
 
 /// Bucket capacity — the Kademlia replication parameter.
@@ -26,21 +27,7 @@ pub const K: usize = 20;
 /// anything — so eviction only removes a peer that has genuinely gone away.
 pub const EVICTION_THRESHOLD: u8 = 3;
 
-/// A known peer: its id and where to reach it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Contact {
-    /// The peer's node id.
-    pub id: NodeId,
-    /// The peer's socket address.
-    pub addr: SocketAddr,
-}
-
-impl Contact {
-    /// Create a contact.
-    pub fn new(id: NodeId, addr: SocketAddr) -> Self {
-        Self { id, addr }
-    }
-}
+pub use routing_types::Contact;
 
 /// A stored contact plus its liveness bookkeeping. The failure counter is
 /// table-internal — `closest`/`contains` hand callers bare [`Contact`]s, so it

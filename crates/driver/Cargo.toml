@@ -8,6 +8,7 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+dht-next = { path = "../dht-next" }
 swarm = { path = "../swarm" }
 crypto = { path = "../crypto" }
 puncher = { path = "../puncher" }
@@ -16,6 +17,7 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sy
 socket2 = "0.6"
 
 [dev-dependencies]
+dht-next = { path = "../dht-next", features = ["test-support"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "test-util"] }
 
 [[example]]

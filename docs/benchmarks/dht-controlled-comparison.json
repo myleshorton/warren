@@ -1,0 +1,132 @@
+{
+  "utc": "2026-09-11T15:48:38.970718+00:00",
+  "controlled": true,
+  "platform": "macOS-26.5.1-arm64-arm-64bit-Mach-O",
+  "machine": "arm64",
+  "trials": 12,
+  "commands": [
+    {
+      "argv": [
+        "/Users/afisk/go/src/github.com/myleshorton/warren/target/release/examples/compare_dht",
+        "9",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "3"
+      }
+    },
+    {
+      "argv": [
+        "/Users/afisk/go/src/github.com/myleshorton/warren/target/release/examples/compare_dht",
+        "9",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "8"
+      }
+    },
+    {
+      "argv": [
+        "/Users/afisk/go/src/github.com/myleshorton/warren/target/release/examples/compare_dht",
+        "9",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "8",
+        "DHT_DEDICATED": "1"
+      }
+    },
+    {
+      "argv": [
+        "node",
+        "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/hyperdht_controlled.mjs",
+        "9",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "8"
+      }
+    },
+    {
+      "argv": [
+        "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/.venv/bin/python",
+        "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/libtorrent_bench.py",
+        "9",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "8"
+      }
+    },
+    {
+      "argv": [
+        "/Users/afisk/go/src/github.com/myleshorton/warren/target/release/examples/compare_dht",
+        "33",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "3"
+      }
+    },
+    {
+      "argv": [
+        "/Users/afisk/go/src/github.com/myleshorton/warren/target/release/examples/compare_dht",
+        "33",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "8"
+      }
+    },
+    {
+      "argv": [
+        "/Users/afisk/go/src/github.com/myleshorton/warren/target/release/examples/compare_dht",
+        "33",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "8",
+        "DHT_DEDICATED": "1"
+      }
+    },
+    {
+      "argv": [
+        "node",
+        "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/hyperdht_controlled.mjs",
+        "33",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "8"
+      }
+    },
+    {
+      "argv": [
+        "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/.venv/bin/python",
+        "/Users/afisk/go/src/github.com/myleshorton/warren/tools/dht-compare/libtorrent_bench.py",
+        "33",
+        "12"
+      ],
+      "env": {
+        "DHT_CONTROLLED": "1",
+        "DHT_REPLICAS": "8"
+      }
+    }
+  ],
+  "source_sha256": {
+    "crates/driver/examples/compare_dht.rs": "6952deaa12a877e78275cbc1af118f855a3b2df4c02843930c6d8882dab691e5",
+    "tools/dht-compare/hyperdht_controlled.mjs": "f427d6c7d0d7fd6b735ce790789b8980a91fc0d5c54366f1fc47906fbccf3592",
+    "tools/dht-compare/libtorrent_bench.py": "f55695f3523591eef4d001947bc16f18c8a7878b75206620ac11565857284484",
+    "tools/dht-compare/run.py": "9125e2dff4571e382840e206050455d971a0f0e92e4d69f8caef2aa71ddd23fc"
+  },
+  "warren_binary_sha256": "a38a80ba31677ce33306bf73469fe7de6382700704ce3eb3423c33793623be29"
+}

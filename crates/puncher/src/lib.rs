@@ -8,8 +8,8 @@
 //! - [`connect_to`] / [`accept`] — simultaneous open or dial between predictable
 //!   endpoints.
 //! - [`open_birthday_sockets`] / [`spray`] — the one-sided-random birthday
-//!   punch: the random peer opens many sockets and listens (its ports are
-//!   unpredictable, as a symmetric NAT's would be); the predictable peer sprays
+//!   punch: the random peer opens many sockets and sends from each to create
+//!   return mappings, then listens; the predictable peer sprays
 //!   the port space until a probe collides.
 //!
 //! Each primitive has an `_any` form ([`connect_to_any`], [`accept_any`],
@@ -20,8 +20,13 @@
 //! Establishment uses a tiny probe handshake: a [`PROBE`] byte, answered by an
 //! [`ACK`]. Receiving either from the peer means that socket has a working path.
 //!
-//! Not yet here (needs a router, so it can't run in CI): UPnP/NAT-PMP/PCP port
-//! mapping. Reflexive-address discovery lives with the DHT's NAT sampling.
+//! Gateway mapping is implemented by `portmap` and integrated in the DHT driver.
+//! Reflexive-address discovery uses authenticated DHT reflection.
+
+mod rendezvous;
+pub use rendezvous::{
+    nat_strategy, rendezvous, rendezvous_reply, rendezvous_with_strategy, NatStrategy,
+};
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -31,6 +36,49 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::task::JoinSet;
 use tokio::time::{sleep_until, timeout, Instant};
+
+fn ephemeral_port() -> io::Result<u16> {
+    let reservation = std::net::UdpSocket::bind("0.0.0.0:0")?;
+    Ok(reservation.local_addr()?.port())
+}
+/// Bind a nonblocking UDP socket, supporting both families for IPv6 wildcard binds.
+/// Ephemeral dual-stack ports retry cross-family conflicts; explicit ports are preserved.
+/// Call from a Tokio runtime.
+pub fn bind_udp(addr: SocketAddr) -> io::Result<UdpSocket> {
+    bind_udp_with_port_picker(addr, ephemeral_port)
+}
+fn bind_udp_with_port_picker(
+    addr: SocketAddr,
+    mut pick_port: impl FnMut() -> io::Result<u16>,
+) -> io::Result<UdpSocket> {
+    let dual_stack_ephemeral = addr.is_ipv6() && addr.ip().is_unspecified() && addr.port() == 0;
+    for _ in 0..16 {
+        let mut selected = addr;
+        if dual_stack_ephemeral {
+            // Some kernels allocate IPv6 port zero over an occupied IPv4 port.
+            // An explicit bind checks conflicts; retry if a racer takes the port.
+            selected.set_port(pick_port()?);
+        }
+        let raw = socket2::Socket::new(
+            socket2::Domain::for_address(selected),
+            socket2::Type::DGRAM,
+            Some(socket2::Protocol::UDP),
+        )?;
+        if selected.is_ipv6() {
+            raw.set_only_v6(false)?;
+        }
+        raw.set_nonblocking(true)?;
+        match raw.bind(&selected.into()) {
+            Ok(()) => return UdpSocket::from_std(raw.into()),
+            Err(error) if dual_stack_ephemeral && error.kind() == io::ErrorKind::AddrInUse => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AddrInUse,
+        "no free dual-stack UDP port after 16 attempts",
+    ))
+}
 
 /// Small deterministic PRNG (SplitMix64) for picking spray/bind ports. Inlined
 /// so this real-socket crate needn't depend on `swarm` (nor its simulator).
@@ -228,39 +276,34 @@ pub async fn accept_any(
     }
 }
 
-/// The random side of a one-sided-random punch: bind `count` sockets to
-/// unpredictable ports in `range` on `host` and listen for a probe from
-/// `peer_host`. Because we never send first, our ports are unobservable to the
-/// peer — the peer must find one by spraying. Returns the socket that first
-/// receives a probe from `peer_host`.
-///
-/// Only probes from `peer_host` are honored, so on a non-loopback bind an
-/// unrelated host can't hijack a socket by guessing a port.
-///
-/// `range` is half-open, `[range.0, range.1)`. Panics if not
-/// `1 <= range.0 < range.1`.
+/// Open `count` sockets and send probes from each to the peer's advertised
+/// endpoint, creating mappings and return-filter allowances before listening.
+/// Controls prove no identity; authenticate the resulting channel separately.
+/// `range` is half-open; panics unless `1 <= range.0 < range.1`.
 pub async fn open_birthday_sockets(
     host: IpAddr,
-    peer_host: IpAddr,
+    peer: SocketAddr,
     range: (u16, u16),
     count: usize,
     seed: u64,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
-    open_birthday_sockets_any(host, &[peer_host], range, count, seed, cfg).await
+    open_birthday_sockets_any(host, &[peer], range, count, seed, cfg).await
 }
 
-/// Like [`open_birthday_sockets`], but honors a probe from *any* of `peer_hosts`
-/// — the distinct hosts among the peer's advertised candidates.
+/// Like [`open_birthday_sockets`], but opens return mappings to all advertised
+/// peer endpoints and accepts controls from their IPs.
+/// Each socket sends at most three probes per endpoint, at least 250 ms apart,
+/// then only listens until the overall deadline.
 pub async fn open_birthday_sockets_any(
     host: IpAddr,
-    peer_hosts: &[IpAddr],
+    peers: &[SocketAddr],
     range: (u16, u16),
     count: usize,
     seed: u64,
     cfg: &Config,
 ) -> io::Result<Option<Established>> {
-    if peer_hosts.is_empty() {
+    if peers.is_empty() {
         return Ok(None); // no host to accept a probe from — fail fast
     }
     assert!(
@@ -274,9 +317,9 @@ pub async fn open_birthday_sockets_any(
     let mut opened = 0;
     let mut attempts = 0;
     let max_attempts = count.saturating_mul(20);
-    // The accepted hosts are shared across all listener tasks (each is 'static) via
+    // The peer endpoints are shared across all listener tasks (each is 'static) via
     // a cheap Arc clone rather than a fresh Vec per socket.
-    let hosts: Arc<[IpAddr]> = Arc::from(peer_hosts);
+    let peers: Arc<[SocketAddr]> = Arc::from(peers);
     while opened < count && attempts < max_attempts {
         if Instant::now() >= deadline {
             break; // binding also counts against the overall deadline
@@ -285,18 +328,25 @@ pub async fn open_birthday_sockets_any(
         let port = range.0 + (rng.next_u64() % span) as u16;
         if let Ok(socket) = UdpSocket::bind((host, port)).await {
             opened += 1;
-            let hosts = Arc::clone(&hosts);
+            let peers = Arc::clone(&peers);
+            let interval = cfg.probe_interval.max(Duration::from_millis(250));
             set.spawn(async move {
                 let mut buf = [0u8; 64];
+                let mut timer = tokio::time::interval(interval);
+                let mut transmissions = 0;
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
-                    match socket.recv_from(&mut buf).await {
-                        Ok((n, from))
-                            if hosts.contains(&from.ip()) && matches!(&buf[..n], [PROBE]) =>
-                        {
-                            return Some((socket, from));
+                    tokio::select! {
+                        _ = timer.tick(), if transmissions < 3 => {
+                            transmissions += 1;
+                            for peer in peers.iter() { let _ = socket.send_to(&[PROBE], peer).await; }
                         }
-                        Ok(_) => {} // stray/foreign datagram: keep listening
-                        Err(_) => return None,
+                        received = socket.recv_from(&mut buf) => match received {
+                            Ok((n, from)) if peers.iter().any(|peer| peer.ip() == from.ip())
+                                && is_control_msg(&buf[..n]) => return Some((socket, from)),
+                            Ok(_) => {},
+                            Err(_) => return None,
+                        }
                     }
                 }
             });
@@ -366,6 +416,24 @@ pub async fn spray_any(
         "invalid port range {range:?}: need 1 <= start < end"
     );
     let socket = UdpSocket::bind(bind).await?;
+    spray_socket_any(socket, peer_hosts, range, probes, seed, cfg).await
+}
+
+/// Spray from the socket whose address was advertised during signaling. Keeping
+/// this socket is essential for the return filters opened by the random peer.
+pub async fn spray_socket_any(
+    socket: UdpSocket,
+    peer_hosts: &[IpAddr],
+    range: (u16, u16),
+    probes: usize,
+    seed: u64,
+    cfg: &Config,
+) -> io::Result<Option<Established>> {
+    if peer_hosts.is_empty() {
+        return Ok(None);
+    }
+    assert!(range.0 >= 1 && range.0 < range.1, "invalid port range");
+
     let own_port = socket.local_addr()?.port();
     let deadline = Instant::now() + cfg.overall;
     let mut rng = Rng::new(seed);
@@ -413,4 +481,65 @@ pub async fn spray_any(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod socket_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dual_stack_ephemeral_binding_retries_ipv4_conflicts() {
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let mut attempts = 0;
+        let socket = bind_udp_with_port_picker("[::]:0".parse().unwrap(), || {
+            attempts += 1;
+            if attempts == 1 {
+                Ok(port)
+            } else {
+                ephemeral_port()
+            }
+        })
+        .unwrap();
+        assert!(attempts >= 2);
+        assert_ne!(socket.local_addr().unwrap().port(), port);
+        occupied.set_nonblocking(true).unwrap();
+        let peer = UdpSocket::from_std(occupied).unwrap();
+        socket
+            .send_to(b"probe", format!("[::ffff:127.0.0.1]:{port}"))
+            .await
+            .unwrap();
+        let mut buffer = [0; 16];
+        let (len, source) = peer.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..len], b"probe");
+        peer.send_to(b"reply", source).await.unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), socket.recv_from(&mut buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&buffer[..len], b"reply");
+        let address = socket.local_addr().unwrap();
+        drop(socket);
+        let rebound = bind_udp(address).unwrap();
+        assert_eq!(rebound.local_addr().unwrap(), address);
+    }
+
+    #[tokio::test]
+    async fn dual_stack_bind_retries_are_bounded_and_explicit_ports_are_preserved() {
+        let occupied = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = occupied.local_addr().unwrap().port();
+        let mut attempts = 0;
+        let error = bind_udp_with_port_picker("[::]:0".parse().unwrap(), || {
+            attempts += 1;
+            Ok(port)
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 16);
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+        let error = bind_udp_with_port_picker(format!("[::]:{port}").parse().unwrap(), || {
+            panic!("explicit ports must not be replaced")
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
+    }
 }

@@ -1,0 +1,37 @@
+[package]
+name = "warren-dht-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+dht-next = { path = "../crates/dht-next", features = ["test-support"] }
+crypto = { path = "../crates/crypto" }
+
+[[bin]]
+name = "packet"
+path = "fuzz_targets/packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signed-body"
+path = "fuzz_targets/signed_body.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lifecycle"
+path = "fuzz_targets/lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

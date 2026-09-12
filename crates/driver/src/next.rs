@@ -12,6 +12,7 @@ use puncher::bind_udp as bind_socket;
 pub use state::BootstrapState;
 use std::io;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
@@ -95,6 +96,7 @@ struct Inner {
     events: broadcast::Sender<Notice>,
     network: watch::Sender<NetworkState>,
     id: NodeId,
+    inbound: Arc<AtomicU64>,
     managed_values: Arc<std::sync::Mutex<std::collections::BTreeSet<NodeId>>>,
     task: JoinHandle<()>,
 }
@@ -130,13 +132,22 @@ impl Node {
             address: addr,
             generation: 0,
         });
-        let task = tokio::spawn(run(socket, core, receiver, events.clone(), network.clone()));
+        let inbound = Arc::new(AtomicU64::new(0));
+        let task = tokio::spawn(run(
+            socket,
+            core,
+            receiver,
+            events.clone(),
+            network.clone(),
+            inbound.clone(),
+        ));
         Ok(Self {
             inner: Arc::new(Inner {
                 commands,
                 events,
                 network,
                 id,
+                inbound,
                 managed_values: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
                 task,
             }),
@@ -144,6 +155,20 @@ impl Node {
     }
     pub fn id(&self) -> NodeId {
         self.inner.id
+    }
+    pub fn inbound_datagrams(&self) -> u64 {
+        self.inner.inbound.load(Ordering::Relaxed)
+    }
+    pub async fn register(&self, coordinator: Contact, topic: NodeId) -> Result<(), Error> {
+        self.apply(move |d, now| d.register(coordinator, topic, now).map(|a| ((), a)))
+            .await
+    }
+    pub async fn cancel_lookup(&self, query: u64) -> Result<(), Error> {
+        self.apply(move |d, _| {
+            d.cancel_lookup(query);
+            Ok(((), vec![]))
+        })
+        .await
     }
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.network.borrow().address
@@ -502,6 +527,7 @@ async fn run(
     mut commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<Notice>,
     network: watch::Sender<NetworkState>,
+    inbound: Arc<AtomicU64>,
 ) {
     let mut dual_stack = socket.local_addr().is_ok_and(|addr| addr.is_ipv6());
     let mut receive_enabled = true;
@@ -576,6 +602,7 @@ async fn run(
             },
             packet = socket.recv_from(&mut buffer), if receive_enabled => match packet {
                 Ok((len, from)) => {
+                    inbound.fetch_add(1, Ordering::Relaxed);
                     let from = match from {
                         SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or(from, |v4| SocketAddr::new(v4.into(), v6.port())),
                         _ => from,

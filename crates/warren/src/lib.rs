@@ -14,6 +14,7 @@
 pub mod channel;
 pub mod invite;
 pub mod merge;
+pub mod network;
 pub mod protocol;
 pub mod record;
 pub mod room;

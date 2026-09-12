@@ -1295,6 +1295,7 @@ mod tests {
                         events,
                         network,
                         id: core.id(),
+                        inbound: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                         managed_values: Arc::new(Mutex::new(BTreeSet::new())),
                         task: tokio::spawn(std::future::pending()),
                     }),

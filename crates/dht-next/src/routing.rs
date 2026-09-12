@@ -113,6 +113,13 @@ struct Check {
     observed_expiry: Option<u64>,
 }
 
+#[cfg(feature = "test-support")]
+impl Maintenance {
+    pub(super) fn owns_probe(&self, nonce: &[u8; 32]) -> bool {
+        self.probes.contains_key(nonce)
+    }
+}
+
 impl Dht {
     pub(super) fn routing_allows(&self, contact: Contact, now: Time) -> bool {
         self.routing_policy

@@ -289,13 +289,31 @@ impl Network {
         self.bounds();
     }
 
+    fn advance_recovery(&mut self, deadline: u64) {
+        let next = self
+            .nodes
+            .iter()
+            .zip(self.online)
+            .filter(|(_, online)| *online)
+            .filter_map(|(node, _)| node.poll_timeout())
+            .min()
+            .unwrap_or(deadline)
+            .max(self.now + 1)
+            .min(deadline);
+        self.advance(next - self.now);
+    }
+
     fn expect_event(&mut self, source: usize, matches: impl Fn(&Event) -> bool) {
-        for _ in 0..=60 {
+        let deadline = self.now + 60_000;
+        loop {
             self.pump();
             if self.events.iter().any(|(i, e)| *i == source && matches(e)) {
                 return;
             }
-            self.advance(1000);
+            if self.now >= deadline {
+                break;
+            }
+            self.advance_recovery(deadline);
         }
         panic!("recovery deadline exceeded: {:?}", self.events);
     }
@@ -318,15 +336,21 @@ impl Network {
                 self.nodes[i].stop_renewing(topic, coordinator);
             }
         }
-        for _ in 0..70 {
-            self.advance(1000);
+        self.pump();
+        let deadline = self.now + 70_000;
+        while self.now < deadline {
+            self.advance_recovery(deadline);
             self.pump();
         }
         for n in &self.nodes {
-            assert!(n.pending.values().all(|p| p.query.is_some_and(|q| n
-                .queries
-                .get(&q)
-                .is_some_and(|q| q.owner == QueryOwner::Routing))));
+            assert!(n.pending.iter().all(|(nonce, p)| {
+                n.routing.as_ref().is_some_and(|r| r.owns_probe(nonce))
+                    || p.query.is_some_and(|q| {
+                        n.queries
+                            .get(&q)
+                            .is_some_and(|q| q.owner == QueryOwner::Routing)
+                    })
+            }));
             assert!(n.queries.values().all(|q| q.owner == QueryOwner::Routing));
             assert!(n.outgoing.is_empty());
         }
@@ -385,6 +409,48 @@ pub fn fuzz_lifecycle(input: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_drives_restart_retries_before_the_rpc_deadline() {
+        let mut network = Network::new();
+        let now = network.time();
+        let actions = network.nodes[1].probe(network.contacts[2], now).unwrap();
+        network.actions(1, actions);
+        network.pump();
+        assert_eq!(
+            network.nodes[1].peers[&(network.contacts[2].id, network.contacts[2].addr)]
+                .rtt
+                .timeout(),
+            200
+        );
+        network.nodes[2] = Network::node(2, 1);
+        network.recover();
+    }
+
+    #[test]
+    fn recovery_uses_a_fresh_seed_after_the_holder_moves() {
+        let mut network = Network::new();
+        let now = network.time();
+        let actions = network.nodes[1].probe(network.contacts[2], now).unwrap();
+        network.actions(1, actions);
+        network.pump();
+        network.contacts[2].addr.set_port(4001);
+        let actions = network.nodes[2]
+            .network_changed([91; 32], &[], now)
+            .unwrap();
+        network.actions(2, actions);
+        network.recover();
+    }
+
+    #[test]
+    fn routing_probe_may_remain_after_application_cleanup() {
+        let hex = include_str!("../../tests/lifecycle/maintenance-probe.hex").trim();
+        let input: Vec<_> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        fuzz_lifecycle(&input);
+    }
+
     #[test]
     fn lifecycle_operation_matrix_recovers() {
         fuzz_lifecycle(&[]);

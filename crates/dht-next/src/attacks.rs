@@ -1981,6 +1981,29 @@ fn default_lookup_queries_independent_seeds_outside_the_nearest_twenty() {
 }
 
 #[test]
+fn explicit_seed_endpoint_precedes_cached_route_without_changing_admission() {
+    for policy in [RoutingPolicy::Diverse, RoutingPolicy::Unrestricted] {
+        let mut d = Dht::with_routing_policy(key(2), [102; 32], true, policy);
+        let old = contact(3);
+        d.admit(old, at(100));
+        let fresh = Contact::new(old.id, SocketAddr::new(old.addr.ip(), 5000));
+        let (query, actions) = d.lookup(old.id, &[fresh], at(101)).unwrap();
+        assert_eq!(d.queries[&query].contacts[&old.id].contact, fresh);
+        assert_eq!(d.routes[&old.id].contact, old);
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, Action::Send { to, .. } if *to == fresh.addr)));
+        assert!(!actions
+            .iter()
+            .any(|a| matches!(a, Action::Send { to, .. } if *to == old.addr)));
+        assert_eq!(
+            d.queries[&query].protected_seeds.contains(&old.id),
+            policy == RoutingPolicy::Diverse
+        );
+    }
+}
+
+#[test]
 fn cached_routes_do_not_expand_the_completion_frontier() {
     let mut d = core(2);
     let far = lookup_candidate(1000, "203.0.113.1:4000");

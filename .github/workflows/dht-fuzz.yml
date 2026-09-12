@@ -7,9 +7,13 @@ on:
       - 'crates/dht-next/**'
       - 'crates/driver/**'
       - 'crates/puncher/**'
+      - 'crates/portmap/**'
+      - 'crates/transfer/**'
       - 'crates/crypto/**'
       - 'crates/wire/**'
       - 'fuzz/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
       - '.github/workflows/dht-fuzz.yml'
 
 jobs:
@@ -24,6 +28,8 @@ jobs:
             max_len: 19216
           - target: signed-body
             max_len: 1200
+          - target: lifecycle
+            max_len: 128
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@master
@@ -36,7 +42,7 @@ jobs:
       - run: cargo install cargo-fuzz --version 0.13.2 --locked
       - run: cargo fmt --manifest-path fuzz/Cargo.toml -- --check
       - run: python3 fuzz/seed_corpus.py
-      - run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=120 -max_len=${{ matrix.max_len }} -timeout=5
+      - run: cargo +nightly-2026-09-11 fuzz run ${{ matrix.target }} -- -max_total_time=120 -max_len=${{ matrix.max_len }} -timeout=5
       - uses: actions/upload-artifact@v4
         if: failure()
         with:

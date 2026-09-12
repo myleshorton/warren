@@ -838,12 +838,12 @@ impl Dht {
         }
         self.query_serial = self.query_serial.checked_add(1).ok_or(Error::Capacity)?;
         let id = self.query_serial;
-        let candidates = self
-            .routes
-            .values()
-            .filter(|r| r.expires > now.monotonic_ms)
-            .map(|r| r.contact)
-            .chain(seeds.iter().copied().take(MAX_CANDIDATES));
+        let candidates = seeds.iter().copied().take(MAX_CANDIDATES).chain(
+            self.routes
+                .values()
+                .filter(|r| r.expires > now.monotonic_ms)
+                .map(|r| r.contact),
+        );
         let mut query = Query {
             owner,
             target,

@@ -88,6 +88,11 @@ when routing maintenance is enabled. Client-role packets do not admit routing co
 A live routing entry is not silently moved to another address; expiry currently
 allows replacement. More responsive authenticated migration is a follow-on.
 
+For a new lookup, a caller-supplied seed takes precedence over a cached route with
+the same identity. This lets a caller use a peer's fresh endpoint after a port or
+network change. The seed remains an unverified candidate: it does not rewrite the
+routing table, bypass identity authentication, or replace an in-flight candidate.
+
 Accepted request nonces cache their response until their cookie can no longer be
 accepted. Retries return the cached result without repeating side effects. Handshake
 replies retain their exact bytes; compact replies are re-encrypted with a fresh

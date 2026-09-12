@@ -21,6 +21,33 @@ The protocol and API details are in [dht-next.md](dht-next.md).
 
 ## Issues closed during the final audit
 
+### PR readiness: moved peers and recovery scheduling
+
+Lifecycle validation reproduced a lookup failure after a holder changed its UDP
+port: a cached route appeared before the caller's fresh seed, so identity
+deduplication kept the stale address. New lookups now consider explicit seeds
+before cached routes. The seed remains subject to authentication and candidate
+quotas; it does not rewrite an admitted routing contact. Regressions cover both
+routing policies and storage/lookup/signaling recovery after a holder moves.
+
+A separate harness issue skipped subsecond retry deadlines by advancing recovery
+in one-second jumps. A warmed connection to a restarted peer could expire before
+the retry that starts a fresh handshake. Recovery now services `poll_timeout()`
+deadlines, with a focused regression that failed under the old scheduler. Fault
+injection still deliberately delays timers during the disruption phase.
+
+The first lifecycle fuzz campaign also found that cleanup rejected a legitimate
+background liveness probe. Cleanup now permits only probes owned by routing
+maintenance, alongside maintenance-owned lookups; unrelated application work
+still fails the assertion. The minimized input is a checked-in regression and
+fuzz seed in `crates/dht-next/tests/lifecycle/`.
+
+The lifecycle fuzz target is included in the CI matrix, seeded from the operation
+matrix and saved property regressions. The first remote fuzz run also exposed the
+repository's stable toolchain overriding the installed nightly; fuzz commands now
+select the pinned nightly explicitly. Normal workspace tests enable lifecycle
+properties through the driver's `test-support` dev dependency.
+
 ### Dual-stack ephemeral port collisions
 
 A macOS socket-only reproducer showed an IPv6 wildcard port-zero bind selecting a
@@ -71,6 +98,13 @@ runner scripts and dependency locks, plus runtime versions and the executable ha
 Historical comparison reports remain historical; they are not silently overwritten.
 
 ## Validation results
+
+PR-readiness follow-up on September 11, 2026 (local date): all five lifecycle
+tests passed after the fixes above, including the saved property regression and
+minimized fuzz input. The repaired lifecycle fuzzer completed 7,026 executions
+in 121 seconds without a failure. The explicit real-UDP signaling soak passed
+all 100 trials in 86.76 seconds. These are bounded validation runs, not a security
+certification. The earlier completion-run results below remain historical.
 
 Local completion run on September 11, 2026:
 

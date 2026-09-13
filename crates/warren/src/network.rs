@@ -1,8 +1,11 @@
 //! Discovery and authenticated links shared by legacy and v6 application sessions.
+//!
+//! Network operations require a Tokio runtime. The v6 adapter uses runtime tasks
+//! for announcement renewal and for cancelling lookups when their futures are dropped.
 use crypto::PublicKey;
 use dht_next::{Event, Record};
 use driver::next::Notice;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -351,6 +354,9 @@ impl NextNode {
     }
     /// Renew application topics in the background. Status exposes incomplete
     /// rounds, including remote registration quotas; startup never waits on them.
+    /// Each round renews distinct topics with at most four concurrent operations,
+    /// a 15-second deadline per topic, and one status update when the round finishes.
+    /// The interval is measured from the start of a round; rounds never overlap.
     pub async fn keep_announced<F>(&self, interval: Duration, topics: F) -> Announcer
     where
         F: Fn() -> Vec<NodeId> + Send + 'static,
@@ -359,16 +365,19 @@ impl NextNode {
         let (status, receiver) = tokio::sync::watch::channel(AnnouncementStatus::default());
         let task = tokio::spawn(async move {
             loop {
-                let mut round = AnnouncementStatus::default();
-                for topic in topics() {
-                    round.attempted += 1;
-                    match node.announce(topic).await {
-                        Ok(()) => round.acknowledged += 1,
-                        Err(error) => round.last_error = Some(error),
-                    }
-                    status.send_replace(round.clone());
-                }
-                tokio::time::sleep(interval.max(Duration::from_millis(1))).await;
+                let started = tokio::time::Instant::now();
+                let round = renew_round(topics(), |topic| {
+                    let node = node.clone();
+                    async move { node.announce(topic).await }
+                })
+                .await;
+                status.send_replace(round);
+                tokio::time::sleep(
+                    interval
+                        .max(Duration::from_millis(1))
+                        .saturating_sub(started.elapsed()),
+                )
+                .await;
             }
         });
         Announcer {
@@ -396,7 +405,9 @@ impl Network for NextNode {
     }
     async fn lookup(&self, topic: NodeId) -> Result<Vec<Member>, String> {
         let (mut records, closest) = self.query(topic).await?;
-        self.pages(topic, closest, &mut records).await?;
+        // Pagination enriches a successful lookup; a failed page must not erase
+        // providers already found. Every retained record is verified below.
+        let _ = self.pages(topic, closest, &mut records).await;
         let now = unix();
         let mut keys = self.inner.providers.lock().expect("providers");
         keys.retain(|_, (_, expiry)| *expiry > now);
@@ -406,10 +417,7 @@ impl Network for NextNode {
                 continue;
             }
             let id = dht_next::node_id(record.provider);
-            if keys.len() >= 1024 && !keys.contains_key(&id) {
-                continue;
-            }
-            keys.insert(id, (record.provider, record.expires));
+            cache_provider(&mut keys, id, record.provider, record.expires);
             members.insert(id, Member { id, contact: None });
         }
         Ok(members.into_values().collect())
@@ -479,6 +487,56 @@ impl Network for NextNode {
     }
 }
 
+fn cache_provider(
+    keys: &mut BTreeMap<NodeId, (PublicKey, u64)>,
+    id: NodeId,
+    key: PublicKey,
+    expires: u64,
+) {
+    if keys.len() >= 1024 && !keys.contains_key(&id) {
+        if let Some(oldest) = keys
+            .iter()
+            .min_by_key(|(_, (_, expiry))| expiry)
+            .map(|(id, _)| *id)
+        {
+            keys.remove(&oldest);
+        }
+    }
+    keys.insert(id, (key, expires));
+}
+
+const RENEW_CONCURRENCY: usize = 4;
+const RENEW_TOPIC_DEADLINE: Duration = Duration::from_secs(15);
+
+async fn renew_round<F, Fut>(topics: Vec<NodeId>, mut announce: F) -> AnnouncementStatus
+where
+    F: FnMut(NodeId) -> Fut,
+    Fut: Future<Output = Result<(), String>> + Send + 'static,
+{
+    let mut seen = BTreeSet::new();
+    let mut topics = topics.into_iter().filter(|topic| seen.insert(*topic));
+    let mut pending = tokio::task::JoinSet::new();
+    let mut round = AnnouncementStatus::default();
+    loop {
+        while pending.len() < RENEW_CONCURRENCY {
+            let Some(topic) = topics.next() else { break };
+            round.attempted += 1;
+            let operation = announce(topic);
+            pending.spawn(async move {
+                tokio::time::timeout(RENEW_TOPIC_DEADLINE, operation)
+                    .await
+                    .map_err(|_| "topic renewal deadline".to_string())?
+            });
+        }
+        match pending.join_next().await {
+            Some(Ok(Ok(()))) => round.acknowledged += 1,
+            Some(Ok(Err(error))) => round.last_error = Some(error),
+            Some(Err(error)) => round.last_error = Some(error.to_string()),
+            None => return round,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AnnouncementStatus {
     pub attempted: usize,
@@ -497,5 +555,69 @@ impl Announcer {
 impl Drop for Announcer {
     fn drop(&mut self) {
         self.task.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn fresh_provider_replaces_the_earliest_expiring_cached_key() {
+        let mut keys = BTreeMap::new();
+        let mut first = None;
+        for i in 0..1024u64 {
+            let key = crypto::Keypair::from_seed(&crypto::hash(&i.to_le_bytes())).public();
+            let id = dht_next::node_id(key);
+            first.get_or_insert(id);
+            cache_provider(&mut keys, id, key, 1000 + i);
+        }
+        let fresh = crypto::Keypair::from_seed(&[99; 32]).public();
+        let id = dht_next::node_id(fresh);
+        cache_provider(&mut keys, id, fresh, 3000);
+        assert_eq!(keys.len(), 1024);
+        assert_eq!(keys[&id], (fresh, 3000));
+        assert!(!keys.contains_key(&first.unwrap()));
+        cache_provider(&mut keys, id, fresh, 4000);
+        assert_eq!(keys.len(), 1024);
+        assert_eq!(keys[&id].1, 4000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renewals_make_bounded_progress_past_a_stalled_topic() {
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut topics: Vec<_> = (0..12).map(|i| NodeId::from_bytes([i; 32])).collect();
+        topics.push(topics[1]);
+        let started = tokio::time::Instant::now();
+        let status = renew_round(topics, |topic| {
+            let (active, peak, completed) = (active.clone(), peak.clone(), completed.clone());
+            async move {
+                peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                let _active = Active(active);
+                if topic == NodeId::from_bytes([0; 32]) {
+                    std::future::pending::<()>().await;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                completed.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await;
+        assert_eq!(status.attempted, 12);
+        assert_eq!(status.acknowledged, 11);
+        assert_eq!(completed.load(Ordering::SeqCst), 11);
+        assert_eq!(peak.load(Ordering::SeqCst), RENEW_CONCURRENCY);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(status.last_error.as_deref(), Some("topic renewal deadline"));
+        assert_eq!(started.elapsed(), RENEW_TOPIC_DEADLINE);
     }
 }

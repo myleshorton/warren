@@ -42,7 +42,26 @@ expiry or endpoint changes so connections can recover through DHT signaling.
 [Network recovery](docs/dht-next.md#network-changes-and-resumable-transfers) rebinds
 and republishes on platform notifications, then resumes verified transfers through fresh sessions.
 Run `cargo run -p transfer --example dht_connect` for an isolated connection/recovery example.
-The legacy `driver::Node` still uses `swarm`; data-plane migration remains separate.
+Application sessions can opt in with `Session<network::NextNode>`; the default
+`Session` still uses the legacy `driver::Node`. Both backends share discovery,
+verified feed subscriptions/mirroring, encrypted blobs, and room logic through
+`network::Network`. Servers call `Network::incoming().await` followed by
+`Incoming::authenticate()` before dispatching requests; v6 reuses its authenticated
+connection rather than performing a second Noise handshake.
+
+The adapter keeps verified partial results if provider pagination fails, bounds its
+public-key cache to 1,024 providers (evicting the earliest expiry for a new provider),
+and returns provider identities separately from directly addressed bootstrap contacts.
+Network-facing sessions require a Tokio runtime for I/O, renewal, and cancellation.
+`NextNode::bind` creates a routing helper; apps use `bind_with_role(..., false)`.
+`keep_announced` renews distinct topics with up to four operations in flight and a
+15-second deadline per topic. It reports one status per completed round; the interval
+runs from the round's start and rounds never overlap. Bootstrap and announcement
+lookups skip provider pagination. Coordinator quotas still apply (including
+16 registrations per provider per coordinator); this is not an unlimited publication
+service. Network notifications must still be forwarded to the underlying endpoint
+by the application. See `crates/warren/tests/session_next.rs` for real-UDP session,
+pagination, and offline-author mirror examples.
 See the [topology evaluation](docs/benchmarks/dht-topology.md) and
 [HyperDHT/libtorrent comparison](docs/benchmarks/dht-value-lookup-comparison.md).
 

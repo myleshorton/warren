@@ -461,6 +461,16 @@ mod tests {
     }
 
     #[test]
+    fn recovery_after_fuzzed_restarts_and_network_changes() {
+        let hex = include_str!("../../tests/lifecycle/recovery-timeout.hex").trim();
+        let input: Vec<_> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        fuzz_lifecycle(&input);
+    }
+
+    #[test]
     fn lifecycle_operation_matrix_recovers() {
         fuzz_lifecycle(&[]);
         for offset in 0..16u8 {

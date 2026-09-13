@@ -286,6 +286,41 @@ fn validated_peer_uses_one_round_trip_and_refreshes_after_expiry_or_restart() {
 }
 
 #[test]
+fn restarted_peer_recovers_before_the_deadline_at_every_retry_delay() {
+    for delay in [200, 500, 1000, 2000, 3000, 4000] {
+        let mut a = core(1);
+        let mut b = core(2);
+        let actions = a.probe(contact(2), at(100)).unwrap();
+        pair(&mut a, &mut b, actions, at(100));
+        a.peers
+            .get_mut(&(contact(2).id, addr(2)))
+            .unwrap()
+            .rtt
+            .ambiguous(delay);
+        let mut restarted = Dht::new(key(2), [99; 32], true);
+        let value = Value::Immutable(b"survives restart".to_vec());
+        let (request, actions) = a
+            .put_value(contact(2), value.clone(), None, at(101))
+            .unwrap();
+        let deadline = a.pending[&request].deadline;
+        pair(&mut a, &mut restarted, actions, at(101));
+        assert!(a.pending.contains_key(&request));
+        while a.pending.contains_key(&request) {
+            let next = a.poll_timeout().unwrap();
+            assert!(
+                next < deadline,
+                "retry delay {delay} exhausted the recovery window"
+            );
+            let now = Time::new(next, next / 1000);
+            let actions = a.tick(now);
+            pair(&mut a, &mut restarted, actions, now);
+        }
+        assert!(restarted.values.contains_key(&value.key()));
+        assert!(a.transport.available(contact(2).id, addr(2), at(109)));
+    }
+}
+
+#[test]
 fn reused_grant_still_requires_the_owners_signature_for_every_new_request() {
     let mut receiver = core(2);
     let valid = challenged(&mut receiver, packet(Body::Probe));

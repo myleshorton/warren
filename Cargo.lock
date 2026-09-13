@@ -1042,6 +1042,7 @@ version = "0.0.0"
 dependencies = [
  "blob",
  "crypto",
+ "dht-next",
  "driver",
  "feed",
  "feed-redb",

@@ -1850,7 +1850,9 @@ impl Dht {
                 p.ambiguous = true;
                 p.retry_delay = (p.retry_delay * 2).min(4000);
                 p.retry_at = now.monotonic_ms.saturating_add(p.retry_delay);
-                if p.retries >= 2 && p.handshake.is_none() {
+                // A backed-off RPC may have only one retry before its deadline.
+                // Refresh a stale session on that last opportunity, too.
+                if (p.retries >= 2 || p.retry_at >= p.deadline) && p.handshake.is_none() {
                     self.transport
                         .forget_preferred(p.contact.id, p.contact.addr);
                     p.handshake = session::start(&mut p.packet);

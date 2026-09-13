@@ -82,9 +82,11 @@ pub struct Keys {
 pub struct Discovered {
     /// Each discovered record, its author's feed key, and the node that served it.
     pub records: Vec<(Record, crypto::PublicKey, swarm::NodeId)>,
-    /// The members found online (including ourselves) — for the app's bootstrap
+    /// Directly addressed members (legacy backend) — for the app's bootstrap
     /// cache; the caller filters out its own id.
     pub members: Vec<swarm::Contact>,
+    /// Discovered identities, including v6 providers without a direct DHT address.
+    pub providers: Vec<crate::network::Member>,
     /// Every member we connected to and downloaded a feed from, with its node id +
     /// feed key — **including members whose feed was empty**. An app resolving a
     /// list/label author by feed key (e.g. a moderation list published by someone
@@ -98,9 +100,9 @@ pub struct Discovered {
 /// (the node, `Arc`-shared log/store/held/clip-keys, a copied key) — so a clone is
 /// the *same* session, which lets an app move one into a spawned task.
 #[derive(Clone)]
-pub struct Session {
+pub struct Session<N: crate::network::Network = driver::Node> {
     /// The DHT node, exposed so the app can announce + run its own accept loop.
-    pub node: driver::Node,
+    pub node: N,
     /// The signed feed log. A **sync** mutex, not async: it's locked briefly per
     /// operation and never held across an `.await`, so a live-tail serve (which
     /// locks per reply, forever) can't block appends.
@@ -163,12 +165,12 @@ fn restore_mirrors(
     }
 }
 
-impl Session {
+impl<N: crate::network::Network> Session<N> {
     /// Build a session over already-loaded state (see [`store::rebuild`] for the
     /// log/store and [`store::load_or_create_seed`] for the identity).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        node: driver::Node,
+        node: N,
         log: Arc<StdMutex<feed::Log>>,
         store: Arc<AsyncMutex<blob::Store>>,
         feed_pubkey: crypto::PublicKey,
@@ -833,7 +835,8 @@ impl Session {
         let connected = reached.len();
         Discovered {
             records,
-            members,
+            members: members.iter().filter_map(|m| m.contact).collect(),
+            providers: members,
             reached,
             connected,
         }

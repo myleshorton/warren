@@ -8,43 +8,12 @@
 //! the trust anchor every downloaded block is verified against — then stream the
 //! log; blob requests stream the (content-addressed, self-verifying) blob.
 
-use driver::{Channel, Node, NodeEvent};
+use crate::network::{Network, Secure};
 use swarm::NodeId;
-use transfer::{Link, NoiseLink};
+use transfer::Link;
 
-/// A punched channel upgraded to an authenticated, encrypted Noise session — what
-/// every peer request now runs over, so a coordinator or on-path observer sees only
-/// ciphertext and a peer is cryptographically bound to the node id it claims.
-type Secure = NoiseLink<Channel>;
-
-/// Connect to `target` over the DHT and upgrade the punched channel to an
-/// authenticated, encrypted Noise session pinned to `target`'s node id (see
-/// [`NoiseLink::connect`]). `Err` if the peer is unreachable, yields no data
-/// channel, or the handshake fails — including a peer whose identity does not hash
-/// to `target` (then the error is `PermissionDenied`).
-async fn secure_dial(node: &Node, target: NodeId) -> Result<Secure, String> {
-    let conn = node
-        .connect(target)
-        .await
-        .map_err(|e| format!("connect: {e:?}"))?;
-    // The driver already emitted a `ConnectResolved` telemetry event carrying the
-    // funnel stats; surface the outcome in the error so even the string path is
-    // legible ("unreachable: TimedOut") instead of a bare "no data channel".
-    let outcome = conn.outcome;
-    let ch = conn
-        .channel
-        .ok_or_else(|| format!("no data channel (unreachable: {outcome:?})"))?;
-    // Time the Noise handshake and report it on the node's telemetry sink (no-op
-    // when no sink is attached), so the embedder can see handshake latency + failures.
-    let started = std::time::Instant::now();
-    let res = NoiseLink::connect(ch, node.identity(), target).await;
-    node.emit_event(NodeEvent::NoiseHandshake {
-        peer: target,
-        initiator: true,
-        ok: res.is_ok(),
-        dur_ms: started.elapsed().as_millis() as u64,
-    });
-    res.map_err(|e| format!("noise handshake: {e}"))
+async fn secure_dial(node: &impl Network, target: NodeId) -> Result<Secure, String> {
+    node.dial(target).await
 }
 
 /// Request the peer's signed feed. The peer replies with its 32-byte feed public
@@ -61,9 +30,9 @@ pub const REQ_FEED_KEY: u8 = 3;
 /// Serve our feed to a peer that asked for it: send our feed public key (the trust
 /// anchor) first, then stream the log. Returns `false` on a broken channel.
 ///
-/// Generic over the [`Link`] the caller hands in — always a [`NoiseLink`] in
-/// practice (the accept loop wraps each incoming channel), so the whole exchange is
-/// authenticated and encrypted.
+/// Generic over the [`Link`] the caller hands in. Application accept loops use
+/// [`crate::network::Incoming::authenticate`] to supply an encrypted, authenticated
+/// link from either network backend.
 pub async fn serve_feed<L: Link>(
     channel: &mut L,
     feed_pubkey: &crypto::PublicKey,
@@ -111,7 +80,7 @@ pub async fn serve_blob<L: Link>(
 /// channel breaks (or the future is dropped). The peer must serve with
 /// [`serve_feed_tail`].
 pub async fn subscribe_feed<F>(
-    node: &Node,
+    node: &impl Network,
     peer: NodeId,
     req: u8,
     from: u64,
@@ -150,7 +119,7 @@ where
 /// `feed_key`). This is what makes swarm-failover subscription work: the caller
 /// can point it at any provider that announced the feed's topic.
 pub async fn subscribe_feed_by_key<F>(
-    node: &Node,
+    node: &impl Network,
     provider: NodeId,
     feed_key: crypto::PublicKey,
     from: u64,
@@ -191,7 +160,7 @@ where
 /// to [`subscribe_feed_by_key`] for a store-and-forward mirror. Returns on channel
 /// error; the caller re-connects (failing over across the feed's providers).
 pub async fn replicate_feed_by_key(
-    node: &Node,
+    node: &impl Network,
     provider: NodeId,
     feed_key: crypto::PublicKey,
     into: &std::sync::Mutex<feed::Replica>,
@@ -229,7 +198,7 @@ pub async fn replicate_feed_by_key(
 /// block, or a truncated log all yield `None`). Feed a live `replicate_feed` from
 /// the returned replica to keep it current.
 pub async fn fetch_replica(
-    node: &Node,
+    node: &impl Network,
     provider: NodeId,
     feed_key: crypto::PublicKey,
     cfg: &transfer::Config,
@@ -265,7 +234,7 @@ pub async fn fetch_replica(
 /// (head + peaks, no blocks) — a valid mirror that can ingest later. Keep it current with
 /// `Session::run_mirror_window`.
 pub async fn fetch_replica_window(
-    node: &Node,
+    node: &impl Network,
     provider: NodeId,
     feed_key: crypto::PublicKey,
     window: u64,
@@ -308,7 +277,7 @@ pub async fn fetch_replica_window(
 /// growing author costs the delta, not the whole window. `None` if the provider is
 /// unreachable or serves a different feed.
 pub async fn fetch_tail_window(
-    node: &Node,
+    node: &impl Network,
     provider: NodeId,
     feed_key: crypto::PublicKey,
     window: u64,
@@ -343,7 +312,7 @@ pub async fn fetch_tail_window(
 /// standard [`REQ_FEED`] and for app-defined feed-shaped kinds (e.g. a signed
 /// moderation list).
 pub async fn fetch_feed(
-    node: &Node,
+    node: &impl Network,
     peer: NodeId,
     req: u8,
     cfg: &transfer::Config,
@@ -369,11 +338,11 @@ pub async fn fetch_feed(
 
 /// Open authenticated blob channels to several providers of `blob_hash` for a swarm
 /// download: the known feed provider plus everyone announcing `content_topic`. Each
-/// returned [`NoiseLink`] has completed its Noise handshake (so the provider is
+/// returned [`transfer::NoiseLink`] has completed its Noise handshake (so the provider is
 /// bound to the node id we dialed) and already sent the [`REQ_BLOB`] header, ready
 /// to hand to `transfer`.
 pub async fn gather_blob_channels(
-    node: &Node,
+    node: &impl Network,
     content_topic: NodeId,
     feed_provider: Option<NodeId>,
     max: usize,

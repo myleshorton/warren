@@ -11,9 +11,13 @@
 //! data feeds are others. Anything specific to a single app (video titles, a
 //! moderation model, the UniFFI bindings) lives in the app, not here.
 
+//! Network-facing sessions require a Tokio runtime. In particular, the v6
+//! adapter schedules renewal tasks and drop-time lookup cancellation on it.
+
 pub mod channel;
 pub mod invite;
 pub mod merge;
+pub mod network;
 pub mod protocol;
 pub mod record;
 pub mod room;

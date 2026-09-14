@@ -338,69 +338,104 @@ impl<N: crate::network::Network> Session<N> {
         meta: serde_json::Map<String, serde_json::Value>,
         payload: Vec<u8>,
     ) -> std::io::Result<Record> {
-        let (stored, enc) = match self.kek() {
-            Some(kek) => {
-                let sealed = crypto::seal::seal(&payload);
-                let (wrap_nonce, wrapped) = crypto::seal::wrap_key(&kek, &sealed.key);
-                let enc = Enc {
-                    n: util::to_hex(&sealed.nonce),
-                    wn: util::to_hex(&wrap_nonce),
-                    wk: util::to_hex(&wrapped),
-                };
-                (sealed.ciphertext, Some(enc))
+        let observation = self.node.diagnostics().operation("publish.result");
+        let result: std::io::Result<Record> = async {
+            let (stored, enc) = match self.kek() {
+                Some(kek) => {
+                    let sealed = crypto::seal::seal(&payload);
+                    let (wrap_nonce, wrapped) = crypto::seal::wrap_key(&kek, &sealed.key);
+                    let enc = Enc {
+                        n: util::to_hex(&sealed.nonce),
+                        wn: util::to_hex(&wrap_nonce),
+                        wk: util::to_hex(&wrapped),
+                    };
+                    (sealed.ciphertext, Some(enc))
+                }
+                None => (payload.clone(), None),
+            };
+
+            let blob_hex = {
+                let mut store = self.store.lock().await;
+                let manifest = store.add(&stored);
+                let id = manifest.id();
+                store.put(manifest.encode());
+                util::to_hex(&id)
+            };
+
+            let record = Record {
+                author: util::to_hex(&self.feed_pubkey.to_bytes()),
+                created_at: util::now_secs(),
+                content_type,
+                blob: Some(blob_hex.clone()),
+                size: payload.len() as u64,
+                body: None,
+                meta,
+                enc: enc.clone(),
+                ..Default::default()
+            };
+            // Never append an empty/garbage block on a serialize error — that would
+            // corrupt the signed log. (A plain Record can't fail to serialize, but treat
+            // it as an error rather than silently persisting nonsense.)
+            let line = serde_json::to_string(&record)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            // Persist the blob (content-addressed, order-independent) *outside* the log lock
+            // so a large write can't block feed serving; then append the block *under* the
+            // lock. `try_append` commits to the store (redb — durable, fsync'd) and advances
+            // the in-memory log together, so concurrent publishers can't reorder the persisted
+            // feed against the in-memory Merkle order, and a returned `Err` means "not
+            // published" (the store commits before the in-memory log advances).
+            let mut write = observation.child("storage.blob.write");
+            write.field(
+                "bytes",
+                driver::diagnostics::Value::Count(stored.len() as u64),
+            );
+            let result = store::write_blob(&self.data_dir, &blob_hex, &stored);
+            write.finish(
+                result
+                    .as_ref()
+                    .err()
+                    .map(driver::diagnostics::io_code)
+                    .unwrap_or(""),
+            );
+            result?;
+            {
+                let mut log = self.log.lock().expect("feed log");
+                let mut append = observation.child("feed.append");
+                append.field(
+                    "bytes",
+                    driver::diagnostics::Value::Count(line.len() as u64),
+                );
+                let result = log.try_append(line.into_bytes());
+                append.finish(if result.is_ok() {
+                    ""
+                } else {
+                    "append_commit_failed"
+                });
+                result.map_err(|e| std::io::Error::other(e.to_string()))?;
             }
-            None => (payload.clone(), None),
-        };
+            self.appended.notify_waiters(); // wake any live-tail subscribers
 
-        let blob_hex = {
-            let mut store = self.store.lock().await;
-            let manifest = store.add(&stored);
-            let id = manifest.id();
-            store.put(manifest.encode());
-            util::to_hex(&id)
-        };
-
-        let record = Record {
-            author: util::to_hex(&self.feed_pubkey.to_bytes()),
-            created_at: util::now_secs(),
-            content_type,
-            blob: Some(blob_hex.clone()),
-            size: payload.len() as u64,
-            body: None,
-            meta,
-            enc: enc.clone(),
-            ..Default::default()
-        };
-        // Never append an empty/garbage block on a serialize error — that would
-        // corrupt the signed log. (A plain Record can't fail to serialize, but treat
-        // it as an error rather than silently persisting nonsense.)
-        let line = serde_json::to_string(&record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Persist the blob (content-addressed, order-independent) *outside* the log lock
-        // so a large write can't block feed serving; then append the block *under* the
-        // lock. `try_append` commits to the store (redb — durable, fsync'd) and advances
-        // the in-memory log together, so concurrent publishers can't reorder the persisted
-        // feed against the in-memory Merkle order, and a returned `Err` means "not
-        // published" (the store commits before the in-memory log advances).
-        store::write_blob(&self.data_dir, &blob_hex, &stored)?;
-        {
-            let mut log = self.log.lock().expect("feed log");
-            log.try_append(line.into_bytes())
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+            if let Some(hash) = util::bytes_from_hex::<32>(&blob_hex) {
+                self.held.lock().expect("held").push(hash);
+                self.announce_content(hash).await;
+            }
+            if let Some(enc) = enc {
+                self.clip_keys
+                    .lock()
+                    .expect("clip_keys")
+                    .insert(blob_hex, enc);
+            }
+            Ok(record)
         }
-        self.appended.notify_waiters(); // wake any live-tail subscribers
-
-        if let Some(hash) = util::bytes_from_hex::<32>(&blob_hex) {
-            self.held.lock().expect("held").push(hash);
-            self.announce_content(hash).await;
-        }
-        if let Some(enc) = enc {
-            self.clip_keys
-                .lock()
-                .expect("clip_keys")
-                .insert(blob_hex, enc);
-        }
-        Ok(record)
+        .await;
+        observation.finish(
+            result
+                .as_ref()
+                .err()
+                .map(driver::diagnostics::io_code)
+                .unwrap_or(""),
+        );
+        result
     }
 
     /// Publish a **body-only** record (no blob) — a chat message, a comment, any small
@@ -422,32 +457,54 @@ impl<N: crate::network::Network> Session<N> {
         clock: std::collections::BTreeMap<String, u64>,
         lamport: u64,
     ) -> std::io::Result<Record> {
-        let record = Record {
-            author: util::to_hex(&self.feed_pubkey.to_bytes()),
-            created_at: util::now_secs(),
-            content_type,
-            blob: None,
-            size: 0,
-            body: Some(body),
-            meta,
-            enc: None,
-            clock,
-            lamport,
-        };
-        let line = serde_json::to_string(&record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        // Append the block under the log lock so concurrent publishers stay in the same
-        // order (persisted-store order == in-memory Merkle order == what a subscriber is
-        // served). `try_append` commits to the store (redb — durable, fsync'd on commit)
-        // *before* advancing the in-memory log, so a returned `Err` means "not published".
-        // Synchronous (no `.await`), so this brief hold can't wedge a live-tail serve.
-        {
-            let mut log = self.log.lock().expect("feed log");
-            log.try_append(line.into_bytes())
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let observation = self.node.diagnostics().operation("publish.body");
+        let result: std::io::Result<Record> = async {
+            let record = Record {
+                author: util::to_hex(&self.feed_pubkey.to_bytes()),
+                created_at: util::now_secs(),
+                content_type,
+                blob: None,
+                size: 0,
+                body: Some(body),
+                meta,
+                enc: None,
+                clock,
+                lamport,
+            };
+            let line = serde_json::to_string(&record)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            // Append the block under the log lock so concurrent publishers stay in the same
+            // order (persisted-store order == in-memory Merkle order == what a subscriber is
+            // served). `try_append` commits to the store (redb — durable, fsync'd on commit)
+            // *before* advancing the in-memory log, so a returned `Err` means "not published".
+            // Synchronous (no `.await`), so this brief hold can't wedge a live-tail serve.
+            {
+                let mut log = self.log.lock().expect("feed log");
+                let mut append = observation.child("feed.append");
+                append.field(
+                    "bytes",
+                    driver::diagnostics::Value::Count(line.len() as u64),
+                );
+                let result = log.try_append(line.into_bytes());
+                append.finish(if result.is_ok() {
+                    ""
+                } else {
+                    "append_commit_failed"
+                });
+                result.map_err(|e| std::io::Error::other(e.to_string()))?;
+            }
+            self.appended.notify_waiters(); // wake any live-tail subscribers
+            Ok(record)
         }
-        self.appended.notify_waiters(); // wake any live-tail subscribers
-        Ok(record)
+        .await;
+        observation.finish(
+            result
+                .as_ref()
+                .err()
+                .map(driver::diagnostics::io_code)
+                .unwrap_or(""),
+        );
+        result
     }
 
     /// Live-tail a feed by its owner's `feed_key`, from block `from`, delivering each

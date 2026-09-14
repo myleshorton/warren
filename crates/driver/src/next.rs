@@ -7,6 +7,9 @@ pub use managed_value::{ManagedValue, ValuePublicationConfig, ValuePublicationSt
 pub use nat64::route_addresses;
 pub use portmap::Gateway as MappingGateway;
 mod state;
+use crate::diagnostics::{
+    io_code, Observer, Operation as DiagnosticOperation, Value as DiagnosticValue,
+};
 use crypto::Keypair;
 use dht_next::{Action, Contact, Dht, Event, NodeId, Record, RoutingPolicy, Time};
 pub use direct::{DirectChannel, DirectSocket};
@@ -90,6 +93,7 @@ enum Command {
     ),
 }
 struct PendingRebind {
+    observation: DiagnosticOperation,
     socket: Option<UdpSocket>,
     seeds: Vec<Contact>,
     reply: oneshot::Sender<io::Result<SocketAddr>>,
@@ -103,6 +107,7 @@ pub struct NetworkState {
     pub generation: u64,
 }
 struct Inner {
+    diagnostics: Observer,
     commands: mpsc::Sender<Command>,
     events: broadcast::Sender<Notice>,
     network: watch::Sender<NetworkState>,
@@ -146,17 +151,22 @@ impl Node {
             generation: 0,
         });
         let inbound = Arc::new(AtomicU64::new(0));
+        let diagnostics = Observer::new();
         let task = tokio::spawn(run(
             socket,
             translation.clone(),
             core,
             receiver,
-            events.clone(),
-            network.clone(),
-            inbound.clone(),
+            ActorSignals {
+                events: events.clone(),
+                network: network.clone(),
+                inbound: inbound.clone(),
+                diagnostics: diagnostics.clone(),
+            },
         ));
         Ok(Self {
             inner: Arc::new(Inner {
+                diagnostics,
                 commands,
                 events,
                 network,
@@ -168,6 +178,14 @@ impl Node {
             }),
         })
     }
+    pub fn diagnostics(&self) -> Observer {
+        self.inner.diagnostics.clone()
+    }
+
+    pub fn translation_mode(&self) -> &'static str {
+        self.inner.translation.borrow().mode()
+    }
+
     pub fn id(&self) -> NodeId {
         self.inner.id
     }
@@ -217,10 +235,26 @@ impl Node {
         reflectors: &[Contact],
         gateway: Option<&portmap::Gateway>,
     ) -> io::Result<DirectSocket> {
+        self.direct_socket_for(reflectors, gateway, None).await
+    }
+
+    pub async fn direct_socket_for(
+        &self,
+        reflectors: &[Contact],
+        gateway: Option<&portmap::Gateway>,
+        parent: Option<u64>,
+    ) -> io::Result<DirectSocket> {
         let mut translation = self.inner.translation.borrow().clone();
         translation.bind.set_port(0);
-        DirectSocket::bind_with_translation(translation.bind, reflectors, gateway, translation)
-            .await
+        DirectSocket::bind_with_translation(
+            translation.bind,
+            reflectors,
+            gateway,
+            translation,
+            self.diagnostics(),
+            parent,
+        )
+        .await
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Notice> {
@@ -234,6 +268,7 @@ impl Node {
             + 'static,
     ) -> Result<T, Error> {
         let (sender, receiver) = oneshot::channel();
+        let diagnostics = self.diagnostics();
         self.inner
             .commands
             .send(Command::Apply(Box::new(move |core, now| {
@@ -247,6 +282,12 @@ impl Node {
                         actions
                     }
                     Err(error) => {
+                        let code = match error {
+                            dht_next::Error::Capacity => "capacity",
+                            dht_next::Error::Invalid => "invalid",
+                            dht_next::Error::UnknownSession => "unknown_session",
+                        };
+                        diagnostics.event("dht.command", code, vec![]);
                         let _ = sender.send(Err(Error::Core(error)));
                         vec![]
                     }
@@ -548,15 +589,29 @@ fn time(start: Instant) -> Time {
     )
 }
 
+struct ActorSignals {
+    events: broadcast::Sender<Notice>,
+    network: watch::Sender<NetworkState>,
+    inbound: Arc<AtomicU64>,
+    diagnostics: Observer,
+}
+
 async fn run(
     mut socket: UdpSocket,
     mappings: watch::Sender<nat64::Translation>,
     mut core: Dht,
     mut commands: mpsc::Receiver<Command>,
-    events: broadcast::Sender<Notice>,
-    network: watch::Sender<NetworkState>,
-    inbound: Arc<AtomicU64>,
+    signals: ActorSignals,
 ) {
+    let ActorSignals {
+        events,
+        network,
+        inbound,
+        diagnostics,
+    } = signals;
+    let mut health = tokio::time::interval(Duration::from_secs(30));
+    health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (mut outbound, mut send_errors, mut receive_errors) = (0u64, 0u64, 0u64);
     let mut translation = mappings.borrow().clone();
     let mut pending: Option<PendingRebind> = None;
     #[cfg(test)]
@@ -572,10 +627,15 @@ async fn run(
                 Action::Send { to, bytes } => {
                     let destination = translation.destination(to);
                     if let Err(error) = socket.send_to(&bytes, destination).await {
+                        send_errors += 1;
+                        diagnostics.event("dht.socket.send", io_code(&error), vec![]);
                         let _ = events.send(Notice::IoError(error.kind()));
+                    } else {
+                        outbound += 1;
                     }
                 }
                 Action::Event(event) => {
+                    observe_dht_event(&diagnostics, &event);
                     let _ = events.send(Notice::Dht(event));
                 }
             }
@@ -597,13 +657,15 @@ async fn run(
                 Some(Command::Apply(operation)) => operation(&mut core, time(start)),
                 Some(Command::Rebind(address, seeds, reply)) => {
                     if reply.is_closed() { vec![] } else {
+                        let observation = diagnostics.operation("network.rebind");
                         let replacement = if socket.local_addr().ok() == Some(address) {
                             Ok(None)
                         } else { bind_socket(address).map(Some) };
                         match replacement {
-                            Err(error) => { let _ = reply.send(Err(error)); }
+                            Err(error) => { observation.finish(io_code(&error)); let _ = reply.send(Err(error)); }
                             Ok(replacement) => {
                                 if let Some(previous) = pending.take() {
+                                    previous.observation.finish("superseded");
                                     let _ = previous.reply.send(Err(io::Error::new(
                                         io::ErrorKind::Interrupted, "superseded network change")));
                                 }
@@ -612,6 +674,7 @@ async fn run(
                                 #[cfg(test)]
                                 let gate = discovery_gate.take();
                                 pending = Some(PendingRebind {
+                                    observation,
                                     socket: replacement, seeds, reply,
                                     discovery: Box::pin(async move {
                                         #[cfg(test)]
@@ -649,12 +712,19 @@ async fn run(
                             let address = socket.local_addr().expect("bound UDP socket");
                             receive_enabled = true;
                             translation = mapping;
+                            let mut observation = request.observation;
+                            observation.field("translation", DiagnosticValue::Text(translation.mode()));
+                            observation.field("discovery", DiagnosticValue::Text(translation.discovery_status));
+                            diagnostics.generation(network.borrow().generation + 1);
+                            observation.field("generation", DiagnosticValue::Count(network.borrow().generation + 1));
+                            observation.finish("");
                             mappings.send_replace(translation.clone());
                             network.send_modify(|state| { state.address = address; state.generation += 1; });
                             let _ = request.reply.send(Ok(address));
                             actions
                         }
                         Err(error) => {
+                            request.observation.finish("dht_rebind_rejected");
                             let _ = request.reply.send(Err(io::Error::other(format!("{error:?}"))));
                             vec![]
                         }
@@ -668,6 +738,8 @@ async fn run(
                     core.receive(from, &buffer[..len], time(start))
                 },
                 Err(error) => {
+                    receive_errors += 1;
+                    diagnostics.event("dht.socket.receive", io_code(&error), vec![]);
                     let _ = events.send(Notice::IoError(error.kind()));
                     // Keep accepting recovery commands without spinning on a
                     // failed interface. Rebinding enables receives again.
@@ -676,6 +748,19 @@ async fn run(
                 }
             },
             _ = timer => core.tick(time(start)),
+            _ = health.tick() => {
+                diagnostics.event("dht.health", "", vec![
+                    ("routing_contacts", DiagnosticValue::Count(core.routing_len() as u64)),
+                    ("inbound_datagrams", DiagnosticValue::Count(inbound.load(Ordering::Relaxed))),
+                    ("outbound_datagrams", DiagnosticValue::Count(outbound)),
+                    ("send_errors", DiagnosticValue::Count(send_errors)),
+                    ("receive_errors", DiagnosticValue::Count(receive_errors)),
+                    ("generation", DiagnosticValue::Count(network.borrow().generation)),
+                    ("translation", DiagnosticValue::Text(translation.mode())),
+                    ("discovery", DiagnosticValue::Text(translation.discovery_status)),
+                ]);
+                vec![]
+            },
         };
     }
     drop(socket);
@@ -683,6 +768,39 @@ async fn run(
     if let Some(reply) = stopped {
         let _ = reply.send(());
     }
+}
+
+fn observe_dht_event(observer: &Observer, event: &Event) {
+    let (name, error, fields) = match event {
+        Event::RpcTimedOut(_) => ("dht.rpc.timeout", "timeout", vec![]),
+        Event::SignalTimedOut(_) => ("dht.signal", "timeout", vec![]),
+        Event::Ready(_) => ("dht.handshake", "", vec![]),
+        Event::Registered(_) => ("dht.registration", "", vec![]),
+        Event::LookupDone {
+            timed_out, closest, ..
+        } => (
+            "dht.lookup.result",
+            if *timed_out { "timeout" } else { "" },
+            vec![("closest", DiagnosticValue::Count(closest.len() as u64))],
+        ),
+        Event::Providers { records, .. } | Event::ProviderPage { records, .. } => (
+            "dht.providers",
+            "",
+            vec![("providers", DiagnosticValue::Count(records.len() as u64))],
+        ),
+        Event::ValueStored { stored, .. } => (
+            "dht.value.store",
+            if *stored { "" } else { "rejected" },
+            vec![],
+        ),
+        Event::Value { value, .. } => (
+            "dht.value.fetch",
+            "",
+            vec![("found", DiagnosticValue::Flag(value.is_some()))],
+        ),
+        _ => return,
+    };
+    observer.event(name, error, fields);
 }
 
 fn transient_receive_error(kind: io::ErrorKind) -> bool {

@@ -4,6 +4,7 @@
 use crate::{Link, NoiseLink};
 use crypto::{Keypair, PublicKey};
 use dht_next::{node_id, Contact, Event, ReceivedSignal, Record, RoutingPolicy};
+use driver::diagnostics::{io_code, Operation, Value};
 use driver::next::{DirectSocket, Node, Notice};
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -68,6 +69,29 @@ pub enum Error {
     #[error("invalid connection configuration")]
     InvalidConfig,
 }
+impl Error {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Dht(driver::next::Error::NetworkChanged) => "network_changed",
+            Self::Dht(driver::next::Error::TimedOut) => "dht_timeout",
+            Self::Dht(driver::next::Error::Closed) => "dht_closed",
+            Self::Dht(driver::next::Error::EventsLagged(_)) => "dht_events_lagged",
+            Self::Dht(_) => "dht_error",
+            Self::PeerNotFound => "peer_not_found",
+            Self::SignalingTimedOut => "signaling_timeout",
+            Self::DirectUnavailable => "direct_unreachable",
+            Self::InvalidCandidates => "invalid_candidates",
+            Self::Deadline => "deadline",
+            Self::Busy => "capacity",
+            Self::Unauthorized => "unauthorized",
+            Self::AlreadyListening => "already_listening",
+            Self::Socket(error) => io_code(error),
+            Self::Authentication(_) => "authentication_failed",
+            Self::InvalidConfig => "invalid_config",
+        }
+    }
+}
+
 struct Inner {
     node: Node,
     identity: Keypair,
@@ -219,17 +243,26 @@ impl Endpoint {
     }
     /// Dial a public key. Records published by other keys at that topic are ignored.
     pub async fn connect(&self, peer: PublicKey, seeds: &[Contact]) -> Result<Connection, Error> {
-        let _permit = self
-            .inner
-            .connections
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Busy)?;
-        guarded(self.dht(), self.inner.config.deadline, async {
-            let records = self.discover(peer, seeds).await?;
-            self.connect_records(peer, &records).await
-        })
-        .await
+        let mut operation = self.dht().diagnostics().operation("connect.result");
+        operation.field("initiator", Value::Flag(true));
+        let result = async {
+            let _permit = self
+                .inner
+                .connections
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Error::Busy)?;
+            guarded(self.dht(), self.inner.config.deadline, async {
+                let lookup = operation.child("connect.discovery");
+                let records = self.discover(peer, seeds).await;
+                lookup.finish(records.as_ref().err().map(Error::code).unwrap_or(""));
+                self.connect_records(peer, &records?, &operation).await
+            })
+            .await
+        }
+        .await;
+        operation.finish(result.as_ref().err().map(Error::code).unwrap_or(""));
+        result
     }
     async fn discover(&self, peer: PublicKey, seeds: &[Contact]) -> Result<Vec<Record>, Error> {
         let mut events = self.dht().subscribe();
@@ -327,39 +360,63 @@ impl Endpoint {
         &self,
         peer: PublicKey,
         records: &[Record],
+        observation: &Operation,
     ) -> Result<Connection, Error> {
         let reflectors: Vec<_> = records.iter().map(|r| r.coordinator).collect();
-        let socket = self.prepare(&reflectors).await?;
-        let mut events = self.dht().subscribe();
-        let session = self
-            .dht()
-            .signal_via(records, encode(socket.candidates(), false)?)
-            .await?;
-        let candidates = loop {
-            match next_event(&mut events).await? {
-                Event::Answered(signal)
-                    if signal.envelope.session == session && signal.envelope.author == peer =>
-                {
-                    break decode(&signal.payload, true)?;
+        let socket = self.prepare(&reflectors, observation.id()).await?;
+        let signal_observation = observation.child("connect.signaling");
+        let result = async {
+            let mut events = self.dht().subscribe();
+            let session = self
+                .dht()
+                .signal_via(records, encode(socket.candidates(), false)?)
+                .await?;
+            let candidates = loop {
+                match next_event(&mut events).await? {
+                    Event::Answered(signal)
+                        if signal.envelope.session == session && signal.envelope.author == peer =>
+                    {
+                        break decode(&signal.payload, true)?;
+                    }
+                    Event::SignalTimedOut(id) if id == session => {
+                        return Err(Error::SignalingTimedOut)
+                    }
+                    _ => {}
                 }
-                Event::SignalTimedOut(id) if id == session => return Err(Error::SignalingTimedOut),
-                _ => {}
-            }
-        };
+            };
+            Ok::<_, Error>((session, candidates))
+        }
+        .await;
+        signal_observation.finish(result.as_ref().err().map(Error::code).unwrap_or(""));
+        let (session, candidates) = result?;
         let channel = socket
             .punch(&candidates, &self.inner.config.punch, session, true)
             .await
             .map_err(Error::Socket)?
             .ok_or(Error::DirectUnavailable)?;
+        let handshake = observation.child("noise.handshake");
         let link =
-            NoiseLink::connect_session(channel, &self.inner.identity, node_id(peer), session)
-                .await
-                .map_err(Error::Authentication)?;
-        Ok(Connection::new(peer, session, link).on_network(self.dht().network()))
+            NoiseLink::connect_session(channel, &self.inner.identity, node_id(peer), session).await;
+        handshake.finish(
+            link.as_ref()
+                .err()
+                .map(|_| "authentication_failed")
+                .unwrap_or(""),
+        );
+        Ok(
+            Connection::new(peer, session, link.map_err(Error::Authentication)?)
+                .observed(self.dht().diagnostics(), observation.id())
+                .on_network(self.dht().network()),
+        )
     }
-    async fn prepare(&self, reflectors: &[Contact]) -> Result<DirectSocket, Error> {
+
+    async fn prepare(&self, reflectors: &[Contact], parent: u64) -> Result<DirectSocket, Error> {
         self.dht()
-            .direct_socket(reflectors, self.inner.config.port_mapping.as_ref())
+            .direct_socket_for(
+                reflectors,
+                self.inner.config.port_mapping.as_ref(),
+                Some(parent),
+            )
             .await
             .map_err(Error::Socket)
     }
@@ -407,46 +464,66 @@ impl Listener {
                 break (coordinator, signal);
             }
         };
-        let endpoint = &self.endpoint;
-        if !(endpoint.inner.config.authorize)(signal.envelope.author) {
-            return Err(Error::Unauthorized);
-        }
-        let mut reflectors = self.reflectors.lock().expect("reflectors").clone();
-        if !reflectors.contains(&coordinator) {
-            reflectors.push(coordinator);
-        }
-        reflectors.truncate(dht_next::MAX_COORDINATORS);
-        let _permit = endpoint
-            .inner
-            .connections
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| Error::Busy)?;
-        guarded(endpoint.dht(), endpoint.inner.config.deadline, async {
-            let peer = signal.envelope.author;
-            let session = signal.envelope.session;
-            let candidates = decode(&signal.payload, false)?;
-            let socket = endpoint.prepare(&reflectors).await?;
-            endpoint
-                .dht()
-                .answer(session, encode(socket.candidates(), true)?)
-                .await?;
-            let channel = socket
-                .punch(&candidates, &endpoint.inner.config.punch, session, false)
-                .await
-                .map_err(Error::Socket)?
-                .ok_or(Error::DirectUnavailable)?;
-            let (link, _) = NoiseLink::accept_session(
-                channel,
-                &endpoint.inner.identity,
-                node_id(peer),
-                session,
-            )
+        let mut observation = self
+            .endpoint
+            .dht()
+            .diagnostics()
+            .operation("connect.result");
+        observation.field("initiator", Value::Flag(false));
+        let result = async {
+            let endpoint = &self.endpoint;
+            if !(endpoint.inner.config.authorize)(signal.envelope.author) {
+                return Err(Error::Unauthorized);
+            }
+            let mut reflectors = self.reflectors.lock().expect("reflectors").clone();
+            if !reflectors.contains(&coordinator) {
+                reflectors.push(coordinator);
+            }
+            reflectors.truncate(dht_next::MAX_COORDINATORS);
+            let _permit = endpoint
+                .inner
+                .connections
+                .clone()
+                .try_acquire_owned()
+                .map_err(|_| Error::Busy)?;
+            guarded(endpoint.dht(), endpoint.inner.config.deadline, async {
+                let peer = signal.envelope.author;
+                let session = signal.envelope.session;
+                let candidates = decode(&signal.payload, false)?;
+                let socket = endpoint.prepare(&reflectors, observation.id()).await?;
+                endpoint
+                    .dht()
+                    .answer(session, encode(socket.candidates(), true)?)
+                    .await?;
+                let channel = socket
+                    .punch(&candidates, &endpoint.inner.config.punch, session, false)
+                    .await
+                    .map_err(Error::Socket)?
+                    .ok_or(Error::DirectUnavailable)?;
+                let handshake = observation.child("noise.handshake");
+                let link = NoiseLink::accept_session(
+                    channel,
+                    &endpoint.inner.identity,
+                    node_id(peer),
+                    session,
+                )
+                .await;
+                handshake.finish(
+                    link.as_ref()
+                        .err()
+                        .map(|_| "authentication_failed")
+                        .unwrap_or(""),
+                );
+                let (link, _) = link.map_err(Error::Authentication)?;
+                Ok(Connection::new(peer, session, link)
+                    .observed(endpoint.dht().diagnostics(), observation.id())
+                    .on_network(endpoint.dht().network()))
+            })
             .await
-            .map_err(Error::Authentication)?;
-            Ok(Connection::new(peer, session, link).on_network(endpoint.dht().network()))
-        })
-        .await
+        }
+        .await;
+        observation.finish(result.as_ref().err().map(Error::code).unwrap_or(""));
+        result
     }
     pub async fn close(mut self) {
         if let Some(stop) = self.stop.take() {
@@ -461,6 +538,9 @@ impl Listener {
 /// An authenticated datagram link usable by the existing reliable feed/blob
 /// transfer APIs. This is not an ordered `AsyncRead`/`AsyncWrite` byte stream.
 pub struct Connection {
+    dropped_datagrams: Arc<std::sync::atomic::AtomicU64>,
+    diagnostics: driver::diagnostics::Observer,
+    parent: Option<u64>,
     peer: PublicKey,
     session: [u8; 32],
     link: Arc<NoiseLink<driver::next::DirectChannel>>,
@@ -474,6 +554,23 @@ pub struct Connection {
 }
 impl Drop for Connection {
     fn drop(&mut self) {
+        self.diagnostics.event(
+            "connection.queue",
+            "",
+            vec![
+                (
+                    "dropped_datagrams",
+                    Value::Count(
+                        self.dropped_datagrams
+                            .load(std::sync::atomic::Ordering::Relaxed),
+                    ),
+                ),
+                (
+                    "connection_operation_id",
+                    Value::Count(self.parent.unwrap_or(0)),
+                ),
+            ],
+        );
         self.receiver.abort();
         if let Some(task) = &self.network_task {
             task.abort();
@@ -481,6 +578,11 @@ impl Drop for Connection {
     }
 }
 impl Connection {
+    fn observed(mut self, diagnostics: driver::diagnostics::Observer, parent: u64) -> Self {
+        self.diagnostics = diagnostics;
+        self.parent = Some(parent);
+        self
+    }
     fn new(
         peer: PublicKey,
         session: [u8; 32],
@@ -489,8 +591,16 @@ impl Connection {
         let link = Arc::new(link);
         let receiving = link.clone();
         let (send, incoming) = mpsc::channel(CAPACITY);
-        let receiver = tokio::spawn(receive_connection(receiving, send));
+        let dropped_datagrams = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let receiver = tokio::spawn(receive_connection(
+            receiving,
+            send,
+            dropped_datagrams.clone(),
+        ));
         Self {
+            dropped_datagrams,
+            diagnostics: Default::default(),
+            parent: None,
             peer,
             session,
             link,
@@ -548,6 +658,7 @@ const DEAD_PEER: Duration = Duration::from_secs(90);
 async fn receive_connection<L: Link + Send + Sync + 'static>(
     link: Arc<L>,
     send: mpsc::Sender<io::Result<Vec<u8>>>,
+    dropped: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut heartbeat =
         tokio::time::interval_at(tokio::time::Instant::now() + KEEPALIVE, KEEPALIVE);
@@ -568,7 +679,8 @@ async fn receive_connection<L: Link + Send + Sync + 'static>(
                         [0, payload @ ..] => {
                             last_received = tokio::time::Instant::now();
                             match send.try_send(Ok(payload.to_vec())) {
-                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                                Ok(()) => {},
+                                Err(mpsc::error::TrySendError::Full(_)) => { dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed); },
                                 Err(mpsc::error::TrySendError::Closed(_)) => return Ok(()),
                             }
                         }
@@ -589,6 +701,9 @@ async fn receive_connection<L: Link + Send + Sync + 'static>(
     }
 }
 impl Link for Connection {
+    fn observation(&self, name: &'static str) -> Operation {
+        self.diagnostics.child(name, self.parent)
+    }
     async fn send(&self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > self.max_payload() {
             return Err(io::Error::new(
@@ -792,6 +907,7 @@ mod tests {
         let router = router(91).await;
         let server = endpoint(92, "127.0.0.1").await;
         let client = endpoint(93, "127.0.0.1").await;
+        let mut observations = client.dht().diagnostics().subscribe().unwrap();
         let seeds = [contact(&router)];
         let mut listener = server.listen(&seeds).await.unwrap();
         let (outgoing, incoming) = tokio::join!(
@@ -820,6 +936,32 @@ mod tests {
         .unwrap()
         .unwrap();
         assert_eq!(received, bytes);
+        let mut events = Vec::new();
+        while let Ok(event) = observations.try_recv() {
+            events.push(event);
+        }
+        let connection = events.iter().find(|e| e.name == "connect.result").unwrap();
+        assert_eq!(connection.outcome, "success");
+        for name in [
+            "connect.discovery",
+            "nat.reflection",
+            "connect.signaling",
+            "nat.punch",
+            "noise.handshake",
+            "blob.download",
+            "transfer.transport",
+        ] {
+            let event = events
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(
+                event.parent,
+                Some(connection.operation),
+                "{name} correlation"
+            );
+            assert_eq!(event.outcome, "success");
+        }
         serving.abort();
         assert!(serving.await.unwrap_err().is_cancelled());
         assert_eq!(
@@ -866,11 +1008,12 @@ mod tests {
             (&b, &a)
         };
         dead.shutdown().await.unwrap();
+        let observation = client.dht().diagnostics().operation("connect.result");
         let (outgoing, incoming) = tokio::join!(
             guarded(
                 client.dht(),
                 Duration::from_secs(15),
-                client.connect_records(server.public_key(), &records)
+                client.connect_records(server.public_key(), &records, &observation)
             ),
             listener.accept()
         );
@@ -1427,6 +1570,7 @@ mod maintenance_tests {
                 outgoing,
             }),
             send,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
         // Saturate the application queue and keep the connection idle to its user.
         for _ in 0..CAPACITY + 1 {
@@ -1462,6 +1606,7 @@ mod maintenance_tests {
                 outgoing,
             }),
             send,
+            Arc::new(std::sync::atomic::AtomicU64::new(0)),
         ));
         network.send(vec![1]).await.unwrap();
         assert_eq!(sent.recv().await.unwrap(), vec![2]);

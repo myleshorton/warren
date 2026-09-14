@@ -1291,6 +1291,7 @@ mod tests {
                 });
                 let node = Node {
                     inner: Arc::new(Inner {
+                        diagnostics: crate::diagnostics::Observer::new(),
                         commands,
                         events,
                         translation: watch::channel(

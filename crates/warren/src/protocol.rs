@@ -317,23 +317,34 @@ pub async fn fetch_feed(
     req: u8,
     cfg: &transfer::Config,
 ) -> Option<(Vec<Vec<u8>>, crypto::PublicKey)> {
-    let mut ch = secure_dial(node, peer).await.ok()?;
-    ch.send(&[req]).await.ok()?;
-
-    // Bound the handshake reply so a reachable-but-silent peer can't stall discovery
-    // (the same guard as the by-key subscribe/replicate/fetch_replica handshakes).
-    let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(cfg.request_timeout * 2, ch.recv(&mut buf))
-        .await
-        .ok()?
-        .ok()?;
-    if n < 32 {
-        return None;
+    let observation = node.diagnostics().operation("feed.fetch");
+    let result: Result<_, &'static str> = async {
+        let mut ch = secure_dial(node, peer)
+            .await
+            .map_err(|_| "connect_failed")?;
+        ch.send(&[req])
+            .await
+            .map_err(|e| driver::diagnostics::io_code(&e))?;
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(cfg.request_timeout * 2, ch.recv(&mut buf))
+            .await
+            .map_err(|_| "feed_key_timeout")?
+            .map_err(|e| driver::diagnostics::io_code(&e))?;
+        if n < 32 {
+            return Err("invalid_feed_key_length");
+        }
+        let pk_bytes: [u8; 32] = buf[..32]
+            .try_into()
+            .map_err(|_| "invalid_feed_key_length")?;
+        let pubkey = crypto::PublicKey::from_bytes(&pk_bytes).map_err(|_| "invalid_feed_key")?;
+        let blocks = transfer::download_feed(&mut ch, pubkey, cfg)
+            .await
+            .map_err(|e| e.code())?;
+        Ok((blocks, pubkey))
     }
-    let pk_bytes: [u8; 32] = buf[..32].try_into().ok()?;
-    let pubkey = crypto::PublicKey::from_bytes(&pk_bytes).ok()?;
-    let blocks = transfer::download_feed(&mut ch, pubkey, cfg).await.ok()?;
-    Some((blocks, pubkey))
+    .await;
+    observation.finish(result.as_ref().err().copied().unwrap_or(""));
+    result.ok()
 }
 
 /// Open authenticated blob channels to several providers of `blob_hash` for a swarm

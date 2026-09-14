@@ -32,6 +32,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
+pub mod diagnostics;
 mod lan;
 pub mod next;
 

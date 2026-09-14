@@ -276,3 +276,42 @@ async fn v6_mirror_serves_an_offline_authors_verified_feed() {
     .await
     .unwrap();
 }
+
+#[tokio::test]
+async fn failed_blob_persistence_reports_failure_without_an_append() {
+    let directory = tempfile::tempdir().unwrap();
+    let invalid_directory = directory.path().join("not-a-directory");
+    std::fs::write(&invalid_directory, b"occupied").unwrap();
+    let node = NextNode::bind_with_role(
+        "127.0.0.1:0".parse().unwrap(),
+        crypto::Keypair::from_seed(&[121; 32]),
+        false,
+    )
+    .await
+    .unwrap();
+    let mut observations = node.diagnostics().subscribe().unwrap();
+    let author = session(node, 122, &invalid_directory, b"test");
+    assert!(author
+        .publish("video/mp4".into(), serde_json::Map::new(), vec![42; 128])
+        .await
+        .is_err());
+    let mut events = Vec::new();
+    while let Ok(event) = observations.try_recv() {
+        events.push(event);
+    }
+    let write = events
+        .iter()
+        .find(|event| event.name == "storage.blob.write")
+        .unwrap();
+    assert_eq!(write.outcome, "error");
+    assert!(!write.error_code.is_empty());
+    assert!(!events.iter().any(|event| event.name == "feed.append"));
+    assert_eq!(
+        events
+            .iter()
+            .find(|event| event.name == "publish.result")
+            .unwrap()
+            .outcome,
+        "error"
+    );
+}

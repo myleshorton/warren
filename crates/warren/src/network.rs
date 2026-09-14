@@ -23,6 +23,9 @@ pub struct Member {
 }
 
 pub trait Network: Clone + Send + Sync + 'static {
+    fn diagnostics(&self) -> driver::diagnostics::Observer {
+        driver::diagnostics::Observer::default()
+    }
     fn id(&self) -> NodeId;
     fn lookup(&self, topic: NodeId) -> impl Future<Output = Result<Vec<Member>, String>> + Send;
     fn announce(&self, topic: NodeId) -> impl Future<Output = Result<(), String>> + Send;
@@ -50,6 +53,12 @@ pub enum Secure {
     Next(transfer::next::Connection),
 }
 impl Link for Secure {
+    fn observation(&self, name: &'static str) -> driver::diagnostics::Operation {
+        match self {
+            Self::Legacy(l) => l.observation(name),
+            Self::Next(l) => l.observation(name),
+        }
+    }
     async fn send(&self, bytes: &[u8]) -> io::Result<usize> {
         match self {
             Self::Legacy(l) => l.send(bytes).await,
@@ -220,45 +229,58 @@ impl NextNode {
             .map_err(io_error)
     }
     async fn query(&self, topic: NodeId) -> Result<(Vec<Record>, Vec<Contact>), String> {
-        let node = self.inner.endpoint.dht();
-        let mut events = node.subscribe();
-        let query = node
-            .lookup(topic, &self.seeds())
-            .await
-            .map_err(|e| e.to_string())?;
-        let _guard = QueryGuard {
-            node: node.clone(),
-            query,
-        };
-        tokio::time::timeout(Duration::from_secs(45), async {
-            let mut records = Vec::new();
-            loop {
-                match events.recv().await.map_err(|e| e.to_string())? {
-                    Notice::Dht(e) => match *e {
-                        Event::Providers {
-                            query: q,
-                            records: found,
-                        } if q == query => records.extend(found),
-                        Event::LookupDone {
-                            query: q,
-                            closest,
-                            timed_out,
-                        } if q == query => {
-                            if timed_out && records.is_empty() {
-                                return Err("provider lookup timed out".to_string());
+        let observation = self.endpoint().dht().diagnostics().operation("dht.lookup");
+        let result: Result<_, String> = async {
+            let node = self.inner.endpoint.dht();
+            let mut events = node.subscribe();
+            let query = node
+                .lookup(topic, &self.seeds())
+                .await
+                .map_err(|e| e.to_string())?;
+            let _guard = QueryGuard {
+                node: node.clone(),
+                query,
+            };
+            tokio::time::timeout(Duration::from_secs(45), async {
+                let mut records = Vec::new();
+                loop {
+                    match events.recv().await.map_err(|e| e.to_string())? {
+                        Notice::Dht(e) => match *e {
+                            Event::Providers {
+                                query: q,
+                                records: found,
+                            } if q == query => records.extend(found),
+                            Event::LookupDone {
+                                query: q,
+                                closest,
+                                timed_out,
+                            } if q == query => {
+                                if timed_out && records.is_empty() {
+                                    return Err("provider lookup timed out".to_string());
+                                }
+                                return Ok((records, closest));
                             }
-                            return Ok((records, closest));
-                        }
-                        Event::NetworkChanged(_) => return Err("network changed".to_string()),
-                        _ => {}
-                    },
-                    Notice::Stopped => return Err("DHT stopped".to_string()),
-                    Notice::IoError(_) => {}
+                            Event::NetworkChanged(_) => return Err("network changed".to_string()),
+                            _ => {}
+                        },
+                        Notice::Stopped => return Err("DHT stopped".to_string()),
+                        Notice::IoError(_) => {}
+                    }
                 }
-            }
-        })
-        .await
-        .map_err(|_| "provider lookup deadline".to_string())?
+            })
+            .await
+            .map_err(|_| "provider lookup deadline".to_string())?
+        }
+        .await;
+        let code = match result.as_ref().err().map(String::as_str) {
+            None => "",
+            Some("provider lookup timed out" | "provider lookup deadline") => "timeout",
+            Some("network changed") => "network_changed",
+            Some("DHT stopped") => "closed",
+            Some(_) => "lookup_failed",
+        };
+        observation.finish(code);
+        result
     }
     pub async fn next_incoming(&self) -> io::Result<Secure> {
         self.listen().await?;
@@ -394,6 +416,9 @@ impl NextNode {
 }
 
 impl Network for NextNode {
+    fn diagnostics(&self) -> driver::diagnostics::Observer {
+        self.endpoint().dht().diagnostics()
+    }
     async fn incoming(&self) -> Result<Incoming, String> {
         match self.next_incoming().await.map_err(|e| e.to_string())? {
             Secure::Next(link) => Ok(Incoming::Next(link)),
@@ -407,7 +432,10 @@ impl Network for NextNode {
         let (mut records, closest) = self.query(topic).await?;
         // Pagination enriches a successful lookup; a failed page must not erase
         // providers already found. Every retained record is verified below.
-        let _ = self.pages(topic, closest, &mut records).await;
+        if self.pages(topic, closest, &mut records).await.is_err() {
+            self.diagnostics()
+                .event("dht.pagination", "pagination_failed", vec![]);
+        }
         let now = unix();
         let mut keys = self.inner.providers.lock().expect("providers");
         keys.retain(|_, (_, expiry)| *expiry > now);

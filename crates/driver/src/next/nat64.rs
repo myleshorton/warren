@@ -184,6 +184,7 @@ pub(super) struct Translation {
     pub(super) bind: SocketAddr,
     prefixes: Vec<Prefix>,
     native_ipv4: bool,
+    pub(super) discovery_status: &'static str,
 }
 impl Translation {
     pub async fn discover(bind: SocketAddr) -> Self {
@@ -202,19 +203,33 @@ impl Translation {
         // A UDP connect checks the route without sending a packet.
         let native_ipv4 =
             bind.ip().is_unspecified() && native_ipv4(SocketAddr::from(([192, 0, 0, 170], 9)));
-        let prefixes = if bind.is_ipv6() && !bind.ip().is_loopback() && !native_ipv4 {
-            tokio::time::timeout(std::time::Duration::from_secs(5), lookup)
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .unwrap_or_default()
-        } else {
-            vec![]
-        };
+        let (prefixes, discovery_status) =
+            if bind.is_ipv6() && !bind.ip().is_loopback() && !native_ipv4 {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), lookup).await {
+                    Ok(Ok(prefixes)) if !prefixes.is_empty() => (prefixes, "found"),
+                    Ok(Ok(prefixes)) => (prefixes, "empty"),
+                    Ok(Err(_)) => (vec![], "resolver_error"),
+                    Err(_) => (vec![], "timeout"),
+                }
+            } else {
+                (vec![], "not_required")
+            };
         Self {
             bind,
             prefixes,
             native_ipv4,
+            discovery_status,
+        }
+    }
+    pub(super) fn mode(&self) -> &'static str {
+        if self.bind.is_ipv4() {
+            "ipv4"
+        } else if self.native_ipv4 {
+            "dual_stack"
+        } else if !self.prefixes.is_empty() {
+            "nat64"
+        } else {
+            "ipv6"
         }
     }
     pub fn destination(&self, address: SocketAddr) -> SocketAddr {
@@ -278,6 +293,7 @@ mod tests {
             bind: "[2001:db8::1]:0".parse().unwrap(),
             prefixes: found,
             native_ipv4: false,
+            discovery_status: "found",
         };
         assert_eq!(
             transport.destination(public),
@@ -389,6 +405,7 @@ mod tests {
             bind: "[::]:0".parse().unwrap(),
             prefixes: found,
             native_ipv4: false,
+            discovery_status: "found",
         };
         assert_eq!(
             transport.source("[64:ff9b::c000:201]:41800".parse().unwrap()),

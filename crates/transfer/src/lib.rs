@@ -107,6 +107,9 @@ const STEAL_BATCH: usize = 4;
 /// `L: Link` onto a [`tokio::task::JoinSet`], which requires the futures be `Send` —
 /// a bound `async fn` in a trait can't express.
 pub trait Link {
+    fn observation(&self, name: &'static str) -> driver::diagnostics::Operation {
+        driver::diagnostics::Observer::default().operation(name)
+    }
     /// Send one datagram to the peer, returning the number of bytes sent.
     fn send(&self, data: &[u8]) -> impl std::future::Future<Output = io::Result<usize>> + Send;
     /// Receive one datagram from the peer into `buf`, returning its length.
@@ -193,18 +196,24 @@ pub async fn download_feed_full<L: Link>(
     public_key: PublicKey,
     cfg: &Config,
 ) -> Result<(Option<feed::Head>, Vec<Vec<u8>>), TransferError> {
-    let mut dl = FeedDownload::new(public_key);
-    let mut wire = Wire::new(
-        channel,
-        cfg.initial_rtt,
-        cfg.request_timeout,
-        Cursor::default(),
-    );
-    while let Some(request) = dl.poll_request() {
-        let response = exchange(&mut wire, &request, cfg).await?;
-        dl.handle_response(&response)?;
+    let observation = channel.observation("feed.download");
+    let result: Result<_, TransferError> = async {
+        let mut dl = FeedDownload::new(public_key);
+        let mut wire = Wire::new(
+            channel,
+            cfg.initial_rtt,
+            cfg.request_timeout,
+            Cursor::default(),
+        );
+        while let Some(request) = dl.poll_request() {
+            let response = exchange(&mut wire, &request, cfg).await?;
+            dl.handle_response(&response)?;
+        }
+        Ok((dl.head().cloned(), dl.into_blocks()))
     }
-    Ok((dl.head().cloned(), dl.into_blocks()))
+    .await;
+    observation.finish(result.as_ref().err().map(TransferError::code).unwrap_or(""));
+    result
 }
 
 /// Download a **window** of a feed over `channel`: fetch the head and the peaks, then only
@@ -263,19 +272,25 @@ async fn drive_feed_window<L: Link>(
     mut w: FeedWindow,
     cfg: &Config,
 ) -> Result<(sync::WindowData, Vec<u64>), TransferError> {
-    let mut wire = Wire::new(
-        channel,
-        cfg.initial_rtt,
-        cfg.request_timeout,
-        Cursor::default(),
-    );
-    while let Some(request) = w.poll_request() {
-        let response = exchange(&mut wire, &request, cfg).await?;
-        w.handle_response(&response)?;
+    let observation = channel.observation("feed.window");
+    let result: Result<_, TransferError> = async {
+        let mut wire = Wire::new(
+            channel,
+            cfg.initial_rtt,
+            cfg.request_timeout,
+            Cursor::default(),
+        );
+        while let Some(request) = w.poll_request() {
+            let response = exchange(&mut wire, &request, cfg).await?;
+            w.handle_response(&response)?;
+        }
+        let missing = w.missing();
+        let window = w.into_window().ok_or(TransferError::Incomplete)?;
+        Ok((window, missing))
     }
-    let missing = w.missing();
-    let window = w.into_window().ok_or(TransferError::Incomplete)?;
-    Ok((window, missing))
+    .await;
+    observation.finish(result.as_ref().err().map(TransferError::code).unwrap_or(""));
+    result
 }
 
 /// Subscribe to a feed and deliver its blocks **as they are appended**, over a
@@ -297,30 +312,36 @@ where
     L: Link,
     F: FnMut(u64, Vec<u8>),
 {
-    let mut wire = Wire::new(
-        channel,
-        cfg.initial_rtt,
-        cfg.request_timeout,
-        Cursor::default(),
-    );
-    loop {
-        // Poll for the head — the server holds this until there are new blocks.
-        let head = exchange(&mut wire, &Message::Tail { have: from }, cfg).await?;
-        let mut dl = FeedDownload::resume(public_key, from);
-        dl.handle_response(&head)?;
-        while let Some(request) = dl.poll_request() {
-            let response = exchange(&mut wire, &request, cfg).await?;
-            dl.handle_response(&response)?;
+    let observation = channel.observation("feed.subscribe");
+    let result: Result<_, TransferError> = async {
+        let mut wire = Wire::new(
+            channel,
+            cfg.initial_rtt,
+            cfg.request_timeout,
+            Cursor::default(),
+        );
+        loop {
+            // Poll for the head — the server holds this until there are new blocks.
+            let head = exchange(&mut wire, &Message::Tail { have: from }, cfg).await?;
+            let mut dl = FeedDownload::resume(public_key, from);
+            dl.handle_response(&head)?;
+            while let Some(request) = dl.poll_request() {
+                let response = exchange(&mut wire, &request, cfg).await?;
+                dl.handle_response(&response)?;
+            }
+            let next = dl.head().map(|h| h.len).unwrap_or(from);
+            for (offset, block) in dl.into_blocks().into_iter().enumerate() {
+                on_block(from + offset as u64, block);
+            }
+            // Never let the cursor go backwards: on failover to a provider whose head is
+            // temporarily behind ours (or a buggy/hostile one reporting a short head), a
+            // regressing cursor would re-fetch and re-deliver already-seen blocks.
+            from = next.max(from);
         }
-        let next = dl.head().map(|h| h.len).unwrap_or(from);
-        for (offset, block) in dl.into_blocks().into_iter().enumerate() {
-            on_block(from + offset as u64, block);
-        }
-        // Never let the cursor go backwards: on failover to a provider whose head is
-        // temporarily behind ours (or a buggy/hostile one reporting a short head), a
-        // regressing cursor would re-fetch and re-deliver already-seen blocks.
-        from = next.max(from);
     }
+    .await;
+    observation.finish(result.as_ref().err().map(TransferError::code).unwrap_or(""));
+    result
 }
 
 /// Live-replicate a feed into a shared [`feed::Replica`]: tail `public_key`'s feed
@@ -393,18 +414,24 @@ pub async fn resume_blob<L: Link>(
     download: &mut BlobDownload,
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
-    let dl = download;
-    let mut wire = Wire::new(
-        channel,
-        cfg.initial_rtt,
-        cfg.request_timeout,
-        Cursor::default(),
-    );
-    while let Some(request) = dl.poll_request() {
-        let response = exchange(&mut wire, &request, cfg).await?;
-        dl.handle_response(&response)?;
+    let observation = channel.observation("blob.download");
+    let result: Result<_, TransferError> = async {
+        let dl = download;
+        let mut wire = Wire::new(
+            channel,
+            cfg.initial_rtt,
+            cfg.request_timeout,
+            Cursor::default(),
+        );
+        while let Some(request) = dl.poll_request() {
+            let response = exchange(&mut wire, &request, cfg).await?;
+            dl.handle_response(&response)?;
+        }
+        dl.reassemble().ok_or(TransferError::Incomplete)
     }
-    dl.reassemble().ok_or(TransferError::Incomplete)
+    .await;
+    observation.finish(result.as_ref().err().map(TransferError::code).unwrap_or(""));
+    result
 }
 
 /// One provider's result for a round of chunk fetches.
@@ -449,16 +476,24 @@ pub async fn download_blob_swarm<L: Link + Send + Sync + 'static>(
     id: Hash,
     cfg: &Config,
 ) -> Result<Vec<u8>, TransferError> {
-    // Rarest-first; no incremental delivery needed, so reassemble at the end.
-    let plan = run_swarm(
-        channels,
-        id,
-        cfg,
-        Selection::RarestFirst,
-        |_index, _bytes| {},
-    )
-    .await?;
-    plan.reassemble().ok_or(TransferError::Incomplete)
+    let observation = channels.first().map(|link| link.observation("blob.swarm"));
+    let result: Result<_, TransferError> = async {
+        // Rarest-first; no incremental delivery needed, so reassemble at the end.
+        let plan = run_swarm(
+            channels,
+            id,
+            cfg,
+            Selection::RarestFirst,
+            |_index, _bytes| {},
+        )
+        .await?;
+        plan.reassemble().ok_or(TransferError::Incomplete)
+    }
+    .await;
+    if let Some(observation) = observation {
+        observation.finish(result.as_ref().err().map(TransferError::code).unwrap_or(""));
+    }
+    result
 }
 
 /// Stream a blob from several providers for **playback**, with **bounded memory**:
@@ -482,17 +517,25 @@ pub async fn download_blob_stream<L: Link + Send + Sync + 'static, F>(
 where
     F: FnMut(usize, &[u8]),
 {
-    // A zero window could never fetch even the frontier chunk (nothing would be
-    // in range), so it would stall immediately; treat it as at least one.
-    let window = window.max(1);
-    let plan = run_swarm(channels, id, cfg, Selection::Streaming { window }, on_chunk).await?;
-    // Streaming drops chunks as it delivers them, so completion is "everything
-    // delivered", not "everything still stored".
-    if plan.all_delivered() {
-        Ok(())
-    } else {
-        Err(TransferError::Incomplete)
+    let observation = channels.first().map(|link| link.observation("blob.swarm"));
+    let result: Result<_, TransferError> = async {
+        // A zero window could never fetch even the frontier chunk (nothing would be
+        // in range), so it would stall immediately; treat it as at least one.
+        let window = window.max(1);
+        let plan = run_swarm(channels, id, cfg, Selection::Streaming { window }, on_chunk).await?;
+        // Streaming drops chunks as it delivers them, so completion is "everything
+        // delivered", not "everything still stored".
+        if plan.all_delivered() {
+            Ok(())
+        } else {
+            Err(TransferError::Incomplete)
+        }
     }
+    .await;
+    if let Some(observation) = observation {
+        observation.finish(result.as_ref().err().map(TransferError::code).unwrap_or(""));
+    }
+    result
 }
 
 /// The swarm engine behind [`download_blob_swarm`] and [`download_blob_stream`].
@@ -907,7 +950,10 @@ async fn exchange<L: Link>(
         // No progress: repair the gaps (NACK), or re-ask if nothing arrived yet.
         match wire.missing() {
             Some(missing) => wire.nack(missing.id, &missing.indices).await?,
-            None => wire.send(request).await?,
+            None => {
+                wire.retries += 1;
+                wire.send(request).await?;
+            }
         }
         stalls += 1;
         if stalls > cfg.retries {
@@ -930,116 +976,122 @@ async fn serve<L: Link>(
     tail: Option<&tokio::sync::Notify>,
     respond: impl Fn(&Message) -> Message,
 ) -> Result<(), TransferError> {
-    // The pacer caps the RTT it uses at request_timeout, so no single pacing
-    // pause reaches the peer's stall interval. This guards the usual shared-Config
-    // deployment against a mistuned initial_rtt that's already at/over the timeout
-    // (which would leave no headroom); real RTTs sit far below it.
-    debug_assert!(
-        cfg.initial_rtt < cfg.request_timeout,
-        "initial_rtt ({:?}) must be well below request_timeout ({:?})",
-        cfg.initial_rtt,
-        cfg.request_timeout
-    );
-    let mut wire = Wire::new(
-        channel,
-        cfg.initial_rtt,
-        cfg.request_timeout,
-        Cursor::default(),
-    );
-    // Idle is measured from the last *valid* activity, so a peer can't hold the
-    // session open by sending undecodable junk.
-    let mut deadline = Instant::now() + cfg.idle;
-    // The last request served, and whether its reply has drawn a NACK (so loss is
-    // counted once per reply). Telling a *new* request from a *retransmit* of the
-    // same one distinguishes clean delivery (the client moved on) from total loss
-    // (the client received nothing and re-asks — partial loss would NACK instead).
-    let mut last_request: Option<Message> = None;
-    let mut lost = false;
-    // When the last reply finished sending, for measuring RTT from the client's
-    // next request (its implicit ack).
-    let mut last_reply_at: Option<Instant> = None;
-    loop {
-        match wire.recv(deadline).await? {
-            // Answer only genuine requests. A response-type message (peer
-            // confusion, or a delayed packet) is ignored — replying `Absent` to
-            // it would inject terminal traffic at the client.
-            Some(Recv::Message(request)) if request.is_request() => {
-                let retransmit = last_request.as_ref() == Some(&request);
-                if wire.has_sent() {
-                    if retransmit {
-                        // Same request again → the client got none of the last
-                        // reply: back off (don't mistake a re-ask for progress).
+    let observation = channel.observation("transfer.serve");
+    let result: Result<_, TransferError> = async {
+        // The pacer caps the RTT it uses at request_timeout, so no single pacing
+        // pause reaches the peer's stall interval. This guards the usual shared-Config
+        // deployment against a mistuned initial_rtt that's already at/over the timeout
+        // (which would leave no headroom); real RTTs sit far below it.
+        debug_assert!(
+            cfg.initial_rtt < cfg.request_timeout,
+            "initial_rtt ({:?}) must be well below request_timeout ({:?})",
+            cfg.initial_rtt,
+            cfg.request_timeout
+        );
+        let mut wire = Wire::new(
+            channel,
+            cfg.initial_rtt,
+            cfg.request_timeout,
+            Cursor::default(),
+        );
+        // Idle is measured from the last *valid* activity, so a peer can't hold the
+        // session open by sending undecodable junk.
+        let mut deadline = Instant::now() + cfg.idle;
+        // The last request served, and whether its reply has drawn a NACK (so loss is
+        // counted once per reply). Telling a *new* request from a *retransmit* of the
+        // same one distinguishes clean delivery (the client moved on) from total loss
+        // (the client received nothing and re-asks — partial loss would NACK instead).
+        let mut last_request: Option<Message> = None;
+        let mut lost = false;
+        // When the last reply finished sending, for measuring RTT from the client's
+        // next request (its implicit ack).
+        let mut last_reply_at: Option<Instant> = None;
+        loop {
+            match wire.recv(deadline).await? {
+                // Answer only genuine requests. A response-type message (peer
+                // confusion, or a delayed packet) is ignored — replying `Absent` to
+                // it would inject terminal traffic at the client.
+                Some(Recv::Message(request)) if request.is_request() => {
+                    let retransmit = last_request.as_ref() == Some(&request);
+                    if wire.has_sent() {
+                        if retransmit {
+                            // Same request again → the client got none of the last
+                            // reply: back off (don't mistake a re-ask for progress).
+                            if !lost {
+                                wire.on_loss();
+                                lost = true;
+                            }
+                        } else if !lost {
+                            // A different request → the client accepted the last reply
+                            // cleanly: grow, and take a clean RTT sample (the gap since
+                            // we finished that reply). A repaired reply's timing is
+                            // muddied by the stall+NACK, so we skip it there.
+                            wire.on_delivered();
+                            if let Some(sent_at) = last_reply_at {
+                                wire.rtt_sample(sent_at.elapsed());
+                            }
+                        }
+                    }
+                    if !retransmit {
+                        lost = false;
+                        last_request = Some(request.clone());
+                    }
+                    let mut response = respond(&request);
+                    // Live-tail: if this is a subscription poll (`Tail`) and the feed
+                    // hasn't grown past the subscriber's cursor, hold the reply until an
+                    // append is signaled — bounded by a keepalive kept under the client's
+                    // stall bound, so it heartbeats rather than timing out. This is server
+                    // push (new blocks the instant they land), not client polling.
+                    if let (Some(notify), Message::Tail { have }) = (tail, &request) {
+                        let keepalive = cfg.request_timeout / 2;
+                        // Hold only while *exactly* at head (`len == have`); a cursor past
+                        // the head is abnormal and shouldn't incur a keepalive delay.
+                        while matches!(&response, Message::Head(h) if h.len == *have) {
+                            // Register the wake *before* re-reading the head:
+                            // `notify_waiters()` wakes only already-registered waiters (it
+                            // stores no permit), so an append signaled between the read and
+                            // the await would otherwise be missed and the push delayed to
+                            // the keepalive. `enable()` registers now; the re-check right
+                            // after it catches an append that landed in the gap.
+                            let notified = notify.notified();
+                            tokio::pin!(notified);
+                            notified.as_mut().enable();
+                            response = respond(&request);
+                            if !matches!(&response, Message::Head(h) if h.len == *have) {
+                                break; // grew in the gap: send the new head now
+                            }
+                            if timeout(keepalive, notified).await.is_err() {
+                                break; // keepalive elapsed: heartbeat the unchanged head
+                            }
+                            response = respond(&request); // an append woke us: re-read
+                        }
+                    }
+                    wire.send(&response).await?;
+                    last_reply_at = Some(Instant::now());
+                    deadline = Instant::now() + cfg.idle;
+                }
+                Some(Recv::Message(_)) => {} // response-type: ignore
+                // The client is missing fragments of the reply we last sent: resend
+                // just those. Only a NACK that actually causes a resend counts as
+                // activity (holds the session open) — a stale, empty, or bogus one
+                // resends nothing and mustn't let a client keep the session alive by
+                // spamming NACKs. The first real NACK for a reply shrinks the window.
+                Some(Recv::Nack { id, indices }) => {
+                    if wire.resend(id, &indices).await? {
                         if !lost {
                             wire.on_loss();
                             lost = true;
                         }
-                    } else if !lost {
-                        // A different request → the client accepted the last reply
-                        // cleanly: grow, and take a clean RTT sample (the gap since
-                        // we finished that reply). A repaired reply's timing is
-                        // muddied by the stall+NACK, so we skip it there.
-                        wire.on_delivered();
-                        if let Some(sent_at) = last_reply_at {
-                            wire.rtt_sample(sent_at.elapsed());
-                        }
+                        deadline = Instant::now() + cfg.idle;
                     }
                 }
-                if !retransmit {
-                    lost = false;
-                    last_request = Some(request.clone());
-                }
-                let mut response = respond(&request);
-                // Live-tail: if this is a subscription poll (`Tail`) and the feed
-                // hasn't grown past the subscriber's cursor, hold the reply until an
-                // append is signaled — bounded by a keepalive kept under the client's
-                // stall bound, so it heartbeats rather than timing out. This is server
-                // push (new blocks the instant they land), not client polling.
-                if let (Some(notify), Message::Tail { have }) = (tail, &request) {
-                    let keepalive = cfg.request_timeout / 2;
-                    // Hold only while *exactly* at head (`len == have`); a cursor past
-                    // the head is abnormal and shouldn't incur a keepalive delay.
-                    while matches!(&response, Message::Head(h) if h.len == *have) {
-                        // Register the wake *before* re-reading the head:
-                        // `notify_waiters()` wakes only already-registered waiters (it
-                        // stores no permit), so an append signaled between the read and
-                        // the await would otherwise be missed and the push delayed to
-                        // the keepalive. `enable()` registers now; the re-check right
-                        // after it catches an append that landed in the gap.
-                        let notified = notify.notified();
-                        tokio::pin!(notified);
-                        notified.as_mut().enable();
-                        response = respond(&request);
-                        if !matches!(&response, Message::Head(h) if h.len == *have) {
-                            break; // grew in the gap: send the new head now
-                        }
-                        if timeout(keepalive, notified).await.is_err() {
-                            break; // keepalive elapsed: heartbeat the unchanged head
-                        }
-                        response = respond(&request); // an append woke us: re-read
-                    }
-                }
-                wire.send(&response).await?;
-                last_reply_at = Some(Instant::now());
-                deadline = Instant::now() + cfg.idle;
+                None => return Ok(()), // idle: the client has stopped asking
             }
-            Some(Recv::Message(_)) => {} // response-type: ignore
-            // The client is missing fragments of the reply we last sent: resend
-            // just those. Only a NACK that actually causes a resend counts as
-            // activity (holds the session open) — a stale, empty, or bogus one
-            // resends nothing and mustn't let a client keep the session alive by
-            // spamming NACKs. The first real NACK for a reply shrinks the window.
-            Some(Recv::Nack { id, indices }) => {
-                if wire.resend(id, &indices).await? {
-                    if !lost {
-                        wire.on_loss();
-                        lost = true;
-                    }
-                    deadline = Instant::now() + cfg.idle;
-                }
-            }
-            None => return Ok(()), // idle: the client has stopped asking
         }
     }
+    .await;
+    observation.finish(result.as_ref().err().map(TransferError::code).unwrap_or(""));
+    result
 }
 
 /// What [`Wire::recv`] surfaced: a completed, decoded message, or a peer's NACK
@@ -1063,6 +1115,12 @@ enum Recv {
 /// it holds one monotonic outbound id counter (ids let the peer's reassembler
 /// follow the newest attempt) and one inbound reassembler.
 struct Wire<'a, L: Link> {
+    observation: Option<driver::diagnostics::Operation>,
+    sent_fragments: std::sync::atomic::AtomicU64,
+    repaired_fragments: std::sync::atomic::AtomicU64,
+    nacks: std::sync::atomic::AtomicU64,
+    retries: u64,
+    malformed: u64,
     link: &'a L,
     next_id: u64,
     inbound: Reassembler,
@@ -1076,6 +1134,36 @@ struct Wire<'a, L: Link> {
     rtt: Rtt,
 }
 
+impl<L: Link> Drop for Wire<'_, L> {
+    fn drop(&mut self) {
+        use driver::diagnostics::Value;
+        use std::sync::atomic::Ordering;
+        if let Some(mut observation) = self.observation.take() {
+            observation.field(
+                "sent_fragments",
+                Value::Count(self.sent_fragments.load(Ordering::Relaxed)),
+            );
+            observation.field(
+                "repair_fragments_attempted",
+                Value::Count(self.repaired_fragments.load(Ordering::Relaxed)),
+            );
+            observation.field(
+                "nacks_attempted",
+                Value::Count(self.nacks.load(Ordering::Relaxed)),
+            );
+            observation.field("request_retries", Value::Count(self.retries));
+            observation.field("malformed_messages", Value::Count(self.malformed));
+            observation.field(
+                "rtt_us",
+                Value::Count(self.rtt.get().as_micros().min(u64::MAX as u128) as u64),
+            );
+            observation.field("congestion_window", Value::Count(self.cong.window() as u64));
+            observation.field("snapshot", Value::Flag(true));
+            observation.finish("");
+        }
+    }
+}
+
 impl<'a, L: Link> Wire<'a, L> {
     /// `max_rtt` caps the pacing RTT (the caller passes `request_timeout`) so a
     /// pacing pause can't be mistaken for a stall. `cursor` seeds the session
@@ -1085,6 +1173,12 @@ impl<'a, L: Link> Wire<'a, L> {
     /// id as a stale duplicate) and the inbound straggler watermark survives.
     fn new(link: &'a L, initial_rtt: Duration, max_rtt: Duration, cursor: Cursor) -> Self {
         Self {
+            observation: Some(link.observation("transfer.transport")),
+            sent_fragments: Default::default(),
+            repaired_fragments: Default::default(),
+            nacks: Default::default(),
+            retries: 0,
+            malformed: 0,
             link,
             next_id: cursor.next_id,
             inbound: Reassembler::resume(cursor.accepted),
@@ -1149,6 +1243,8 @@ impl<'a, L: Link> Wire<'a, L> {
                 }
             }
             self.link.send(&fragment).await?;
+            self.sent_fragments
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Ok(())
     }
@@ -1197,6 +1293,8 @@ impl<'a, L: Link> Wire<'a, L> {
                 .collect()
         };
         let resent = !to_send.is_empty();
+        self.repaired_fragments
+            .fetch_add(to_send.len() as u64, std::sync::atomic::Ordering::Relaxed);
         self.paced_send(to_send.into_iter()).await?;
         Ok(resent)
     }
@@ -1205,6 +1303,8 @@ impl<'a, L: Link> Wire<'a, L> {
     /// [`frame::NACK_MAX_INDICES`] so the NACK fits one datagram; the caller
     /// re-NACKs for any remainder on the next interval.
     async fn nack(&self, id: u64, indices: &[u64]) -> Result<(), TransferError> {
+        self.nacks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let batch = &indices[..indices.len().min(frame::NACK_MAX_INDICES)];
         self.link.send(&frame::nack_datagram(id, batch)).await?;
         Ok(())
@@ -1252,12 +1352,15 @@ impl<'a, L: Link> Wire<'a, L> {
                                 self.inbound.accept(mid);
                                 return Ok(Some(Recv::Message(message)));
                             }
+                            self.malformed += 1;
                         }
                     }
                     Some(Packet::Nack { id, indices }) => {
                         return Ok(Some(Recv::Nack { id, indices }))
                     }
-                    None => {} // junk: ignore
+                    None => {
+                        self.malformed += 1;
+                    } // junk: ignore
                 },
                 Ok(Err(e)) => return Err(TransferError::Io(e)),
                 Err(_) => return Ok(None), // deadline elapsed
@@ -1285,6 +1388,30 @@ pub enum TransferError {
     /// The channel failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+impl TransferError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::MessageTooLarge(_) => "message_too_large",
+            Self::Incomplete => "incomplete",
+            Self::Io(e) => driver::diagnostics::io_code(e),
+            Self::Sync(e) => match e {
+                SyncError::BadHead => "invalid_head_signature",
+                SyncError::BadBlock => "invalid_block_proof",
+                SyncError::BadManifest => "invalid_manifest_hash",
+                SyncError::BadChunk => "invalid_chunk_hash",
+                SyncError::TooLong => "feed_limit",
+                SyncError::Unsolicited => "unsolicited_block",
+                SyncError::Absent => "item_absent",
+                SyncError::Unexpected => "unexpected_message",
+                SyncError::Malformed(_) | SyncError::Wire(_) => "malformed_message",
+                SyncError::Feed(_) => "invalid_feed_encoding",
+                SyncError::Blob(_) => "invalid_blob_encoding",
+            },
+        }
+    }
 }
 
 #[cfg(test)]

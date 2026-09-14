@@ -1,5 +1,6 @@
 //! Candidate gathering on the exact socket later used for the data connection.
 use super::{mapping::MappingLease, time};
+use crate::diagnostics::{io_code, Observer, Value};
 use crate::{connect_channel, Channel, PunchConfig};
 use crypto::Keypair;
 use dht_next::{Action, Contact, Dht, Event};
@@ -12,6 +13,8 @@ use tokio::net::UdpSocket;
 /// An unconnected data socket and its bounded, observed/local candidate set.
 /// Reflection uses authenticated DHT RPCs. It does not establish NAT reachability.
 pub struct DirectSocket {
+    observer: Observer,
+    parent: Option<u64>,
     socket: UdpSocket,
     candidates: Vec<SocketAddr>,
     translation: super::nat64::Translation,
@@ -29,102 +32,125 @@ impl DirectSocket {
         gateway: Option<&portmap::Gateway>,
     ) -> io::Result<Self> {
         let translation = super::nat64::Translation::discover(bind).await;
-        Self::bind_with_translation(bind, reflectors, gateway, translation).await
+        Self::bind_with_translation(
+            bind,
+            reflectors,
+            gateway,
+            translation,
+            Observer::default(),
+            None,
+        )
+        .await
     }
     pub(super) async fn bind_with_translation(
         bind: SocketAddr,
         reflectors: &[Contact],
         gateway: Option<&portmap::Gateway>,
         translation: super::nat64::Translation,
+        observer: Observer,
+        parent: Option<u64>,
     ) -> io::Result<Self> {
-        let socket = super::bind_socket(bind)?;
-        let local = canonical(socket.local_addr()?);
-        let dual_stack = bind.is_ipv6();
-        let mut candidates = Vec::new();
-        let mut core = Dht::new(Keypair::generate(), Keypair::generate().seed(), false);
-        let start = Instant::now();
-        let mut pending = BTreeSet::new();
-        let mut actions = Vec::new();
-        for peer in reflectors.iter().take(3) {
-            if let Ok((request, sent)) = core.reflect(*peer, time(start)) {
-                pending.insert(request);
-                actions.extend(sent);
+        let mut observation = observer.child("nat.reflection", parent);
+        observation.field("reflectors", Value::Count(reflectors.len().min(3) as u64));
+        observation.field("translation", Value::Text(translation.mode()));
+        let result = async {
+            let socket = super::bind_socket(bind)?;
+            let local = canonical(socket.local_addr()?);
+            let dual_stack = bind.is_ipv6();
+            let mut candidates = Vec::new();
+            let mut core = Dht::new(Keypair::generate(), Keypair::generate().seed(), false);
+            let start = Instant::now();
+            let mut pending = BTreeSet::new();
+            let mut actions = Vec::new();
+            for peer in reflectors.iter().take(3) {
+                if let Ok((request, sent)) = core.reflect(*peer, time(start)) {
+                    pending.insert(request);
+                    actions.extend(sent);
+                }
             }
-        }
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-        let mut bytes = [0; dht_next::protocol::MAX_PACKET + 1];
-        loop {
-            for action in actions.drain(..) {
-                match action {
-                    Action::Send { to, bytes } => {
-                        let _ = socket.send_to(&bytes, translation.destination(to)).await;
-                    }
-                    Action::Event(event) => match *event {
-                        Event::ObservedAddress {
-                            request, address, ..
-                        } if pending.remove(&request) => {
-                            let address = canonical(address);
-                            if usable(address)
-                                && (dual_stack || address.is_ipv4())
-                                && !candidates.contains(&address)
-                            {
-                                candidates.push(address);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+            let mut bytes = [0; dht_next::protocol::MAX_PACKET + 1];
+            loop {
+                for action in actions.drain(..) {
+                    match action {
+                        Action::Send { to, bytes } => {
+                            let _ = socket.send_to(&bytes, translation.destination(to)).await;
+                        }
+                        Action::Event(event) => match *event {
+                            Event::ObservedAddress {
+                                request, address, ..
+                            } if pending.remove(&request) => {
+                                let address = canonical(address);
+                                if usable(address)
+                                    && (dual_stack || address.is_ipv4())
+                                    && !candidates.contains(&address)
+                                {
+                                    candidates.push(address);
+                                }
                             }
-                        }
-                        Event::RpcTimedOut(request) => {
-                            pending.remove(&request);
-                        }
-                        _ => {}
-                    },
-                }
-            }
-            if pending.is_empty() {
-                break;
-            }
-            let wake = core.poll_timeout().map_or(deadline, |at| {
-                (tokio::time::Instant::now()
-                    + Duration::from_millis(at.saturating_sub(time(start).monotonic_ms)))
-                .min(deadline)
-            });
-            tokio::select! {
-                received = socket.recv_from(&mut bytes) => {
-                    match received {
-                        Ok((len, from)) => actions = core.receive(translation.source(from), &bytes[..len], time(start)),
-                        Err(error) if super::transient_receive_error(error.kind()) => {},
-                        Err(error) => return Err(error),
+                            Event::RpcTimedOut(request) => {
+                                pending.remove(&request);
+                            }
+                            _ => {}
+                        },
                     }
                 }
-                _ = tokio::time::sleep_until(wake) => {
-                    if tokio::time::Instant::now() >= deadline { break; }
-                    actions = core.tick(time(start));
+                if pending.is_empty() {
+                    break;
+                }
+                let wake = core.poll_timeout().map_or(deadline, |at| {
+                    (tokio::time::Instant::now()
+                        + Duration::from_millis(at.saturating_sub(time(start).monotonic_ms)))
+                    .min(deadline)
+                });
+                tokio::select! {
+                    received = socket.recv_from(&mut bytes) => {
+                        match received {
+                            Ok((len, from)) => actions = core.receive(translation.source(from), &bytes[..len], time(start)),
+                            Err(error) if super::transient_receive_error(error.kind()) => {},
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    _ = tokio::time::sleep_until(wake) => {
+                        if tokio::time::Instant::now() >= deadline { break; }
+                        actions = core.tick(time(start));
+                    }
                 }
             }
-        }
-        if usable(local) && !candidates.contains(&local) {
-            candidates.push(local);
-        }
-        let mapping = match gateway {
-            Some(gateway) => MappingLease::acquire(gateway, local).await,
-            None => None,
-        };
-        let mapping = mapping.map(|(lease, external)| {
-            candidates.retain(|candidate| *candidate != external);
-            candidates.insert(0, external);
-            candidates.truncate(4);
-            lease
-        });
-        if candidates.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                "no usable data-socket candidates",
-            ));
-        }
-        Ok(Self {
-            socket,
-            candidates,
-            translation,
-            mapping,
-        })
+            observation.field("observed_candidates", Value::Count(candidates.len() as u64));
+            observation.field("unanswered_reflectors", Value::Count(pending.len() as u64));
+            observation.field("mapping_varies", Value::Flag(mapping_varies(&candidates)));
+            if usable(local) && !candidates.contains(&local) {
+                candidates.push(local);
+            }
+            let mapping = match gateway {
+                Some(gateway) => MappingLease::acquire(gateway, local).await,
+                None => None,
+            };
+            let mapping = mapping.map(|(lease, external)| {
+                candidates.retain(|candidate| *candidate != external);
+                candidates.insert(0, external);
+                candidates.truncate(4);
+                lease
+            });
+            if candidates.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrNotAvailable,
+                    "no usable data-socket candidates",
+                ));
+            }
+            observation.field("gateway_mapping", Value::Flag(mapping.is_some()));
+            observation.field("candidates", Value::Count(candidates.len() as u64));
+            Ok(Self {
+                observer, parent,
+                socket,
+                candidates,
+                translation,
+                mapping,
+            })
+        }.await;
+        observation.finish(result.as_ref().err().map(io_code).unwrap_or(""));
+        result
     }
     pub fn candidates(&self) -> &[SocketAddr] {
         &self.candidates
@@ -139,42 +165,72 @@ impl DirectSocket {
         session: [u8; 32],
         initiator: bool,
     ) -> io::Result<Option<DirectChannel>> {
-        if peers.is_empty() || peers.len() > 4 || peers.iter().any(|p| !usable(*p)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid candidate set",
-            ));
-        }
-        if let Some(mapping) = &self.mapping {
-            mapping.check()?;
-        }
-        let strategy = if self.mapping.is_some() {
-            puncher::NatStrategy::Direct
-        } else {
-            puncher::nat_strategy(mapping_varies(&self.candidates), mapping_varies(peers))
-        };
-        let peers: Vec<_> = peers
-            .iter()
-            .map(|p| self.translation.destination(canonical(*p)))
-            .collect();
-        Ok(connect_channel(
-            puncher::rendezvous_with_strategy(
-                self.socket,
-                &peers,
-                config,
+        let mut observation = self.observer.child("nat.punch", self.parent);
+        observation.field("initiator", Value::Flag(initiator));
+        observation.field(
+            "local_candidates",
+            Value::Count(self.candidates.len() as u64),
+        );
+        observation.field("remote_candidates", Value::Count(peers.len() as u64));
+        observation.field(
+            "local_mapping_varies",
+            Value::Flag(mapping_varies(&self.candidates)),
+        );
+        observation.field("remote_mapping_varies", Value::Flag(mapping_varies(peers)));
+        observation.field("translation", Value::Text(self.translation.mode()));
+        let result = async {
+            if peers.is_empty() || peers.len() > 4 || peers.iter().any(|p| !usable(*p)) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid candidate set",
+                ));
+            }
+            if let Some(mapping) = &self.mapping {
+                mapping.check()?;
+            }
+            let strategy = if self.mapping.is_some() {
+                puncher::NatStrategy::Direct
+            } else {
+                puncher::nat_strategy(mapping_varies(&self.candidates), mapping_varies(peers))
+            };
+            observation.field(
+                "strategy",
+                Value::Text(match strategy {
+                    puncher::NatStrategy::Direct => "direct",
+                    puncher::NatStrategy::OpenMappings => "open_mappings",
+                    puncher::NatStrategy::SearchPorts => "search_ports",
+                }),
+            );
+            let peers: Vec<_> = peers
+                .iter()
+                .map(|p| self.translation.destination(canonical(*p)))
+                .collect();
+            Ok(connect_channel(
+                puncher::rendezvous_with_strategy(
+                    self.socket,
+                    &peers,
+                    config,
+                    session,
+                    initiator,
+                    strategy,
+                )
+                .await?,
+            )
+            .await?
+            .map(|channel| DirectChannel {
+                channel,
                 session,
                 initiator,
-                strategy,
-            )
-            .await?,
-        )
-        .await?
-        .map(|channel| DirectChannel {
-            channel,
-            session,
-            initiator,
-            mapping: self.mapping,
-        }))
+                mapping: self.mapping,
+            }))
+        }
+        .await;
+        observation.finish(match &result {
+            Ok(Some(_)) => "",
+            Ok(None) => "direct_unreachable",
+            Err(error) => io_code(error),
+        });
+        result
     }
 }
 fn mapping_varies(candidates: &[SocketAddr]) -> bool {

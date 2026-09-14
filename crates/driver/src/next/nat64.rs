@@ -23,6 +23,15 @@ impl Prefix {
         }
         bytes.into()
     }
+    fn permits(&self, ip: Ipv4Addr) -> bool {
+        let well_known = self.length == 96
+            && self.bytes == Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0).octets();
+        !well_known
+            || (crate::is_publicly_routable(ip.into())
+                && ip.octets()[0] != 0
+                && !(ip.octets()[..3] == [192, 0, 0] && !matches!(ip.octets()[3], 9 | 10))
+                && ip.octets()[..3] != [192, 88, 99])
+    }
     fn extract(&self, ip: Ipv6Addr) -> Option<Ipv4Addr> {
         let bytes = ip.octets();
         let mut ipv4 = [0; 4];
@@ -123,31 +132,58 @@ pub fn route_addresses(address: SocketAddr) -> io::Result<Vec<SocketAddr>> {
     }
     #[cfg(target_vendor = "apple")]
     {
-        Ok(system_addresses(&address.ip().to_string())?
-            .into_iter()
-            .map(|ip| SocketAddr::new(ip, address.port()))
-            .collect())
+        Ok(resolved_destinations(
+            address,
+            system_addresses(&address.ip().to_string())?,
+        ))
     }
     #[cfg(not(target_vendor = "apple"))]
     {
-        let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
-        if socket.connect(address).is_ok() {
-            return Ok(vec![address]);
-        }
-        let IpAddr::V4(ip) = address.ip() else {
-            unreachable!()
-        };
-        Ok(discover()?
-            .into_iter()
-            .map(|prefix| SocketAddr::new(prefix.embed(ip).into(), address.port()))
-            .collect())
+        route_with_discovery(address, native_ipv4(address), discover)
     }
+}
+
+fn native_ipv4(address: SocketAddr) -> bool {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .and_then(|socket| socket.connect(address))
+        .is_ok()
+}
+
+#[cfg(any(target_vendor = "apple", test))]
+fn resolved_destinations(address: SocketAddr, ips: Vec<IpAddr>) -> Vec<SocketAddr> {
+    if ips.is_empty() {
+        vec![address]
+    } else {
+        ips.into_iter()
+            .map(|ip| SocketAddr::new(ip, address.port()))
+            .collect()
+    }
+}
+
+#[cfg(any(not(target_vendor = "apple"), test))]
+fn route_with_discovery(
+    address: SocketAddr,
+    native: bool,
+    lookup: impl FnOnce() -> io::Result<Vec<Prefix>>,
+) -> io::Result<Vec<SocketAddr>> {
+    if native {
+        return Ok(vec![address]);
+    }
+    let IpAddr::V4(ip) = address.ip() else {
+        return Ok(vec![address]);
+    };
+    Ok(lookup()?
+        .into_iter()
+        .filter(|prefix| prefix.permits(ip))
+        .map(|prefix| SocketAddr::new(prefix.embed(ip).into(), address.port()))
+        .collect())
 }
 
 #[derive(Clone, Debug)]
 pub(super) struct Translation {
-    bind: SocketAddr,
+    pub(super) bind: SocketAddr,
     prefixes: Vec<Prefix>,
+    native_ipv4: bool,
 }
 impl Translation {
     pub async fn discover(bind: SocketAddr) -> Self {
@@ -162,7 +198,11 @@ impl Translation {
         bind: SocketAddr,
         lookup: impl std::future::Future<Output = io::Result<Vec<Prefix>>>,
     ) -> Self {
-        let prefixes = if bind.is_ipv6() && !bind.ip().is_loopback() {
+        // Only a wildcard IPv6 socket can use IPv4-mapped destinations.
+        // A UDP connect checks the route without sending a packet.
+        let native_ipv4 =
+            bind.ip().is_unspecified() && native_ipv4(SocketAddr::from(([192, 0, 0, 170], 9)));
+        let prefixes = if bind.is_ipv6() && !bind.ip().is_loopback() && !native_ipv4 {
             tokio::time::timeout(std::time::Duration::from_secs(5), lookup)
                 .await
                 .ok()
@@ -171,13 +211,21 @@ impl Translation {
         } else {
             vec![]
         };
-        Self { bind, prefixes }
+        Self {
+            bind,
+            prefixes,
+            native_ipv4,
+        }
     }
     pub fn destination(&self, address: SocketAddr) -> SocketAddr {
         match (self.bind.is_ipv6(), address) {
             (true, SocketAddr::V4(v4)) => {
-                if let Some(prefix) = self.prefixes.first() {
-                    return SocketAddr::new(prefix.embed(*v4.ip()).into(), v4.port());
+                if !self.native_ipv4 {
+                    // Keep the resolver's preference order; skip prefixes that
+                    // cannot legally represent this destination (RFC 6052 §3.1).
+                    if let Some(prefix) = self.prefixes.iter().find(|p| p.permits(*v4.ip())) {
+                        return SocketAddr::new(prefix.embed(*v4.ip()).into(), v4.port());
+                    }
                 }
                 SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port())
             }
@@ -202,6 +250,91 @@ impl Translation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_routes_fallbacks_and_prefix_policy() {
+        let public: SocketAddr = "8.8.8.8:41800".parse().unwrap();
+        let found = prefixes([
+            "64:ff9b::c000:aa".parse().unwrap(),
+            "2001:db8:64::c000:aa".parse().unwrap(),
+        ]);
+        assert_eq!(
+            route_with_discovery(public, true, || panic!("native route must skip DNS")).unwrap(),
+            vec![public]
+        );
+        assert_eq!(resolved_destinations(public, vec![]), vec![public]);
+        assert_eq!(
+            resolved_destinations(public, vec!["2001:db8::8".parse().unwrap()]),
+            vec!["[2001:db8::8]:41800".parse::<SocketAddr>().unwrap()]
+        );
+        // False includes both IPv4 bind failures and missing IPv4 routes.
+        assert_eq!(
+            route_with_discovery(public, false, || Ok(found.clone())).unwrap(),
+            vec![
+                "[64:ff9b::808:808]:41800".parse::<SocketAddr>().unwrap(),
+                "[2001:db8:64::808:808]:41800".parse().unwrap()
+            ]
+        );
+        let mut transport = Translation {
+            bind: "[2001:db8::1]:0".parse().unwrap(),
+            prefixes: found,
+            native_ipv4: false,
+        };
+        assert_eq!(
+            transport.destination(public),
+            "[64:ff9b::808:808]:41800".parse().unwrap()
+        );
+        for ip in [
+            "0.1.2.3",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.168.1.5",
+            "192.0.0.170",
+            "192.0.2.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "240.0.0.1",
+            "255.255.255.255",
+        ] {
+            let ip: Ipv4Addr = ip.parse().unwrap();
+            assert!(!transport.prefixes[0].permits(ip), "{ip}");
+            assert!(transport.prefixes[1].permits(ip), "{ip}");
+            let peer = SocketAddr::new(ip.into(), 41800);
+            assert_eq!(
+                transport.destination(peer),
+                SocketAddr::new(transport.prefixes[1].embed(ip).into(), 41800)
+            );
+        }
+        transport.prefixes.truncate(1);
+        let private = "192.168.1.5:41800".parse().unwrap();
+        assert_eq!(
+            transport.destination(private),
+            "[::ffff:192.168.1.5]:41800".parse().unwrap()
+        );
+        transport.native_ipv4 = true;
+        assert_eq!(
+            transport.destination(public),
+            "[::ffff:8.8.8.8]:41800".parse().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn concrete_ipv6_bind_keeps_nat64_even_on_a_dual_stack_host() {
+        let found = prefixes(["64:ff9b::c000:aa".parse().unwrap()]);
+        let transport =
+            Translation::with_discovery("[2001:db8::1]:0".parse().unwrap(), async { Ok(found) })
+                .await;
+        assert!(!transport.native_ipv4);
+        assert_eq!(
+            transport.destination("8.8.8.8:41800".parse().unwrap()),
+            "[64:ff9b::808:808]:41800".parse().unwrap()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn unavailable_synthesis_preserves_native_ipv6() {
         let bind = "[2001:db8::1]:1234".parse().unwrap();
@@ -255,6 +388,7 @@ mod tests {
         let transport = Translation {
             bind: "[::]:0".parse().unwrap(),
             prefixes: found,
+            native_ipv4: false,
         };
         assert_eq!(
             transport.source("[64:ff9b::c000:201]:41800".parse().unwrap()),

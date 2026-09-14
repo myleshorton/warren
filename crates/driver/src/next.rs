@@ -81,12 +81,21 @@ enum Command {
     Stop(oneshot::Sender<()>),
     #[cfg(test)]
     ReceiveError(io::ErrorKind, oneshot::Sender<()>),
+    #[cfg(test)]
+    DelayDiscovery(oneshot::Receiver<()>),
     Rebind(
         SocketAddr,
         Vec<Contact>,
         oneshot::Sender<io::Result<SocketAddr>>,
     ),
 }
+struct PendingRebind {
+    socket: Option<UdpSocket>,
+    seeds: Vec<Contact>,
+    reply: oneshot::Sender<io::Result<SocketAddr>>,
+    discovery: std::pin::Pin<Box<dyn std::future::Future<Output = nat64::Translation> + Send>>,
+}
+
 /// Current bind address and monotonically increasing local network generation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NetworkState {
@@ -97,6 +106,7 @@ struct Inner {
     commands: mpsc::Sender<Command>,
     events: broadcast::Sender<Notice>,
     network: watch::Sender<NetworkState>,
+    translation: watch::Sender<nat64::Translation>,
     id: NodeId,
     inbound: Arc<AtomicU64>,
     managed_values: Arc<std::sync::Mutex<std::collections::BTreeSet<NodeId>>>,
@@ -126,7 +136,7 @@ impl Node {
     ) -> io::Result<Self> {
         let socket = bind_socket(addr)?;
         let addr = socket.local_addr()?;
-        let translation = nat64::Translation::discover(addr).await;
+        let (translation, _) = watch::channel(nat64::Translation::discover(addr).await);
         let core = Dht::with_routing_policy(identity, Keypair::generate().seed(), server, policy);
         let id = core.id();
         let (commands, receiver) = mpsc::channel(128);
@@ -138,7 +148,7 @@ impl Node {
         let inbound = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(run(
             socket,
-            translation,
+            translation.clone(),
             core,
             receiver,
             events.clone(),
@@ -150,6 +160,7 @@ impl Node {
                 commands,
                 events,
                 network,
+                translation,
                 id,
                 inbound,
                 managed_values: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
@@ -200,6 +211,18 @@ impl Node {
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "DHT stopped"))?
     }
+    /// Prepare a data socket using this node's current network translation.
+    pub async fn direct_socket(
+        &self,
+        reflectors: &[Contact],
+        gateway: Option<&portmap::Gateway>,
+    ) -> io::Result<DirectSocket> {
+        let mut translation = self.inner.translation.borrow().clone();
+        translation.bind.set_port(0);
+        DirectSocket::bind_with_translation(translation.bind, reflectors, gateway, translation)
+            .await
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<Notice> {
         self.inner.events.subscribe()
     }
@@ -527,13 +550,17 @@ fn time(start: Instant) -> Time {
 
 async fn run(
     mut socket: UdpSocket,
-    mut translation: nat64::Translation,
+    mappings: watch::Sender<nat64::Translation>,
     mut core: Dht,
     mut commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<Notice>,
     network: watch::Sender<NetworkState>,
     inbound: Arc<AtomicU64>,
 ) {
+    let mut translation = mappings.borrow().clone();
+    let mut pending: Option<PendingRebind> = None;
+    #[cfg(test)]
+    let mut discovery_gate: Option<oneshot::Receiver<()>> = None;
     let mut receive_enabled = true;
     let start = Instant::now();
     let mut buffer = [0; dht_next::protocol::MAX_PACKET + 1];
@@ -573,27 +600,32 @@ async fn run(
                         let replacement = if socket.local_addr().ok() == Some(address) {
                             Ok(None)
                         } else { bind_socket(address).map(Some) };
-                        let replacement = match replacement {
-                            Ok(socket) => Ok((socket, nat64::Translation::discover(address).await)),
-                            Err(error) => Err(error),
-                        };
                         match replacement {
-                            Err(error) => { let _ = reply.send(Err(error)); vec![] }
-                            Ok((replacement, mapping)) => match core.network_changed(Keypair::generate().seed(), &seeds, time(start)) {
-                                Ok(actions) => {
-                                    if let Some(replacement) = replacement { socket = replacement; }
-                                    let address = socket.local_addr().expect("bound UDP socket");
-                                    receive_enabled = true;
-                                    translation = mapping;
-                                    network.send_modify(|state| { state.address = address; state.generation += 1; });
-                                    let _ = reply.send(Ok(address));
-                                    actions
+                            Err(error) => { let _ = reply.send(Err(error)); }
+                            Ok(replacement) => {
+                                if let Some(previous) = pending.take() {
+                                    let _ = previous.reply.send(Err(io::Error::new(
+                                        io::ErrorKind::Interrupted, "superseded network change")));
                                 }
-                                Err(error) => { let _ = reply.send(Err(io::Error::other(format!("{error:?}")))); vec![] }
+                                let bound = replacement.as_ref().unwrap_or(&socket).local_addr()
+                                    .expect("bound UDP socket");
+                                #[cfg(test)]
+                                let gate = discovery_gate.take();
+                                pending = Some(PendingRebind {
+                                    socket: replacement, seeds, reply,
+                                    discovery: Box::pin(async move {
+                                        #[cfg(test)]
+                                        if let Some(gate) = gate { let _ = gate.await; }
+                                        nat64::Translation::discover(bound).await
+                                    }),
+                                });
                             }
                         }
+                        vec![]
                     }
                 }
+                #[cfg(test)]
+                Some(Command::DelayDiscovery(gate)) => { discovery_gate = Some(gate); vec![] }
                 #[cfg(test)]
                 Some(Command::ReceiveError(kind, reply)) => {
                     receive_enabled = transient_receive_error(kind);
@@ -602,6 +634,32 @@ async fn run(
                 }
                 Some(Command::Stop(reply)) => { stopped = Some(reply); break 'actor; }
                 None => break 'actor,
+            },
+            mapping = async {
+                match pending.as_mut() {
+                    Some(request) => request.discovery.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let request = pending.take().expect("completed discovery");
+                if request.reply.is_closed() { vec![] } else {
+                    match core.network_changed(Keypair::generate().seed(), &request.seeds, time(start)) {
+                        Ok(actions) => {
+                            if let Some(replacement) = request.socket { socket = replacement; }
+                            let address = socket.local_addr().expect("bound UDP socket");
+                            receive_enabled = true;
+                            translation = mapping;
+                            mappings.send_replace(translation.clone());
+                            network.send_modify(|state| { state.address = address; state.generation += 1; });
+                            let _ = request.reply.send(Ok(address));
+                            actions
+                        }
+                        Err(error) => {
+                            let _ = request.reply.send(Err(io::Error::other(format!("{error:?}"))));
+                            vec![]
+                        }
+                    }
+                }
             },
             packet = socket.recv_from(&mut buffer), if receive_enabled => match packet {
                 Ok((len, from)) => {
@@ -640,6 +698,105 @@ fn transient_receive_error(kind: io::ErrorKind) -> bool {
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn delayed_discovery_keeps_actor_live_and_cannot_replace_newer_network() {
+        let a = Node::bind("127.0.0.1:0".parse().unwrap(), Keypair::generate(), false)
+            .await
+            .unwrap();
+        let b = Node::bind("127.0.0.1:0".parse().unwrap(), Keypair::generate(), true)
+            .await
+            .unwrap();
+        let before = *a.network().borrow();
+        let (release, gate) = oneshot::channel();
+        a.inner
+            .commands
+            .send(Command::DelayDiscovery(gate))
+            .await
+            .unwrap();
+        let (reply, result) = oneshot::channel();
+        a.inner
+            .commands
+            .send(Command::Rebind(
+                "127.0.0.1:0".parse().unwrap(),
+                vec![],
+                reply,
+            ))
+            .await
+            .unwrap();
+        // The command is accepted but discovery cannot complete yet.
+        tokio::time::timeout(Duration::from_secs(1), a.routing_len())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*a.network().borrow(), before);
+        let mut events = a.subscribe();
+        a.probe(Contact::new(b.id(), b.local_addr())).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(next_event(&mut events).await.unwrap(), Event::Ready(_)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        a.rebind(before.address, &[]).await.unwrap();
+        assert_eq!(
+            result.await.unwrap().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert!(release.send(()).is_err());
+        assert_eq!(a.network().borrow().generation, before.generation + 1);
+        assert_eq!(a.inner.translation.borrow().bind, before.address);
+        a.shutdown().await.unwrap();
+        b.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn canceled_discovery_does_not_commit_and_shutdown_does_not_wait() {
+        let node = Node::bind("127.0.0.1:0".parse().unwrap(), Keypair::generate(), false)
+            .await
+            .unwrap();
+        let before = *node.network().borrow();
+        let (release, gate) = oneshot::channel();
+        node.inner
+            .commands
+            .send(Command::DelayDiscovery(gate))
+            .await
+            .unwrap();
+        let (reply, result) = oneshot::channel();
+        node.inner
+            .commands
+            .send(Command::Rebind(
+                "127.0.0.1:0".parse().unwrap(),
+                vec![],
+                reply,
+            ))
+            .await
+            .unwrap();
+        node.routing_len().await.unwrap();
+        drop(result);
+        release.send(()).unwrap();
+        node.routing_len().await.unwrap();
+        assert_eq!(*node.network().borrow(), before);
+        let (_release, gate) = oneshot::channel();
+        node.inner
+            .commands
+            .send(Command::DelayDiscovery(gate))
+            .await
+            .unwrap();
+        let (reply, _result) = oneshot::channel();
+        node.inner
+            .commands
+            .send(Command::Rebind(before.address, vec![], reply))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), node.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn transient_receive_errors_and_same_port_refresh_preserve_service() {

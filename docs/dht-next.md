@@ -683,11 +683,26 @@ hole punching, and the connected data socket use the same translation policy.
 On Apple platforms, `getaddrinfo` with `AI_DEFAULT` provides the network's
 IPv4-literal synthesis. Other platforms discover a prefix through the system
 resolver's `ipv4only.arpa.` answers. No well-known prefix is hardcoded. All six
-RFC 6052 layouts are supported, and discovery is refreshed on bind/rebind rather
-than cached across network transitions. DNS resolution runs on a blocking worker,
-with a five-second wait bound for socket setup; unavailable synthesis does not
-prevent native IPv6 operation. Packet processing does not resolve DNS. `driver::next::route_addresses` exposes the bootstrap destination selection
-for platform adapters and must be called off UI/async executor threads.
+RFC 6052 layouts are supported. Discovery is refreshed on bind/rebind and shared
+with data sockets prepared through `Node::direct_socket`; transfer endpoints use
+this path, avoiding resolver waits on each connection. Standalone `DirectSocket`
+constructors discover their own mapping. DNS runs on a blocking worker with a
+five-second wait bound. During rebind, the actor continues receiving packets,
+processing commands, and advancing timers on the old socket. It installs the new
+socket and mapping together after discovery, before restarting publications and
+acknowledging rebind. Superseding or canceled requests cannot install stale results.
+Unavailable synthesis preserves native IPv6 operation.
+
+Wildcard IPv6 binds prefer IPv4-mapped destinations when an IPv4 route exists;
+concrete IPv6 binds retain synthesis because they cannot use the host's independent
+IPv4 source address. Outbound translation selects the first permitted prefix in
+system-resolver order; inbound normalization accepts all discovered prefixes. The
+well-known `64:ff9b::/96` prefix excludes non-global IPv4 destinations, while
+network-specific prefixes may represent private IPv4 networks. Packet processing
+does not resolve DNS. `driver::next::route_addresses` exposes bootstrap destination
+selection for platform adapters and must be called off UI/async executor threads.
+IPv4 bind and connect failures both fall back to discovery; empty successful Apple
+resolver results retain the original destination.
 
 This enables IPv6-only clients to reach IPv4 coordinators and publishers through
 a DNS64/NAT64 gateway. It does not supply a relay or bypass a carrier blocking UDP.
@@ -696,7 +711,8 @@ and an IPv4 publisher in isolated Linux namespaces, including re-registration an
 an exact 200 KB authenticated video download. Physical carrier testing is separate.
 
 References: [Apple's IPv6/NAT64 guidance](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/NetworkingOverview/UnderstandingandPreparingfortheIPv6Transition/UnderstandingandPreparingfortheIPv6Transition.html),
-[RFC 7050 prefix discovery](https://www.rfc-editor.org/rfc/rfc7050.html).
+[RFC 7050 prefix discovery](https://www.rfc-editor.org/rfc/rfc7050.html),
+[RFC 6052 prefix restrictions](https://www.rfc-editor.org/rfc/rfc6052.html#section-3.1).
 
 ## Integrated value traversal
 

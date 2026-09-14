@@ -28,10 +28,18 @@ impl DirectSocket {
         reflectors: &[Contact],
         gateway: Option<&portmap::Gateway>,
     ) -> io::Result<Self> {
+        let translation = super::nat64::Translation::discover(bind).await;
+        Self::bind_with_translation(bind, reflectors, gateway, translation).await
+    }
+    pub(super) async fn bind_with_translation(
+        bind: SocketAddr,
+        reflectors: &[Contact],
+        gateway: Option<&portmap::Gateway>,
+        translation: super::nat64::Translation,
+    ) -> io::Result<Self> {
         let socket = super::bind_socket(bind)?;
         let local = canonical(socket.local_addr()?);
         let dual_stack = bind.is_ipv6();
-        let translation = super::nat64::Translation::discover(bind).await;
         let mut candidates = Vec::new();
         let mut core = Dht::new(Keypair::generate(), Keypair::generate().seed(), false);
         let start = Instant::now();

@@ -1293,6 +1293,13 @@ mod tests {
                     inner: Arc::new(Inner {
                         commands,
                         events,
+                        translation: watch::channel(
+                            super::super::nat64::Translation::discover(
+                                "127.0.0.1:4000".parse().unwrap(),
+                            )
+                            .await,
+                        )
+                        .0,
                         network,
                         id: core.id(),
                         inbound: Arc::new(std::sync::atomic::AtomicU64::new(0)),

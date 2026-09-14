@@ -358,13 +358,10 @@ impl Endpoint {
         Ok(Connection::new(peer, session, link).on_network(self.dht().network()))
     }
     async fn prepare(&self, reflectors: &[Contact]) -> Result<DirectSocket, Error> {
-        DirectSocket::bind_with_mapping(
-            SocketAddr::new(self.dht().local_addr().ip(), 0),
-            reflectors,
-            self.inner.config.port_mapping.as_ref(),
-        )
-        .await
-        .map_err(Error::Socket)
+        self.dht()
+            .direct_socket(reflectors, self.inner.config.port_mapping.as_ref())
+            .await
+            .map_err(Error::Socket)
     }
 }
 

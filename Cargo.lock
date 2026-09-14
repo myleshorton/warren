@@ -313,6 +313,7 @@ version = "0.0.0"
 dependencies = [
  "crypto",
  "dht-next",
+ "libc",
  "portmap",
  "puncher",
  "socket2",

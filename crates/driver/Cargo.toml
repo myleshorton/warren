@@ -16,6 +16,9 @@ portmap = { path = "../portmap" }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros"] }
 socket2 = "0.6"
 
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 dht-next = { path = "../dht-next", features = ["test-support"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "sync", "macros", "test-util"] }

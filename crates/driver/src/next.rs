@@ -2,7 +2,9 @@
 mod direct;
 mod managed_value;
 mod mapping;
+mod nat64;
 pub use managed_value::{ManagedValue, ValuePublicationConfig, ValuePublicationStatus};
+pub use nat64::route_addresses;
 pub use portmap::Gateway as MappingGateway;
 mod state;
 use crypto::Keypair;
@@ -124,6 +126,7 @@ impl Node {
     ) -> io::Result<Self> {
         let socket = bind_socket(addr)?;
         let addr = socket.local_addr()?;
+        let translation = nat64::Translation::discover(addr).await?;
         let core = Dht::with_routing_policy(identity, Keypair::generate().seed(), server, policy);
         let id = core.id();
         let (commands, receiver) = mpsc::channel(128);
@@ -135,6 +138,7 @@ impl Node {
         let inbound = Arc::new(AtomicU64::new(0));
         let task = tokio::spawn(run(
             socket,
+            translation,
             core,
             receiver,
             events.clone(),
@@ -523,13 +527,13 @@ fn time(start: Instant) -> Time {
 
 async fn run(
     mut socket: UdpSocket,
+    mut translation: nat64::Translation,
     mut core: Dht,
     mut commands: mpsc::Receiver<Command>,
     events: broadcast::Sender<Notice>,
     network: watch::Sender<NetworkState>,
     inbound: Arc<AtomicU64>,
 ) {
-    let mut dual_stack = socket.local_addr().is_ok_and(|addr| addr.is_ipv6());
     let mut receive_enabled = true;
     let start = Instant::now();
     let mut buffer = [0; dht_next::protocol::MAX_PACKET + 1];
@@ -539,12 +543,7 @@ async fn run(
         for action in actions {
             match action {
                 Action::Send { to, bytes } => {
-                    let destination = match (dual_stack, to) {
-                        (true, SocketAddr::V4(v4)) => {
-                            SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port())
-                        }
-                        _ => to,
-                    };
+                    let destination = translation.destination(to);
                     if let Err(error) = socket.send_to(&bytes, destination).await {
                         let _ = events.send(Notice::IoError(error.kind()));
                     }
@@ -574,14 +573,21 @@ async fn run(
                         let replacement = if socket.local_addr().ok() == Some(address) {
                             Ok(None)
                         } else { bind_socket(address).map(Some) };
+                        let replacement = match replacement {
+                            Ok(socket) => match nat64::Translation::discover(address).await {
+                                Ok(mapping) => Ok((socket, mapping)),
+                                Err(error) => Err(error),
+                            },
+                            Err(error) => Err(error),
+                        };
                         match replacement {
                             Err(error) => { let _ = reply.send(Err(error)); vec![] }
-                            Ok(replacement) => match core.network_changed(Keypair::generate().seed(), &seeds, time(start)) {
+                            Ok((replacement, mapping)) => match core.network_changed(Keypair::generate().seed(), &seeds, time(start)) {
                                 Ok(actions) => {
                                     if let Some(replacement) = replacement { socket = replacement; }
                                     let address = socket.local_addr().expect("bound UDP socket");
                                     receive_enabled = true;
-                                    dual_stack = address.is_ipv6();
+                                    translation = mapping;
                                     network.send_modify(|state| { state.address = address; state.generation += 1; });
                                     let _ = reply.send(Ok(address));
                                     actions
@@ -603,10 +609,7 @@ async fn run(
             packet = socket.recv_from(&mut buffer), if receive_enabled => match packet {
                 Ok((len, from)) => {
                     inbound.fetch_add(1, Ordering::Relaxed);
-                    let from = match from {
-                        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().map_or(from, |v4| SocketAddr::new(v4.into(), v6.port())),
-                        _ => from,
-                    };
+                    let from = translation.source(from);
                     core.receive(from, &buffer[..len], time(start))
                 },
                 Err(error) => {

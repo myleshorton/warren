@@ -14,7 +14,7 @@ use tokio::net::UdpSocket;
 pub struct DirectSocket {
     socket: UdpSocket,
     candidates: Vec<SocketAddr>,
-    dual_stack: bool,
+    translation: super::nat64::Translation,
     mapping: Option<MappingLease>,
 }
 impl DirectSocket {
@@ -31,6 +31,7 @@ impl DirectSocket {
         let socket = super::bind_socket(bind)?;
         let local = canonical(socket.local_addr()?);
         let dual_stack = bind.is_ipv6();
+        let translation = super::nat64::Translation::discover(bind).await?;
         let mut candidates = Vec::new();
         let mut core = Dht::new(Keypair::generate(), Keypair::generate().seed(), false);
         let start = Instant::now();
@@ -48,7 +49,7 @@ impl DirectSocket {
             for action in actions.drain(..) {
                 match action {
                     Action::Send { to, bytes } => {
-                        let _ = socket.send_to(&bytes, destination(to, dual_stack)).await;
+                        let _ = socket.send_to(&bytes, translation.destination(to)).await;
                     }
                     Action::Event(event) => match *event {
                         Event::ObservedAddress {
@@ -80,7 +81,7 @@ impl DirectSocket {
             tokio::select! {
                 received = socket.recv_from(&mut bytes) => {
                     match received {
-                        Ok((len, from)) => actions = core.receive(canonical(from), &bytes[..len], time(start)),
+                        Ok((len, from)) => actions = core.receive(translation.source(from), &bytes[..len], time(start)),
                         Err(error) if super::transient_receive_error(error.kind()) => {},
                         Err(error) => return Err(error),
                     }
@@ -113,7 +114,7 @@ impl DirectSocket {
         Ok(Self {
             socket,
             candidates,
-            dual_stack,
+            translation,
             mapping,
         })
     }
@@ -146,7 +147,7 @@ impl DirectSocket {
         };
         let peers: Vec<_> = peers
             .iter()
-            .map(|p| destination(canonical(*p), self.dual_stack))
+            .map(|p| self.translation.destination(canonical(*p)))
             .collect();
         Ok(connect_channel(
             puncher::rendezvous_with_strategy(
@@ -176,12 +177,6 @@ fn mapping_varies(candidates: &[SocketAddr]) -> bool {
             a.ip() == b.ip() && a.port() != b.port()
         })
     })
-}
-fn destination(address: SocketAddr, dual_stack: bool) -> SocketAddr {
-    match (dual_stack, address) {
-        (true, SocketAddr::V4(v4)) => SocketAddr::new(v4.ip().to_ipv6_mapped().into(), v4.port()),
-        _ => address,
-    }
 }
 fn canonical(address: SocketAddr) -> SocketAddr {
     match address {

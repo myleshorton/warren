@@ -673,6 +673,31 @@ puncher/transfer integration still use the old DHT. Connecting the new signaling
 API to that data plane is a separate integration milestone, not completed Pear SDK
 parity.
 
+### IPv6-only access through NAT64
+
+The UDP driver and direct data sockets translate IPv4 destinations at the socket
+boundary. Signed contacts and records keep their original addresses; received
+NAT64 source addresses are normalized before DHT reply matching. Reflection,
+hole punching, and the connected data socket use the same translation policy.
+
+On Apple platforms, `getaddrinfo` with `AI_DEFAULT` provides the network's
+IPv4-literal synthesis. Other platforms discover a prefix through the system
+resolver's `ipv4only.arpa.` answers. No well-known prefix is hardcoded. All six
+RFC 6052 layouts are supported, and discovery is refreshed on bind/rebind rather
+than cached across network transitions. DNS resolution runs on a blocking worker,
+with a five-second wait bound for socket setup; packet processing does not resolve
+DNS. `driver::next::route_addresses` exposes the bootstrap destination selection
+for platform adapters and must be called off UI/async executor threads.
+
+This enables IPv6-only clients to reach IPv4 coordinators and publishers through
+a DNS64/NAT64 gateway. It does not supply a relay or bypass a carrier blocking UDP.
+Murmur's `scripts/test-nat64.sh` exercises an IPv6-only client, a real TAYGA gateway,
+and an IPv4 publisher in isolated Linux namespaces, including re-registration and
+an exact 200 KB authenticated video download. Physical carrier testing is separate.
+
+References: [Apple's IPv6/NAT64 guidance](https://developer.apple.com/library/archive/documentation/NetworkingInternetWeb/Conceptual/NetworkingOverview/UnderstandingandPreparingfortheIPv6Transition/UnderstandingandPreparingfortheIPv6Transition.html),
+[RFC 7050 prefix discovery](https://www.rfc-editor.org/rfc/rfc7050.html).
+
 ## Integrated value traversal
 
 `lookup_value(key, seeds, now)` shares the routing lookup scheduler, diversity and

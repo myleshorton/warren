@@ -685,8 +685,8 @@ IPv4-literal synthesis. Other platforms discover a prefix through the system
 resolver's `ipv4only.arpa.` answers. No well-known prefix is hardcoded. All six
 RFC 6052 layouts are supported, and discovery is refreshed on bind/rebind rather
 than cached across network transitions. DNS resolution runs on a blocking worker,
-with a five-second wait bound for socket setup; packet processing does not resolve
-DNS. `driver::next::route_addresses` exposes the bootstrap destination selection
+with a five-second wait bound for socket setup; unavailable synthesis does not
+prevent native IPv6 operation. Packet processing does not resolve DNS. `driver::next::route_addresses` exposes the bootstrap destination selection
 for platform adapters and must be called off UI/async executor threads.
 
 This enables IPv6-only clients to reach IPv4 coordinators and publishers through

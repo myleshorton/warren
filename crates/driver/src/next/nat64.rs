@@ -150,20 +150,28 @@ pub(super) struct Translation {
     prefixes: Vec<Prefix>,
 }
 impl Translation {
-    pub async fn discover(bind: SocketAddr) -> io::Result<Self> {
+    pub async fn discover(bind: SocketAddr) -> Self {
+        Self::with_discovery(bind, async {
+            tokio::task::spawn_blocking(discover)
+                .await
+                .map_err(io::Error::other)?
+        })
+        .await
+    }
+    async fn with_discovery(
+        bind: SocketAddr,
+        lookup: impl std::future::Future<Output = io::Result<Vec<Prefix>>>,
+    ) -> Self {
         let prefixes = if bind.is_ipv6() && !bind.ip().is_loopback() {
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tokio::task::spawn_blocking(discover),
-            )
-            .await
-            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "NAT64 discovery timed out"))?
-            .map_err(io::Error::other)?
-            .unwrap_or_default()
+            tokio::time::timeout(std::time::Duration::from_secs(5), lookup)
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or_default()
         } else {
             vec![]
         };
-        Ok(Self { bind, prefixes })
+        Self { bind, prefixes }
     }
     pub fn destination(&self, address: SocketAddr) -> SocketAddr {
         match (self.bind.is_ipv6(), address) {
@@ -194,6 +202,21 @@ impl Translation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn unavailable_synthesis_preserves_native_ipv6() {
+        let bind = "[2001:db8::1]:1234".parse().unwrap();
+        let peer = "[2001:db8::2]:4321".parse().unwrap();
+        let timed_out = Translation::with_discovery(bind, std::future::pending()).await;
+        let failed =
+            Translation::with_discovery(bind, async { Err(io::Error::other("DNS unavailable")) })
+                .await;
+        for translation in [timed_out, failed] {
+            assert!(translation.prefixes.is_empty());
+            assert_eq!(translation.destination(peer), peer);
+            assert_eq!(translation.source(peer), peer);
+        }
+    }
+
     #[test]
     fn rfc6052_layouts_round_trip_and_do_not_rewrite_other_ipv6() {
         let examples = [

@@ -31,7 +31,7 @@ impl DirectSocket {
         let socket = super::bind_socket(bind)?;
         let local = canonical(socket.local_addr()?);
         let dual_stack = bind.is_ipv6();
-        let translation = super::nat64::Translation::discover(bind).await?;
+        let translation = super::nat64::Translation::discover(bind).await;
         let mut candidates = Vec::new();
         let mut core = Dht::new(Keypair::generate(), Keypair::generate().seed(), false);
         let start = Instant::now();

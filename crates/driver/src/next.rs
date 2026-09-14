@@ -126,7 +126,7 @@ impl Node {
     ) -> io::Result<Self> {
         let socket = bind_socket(addr)?;
         let addr = socket.local_addr()?;
-        let translation = nat64::Translation::discover(addr).await?;
+        let translation = nat64::Translation::discover(addr).await;
         let core = Dht::with_routing_policy(identity, Keypair::generate().seed(), server, policy);
         let id = core.id();
         let (commands, receiver) = mpsc::channel(128);
@@ -574,10 +574,7 @@ async fn run(
                             Ok(None)
                         } else { bind_socket(address).map(Some) };
                         let replacement = match replacement {
-                            Ok(socket) => match nat64::Translation::discover(address).await {
-                                Ok(mapping) => Ok((socket, mapping)),
-                                Err(error) => Err(error),
-                            },
+                            Ok(socket) => Ok((socket, nat64::Translation::discover(address).await)),
                             Err(error) => Err(error),
                         };
                         match replacement {

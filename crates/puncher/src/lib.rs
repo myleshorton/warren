@@ -25,7 +25,8 @@
 
 mod rendezvous;
 pub use rendezvous::{
-    nat_strategy, rendezvous, rendezvous_reply, rendezvous_with_strategy, NatStrategy,
+    nat_strategy, rendezvous, rendezvous_reply, rendezvous_with_policy, rendezvous_with_strategy,
+    NatStrategy,
 };
 
 use std::io;

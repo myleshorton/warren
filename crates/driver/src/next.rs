@@ -6,6 +6,7 @@ mod nat64;
 pub use managed_value::{ManagedValue, ValuePublicationConfig, ValuePublicationStatus};
 pub use nat64::route_addresses;
 pub use portmap::Gateway as MappingGateway;
+mod overlay;
 mod state;
 use crate::diagnostics::{
     io_code, Observer, Operation as DiagnosticOperation, Value as DiagnosticValue,
@@ -13,6 +14,7 @@ use crate::diagnostics::{
 use crypto::Keypair;
 use dht_next::{Action, Contact, Dht, Event, NodeId, Record, RoutingPolicy, Time};
 pub use direct::{DirectChannel, DirectSocket};
+pub use overlay::OverlayId;
 use puncher::bind_udp as bind_socket;
 pub use state::BootstrapState;
 use std::io;
@@ -78,6 +80,8 @@ pub struct FetchResult {
     pub timed_out: bool,
 }
 
+pub type AddressFilter = Arc<dyn Fn(SocketAddr) -> bool + Send + Sync>;
+
 type Operation = Box<dyn FnOnce(&mut Dht, Time) -> Vec<Action> + Send>;
 enum Command {
     Apply(Operation),
@@ -113,6 +117,8 @@ struct Inner {
     network: watch::Sender<NetworkState>,
     translation: watch::Sender<nat64::Translation>,
     id: NodeId,
+    overlay: OverlayId,
+    address_filter: AddressFilter,
     inbound: Arc<AtomicU64>,
     managed_values: Arc<std::sync::Mutex<std::collections::BTreeSet<NodeId>>>,
     task: JoinHandle<()>,
@@ -139,6 +145,26 @@ impl Node {
         server: bool,
         policy: RoutingPolicy,
     ) -> io::Result<Self> {
+        Self::bind_in_overlay(addr, identity, server, policy, OverlayId::Global).await
+    }
+    pub async fn bind_in_overlay(
+        addr: SocketAddr,
+        identity: Keypair,
+        server: bool,
+        policy: RoutingPolicy,
+        overlay: OverlayId,
+    ) -> io::Result<Self> {
+        Self::bind_filtered(addr, identity, server, policy, overlay, Arc::new(|_| true)).await
+    }
+    /// Restrict DHT transport peers before any routing state is established.
+    pub async fn bind_filtered(
+        addr: SocketAddr,
+        identity: Keypair,
+        server: bool,
+        policy: RoutingPolicy,
+        overlay: OverlayId,
+        address_filter: AddressFilter,
+    ) -> io::Result<Self> {
         let socket = bind_socket(addr)?;
         let addr = socket.local_addr()?;
         let (translation, _) = watch::channel(nat64::Translation::discover(addr).await);
@@ -163,6 +189,7 @@ impl Node {
                 inbound: inbound.clone(),
                 diagnostics: diagnostics.clone(),
             },
+            (overlay, address_filter.clone()),
         ));
         Ok(Self {
             inner: Arc::new(Inner {
@@ -172,6 +199,8 @@ impl Node {
                 network,
                 translation,
                 id,
+                overlay,
+                address_filter,
                 inbound,
                 managed_values: Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::new())),
                 task,
@@ -188,6 +217,12 @@ impl Node {
 
     pub fn id(&self) -> NodeId {
         self.inner.id
+    }
+    pub fn overlay(&self) -> OverlayId {
+        self.inner.overlay
+    }
+    pub fn allows_address(&self, address: SocketAddr) -> bool {
+        (self.inner.address_filter)(address)
     }
     pub fn inbound_datagrams(&self) -> u64 {
         self.inner.inbound.load(Ordering::Relaxed)
@@ -253,6 +288,7 @@ impl Node {
             translation,
             self.diagnostics(),
             parent,
+            (self.overlay(), self.inner.address_filter.clone()),
         )
         .await
     }
@@ -543,12 +579,21 @@ impl Node {
     }
     /// Snapshot bounded live contact hints for storage by the application.
     pub async fn bootstrap_state(&self) -> Result<BootstrapState, Error> {
-        self.apply(|d, now| Ok((BootstrapState::new(d.bootstrap_contacts(now)), vec![])))
-            .await
+        let overlay = self.overlay();
+        self.apply(move |d, now| {
+            Ok((
+                BootstrapState::in_overlay(d.bootstrap_contacts(now), overlay),
+                vec![],
+            ))
+        })
+        .await
     }
     /// Revalidate stored hints through a normal authenticated bootstrap lookup.
     /// Subscribe first and await the returned query's `LookupDone` event.
     pub async fn restore_bootstrap(&self, state: &BootstrapState) -> Result<u64, Error> {
+        if state.overlay() != self.overlay() {
+            return Err(Error::Core(dht_next::Error::Invalid));
+        }
         self.bootstrap(state.contacts()).await
     }
     pub async fn routing_len(&self) -> Result<usize, Error> {
@@ -602,7 +647,9 @@ async fn run(
     mut core: Dht,
     mut commands: mpsc::Receiver<Command>,
     signals: ActorSignals,
+    transport: (OverlayId, AddressFilter),
 ) {
+    let (overlay, address_filter) = transport;
     let ActorSignals {
         events,
         network,
@@ -612,20 +659,27 @@ async fn run(
     let mut health = tokio::time::interval(Duration::from_secs(30));
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (mut outbound, mut send_errors, mut receive_errors) = (0u64, 0u64, 0u64);
+    let (mut outbound_rejected, mut inbound_policy_rejected, mut inbound_overlay_rejected) =
+        (0u64, 0u64, 0u64);
     let mut translation = mappings.borrow().clone();
     let mut pending: Option<PendingRebind> = None;
     #[cfg(test)]
     let mut discovery_gate: Option<oneshot::Receiver<()>> = None;
     let mut receive_enabled = true;
     let start = Instant::now();
-    let mut buffer = [0; dht_next::protocol::MAX_PACKET + 1];
+    let mut buffer = [0; dht_next::protocol::MAX_PACKET + overlay::HEADER_LEN + 1];
     let mut actions = core.maintain_routing(time(start));
     let mut stopped = None;
     'actor: loop {
         for action in actions {
             match action {
                 Action::Send { to, bytes } => {
+                    if !address_filter(to) {
+                        record_rejection(&diagnostics, "outbound_policy", &mut outbound_rejected);
+                        continue;
+                    }
                     let destination = translation.destination(to);
+                    let bytes = overlay.frame(bytes);
                     if let Err(error) = socket.send_to(&bytes, destination).await {
                         send_errors += 1;
                         diagnostics.event("dht.socket.send", io_code(&error), vec![]);
@@ -735,7 +789,18 @@ async fn run(
                 Ok((len, from)) => {
                     inbound.fetch_add(1, Ordering::Relaxed);
                     let from = translation.source(from);
-                    core.receive(from, &buffer[..len], time(start))
+                    if !address_filter(from) {
+                        record_rejection(&diagnostics, "inbound_policy", &mut inbound_policy_rejected);
+                        vec![]
+                    } else {
+                        match overlay.payload(&buffer[..len]) {
+                            Some(bytes) => core.receive(from, bytes, time(start)),
+                            None => {
+                                record_rejection(&diagnostics, "inbound_overlay", &mut inbound_overlay_rejected);
+                                vec![]
+                            }
+                        }
+                    }
                 },
                 Err(error) => {
                     receive_errors += 1;
@@ -753,6 +818,9 @@ async fn run(
                     ("routing_contacts", DiagnosticValue::Count(core.routing_len() as u64)),
                     ("inbound_datagrams", DiagnosticValue::Count(inbound.load(Ordering::Relaxed))),
                     ("outbound_datagrams", DiagnosticValue::Count(outbound)),
+                    ("outbound_policy_rejected", DiagnosticValue::Count(outbound_rejected)),
+                    ("inbound_policy_rejected", DiagnosticValue::Count(inbound_policy_rejected)),
+                    ("inbound_overlay_rejected", DiagnosticValue::Count(inbound_overlay_rejected)),
                     ("send_errors", DiagnosticValue::Count(send_errors)),
                     ("receive_errors", DiagnosticValue::Count(receive_errors)),
                     ("generation", DiagnosticValue::Count(network.borrow().generation)),
@@ -767,6 +835,17 @@ async fn run(
     let _ = events.send(Notice::Stopped);
     if let Some(reply) = stopped {
         let _ = reply.send(());
+    }
+}
+
+fn record_rejection(observer: &Observer, reason: &'static str, count: &mut u64) {
+    *count = count.saturating_add(1);
+    if count.is_power_of_two() {
+        observer.event(
+            "dht.packet.rejected",
+            reason,
+            vec![("count", DiagnosticValue::Count(*count))],
+        );
     }
 }
 
@@ -816,6 +895,73 @@ fn transient_receive_error(kind: io::ErrorKind) -> bool {
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[test]
+    fn rejection_sampling_preserves_counts_without_udp() {
+        let observer = Observer::new();
+        let mut events = observer.subscribe().unwrap();
+        let mut total = 0;
+        for _ in 0..1000 {
+            record_rejection(&observer, "inbound_overlay", &mut total);
+        }
+        assert_eq!(total, 1000);
+        let mut sampled = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            assert_eq!(event.name, "dht.packet.rejected");
+            assert_eq!(event.error_code, "inbound_overlay");
+            let (_, DiagnosticValue::Count(count)) = event.fields[0] else {
+                panic!("missing rejection count");
+            };
+            sampled.push(count);
+        }
+        assert_eq!(sampled, vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512]);
+    }
+
+    #[tokio::test]
+    async fn packet_rejection_reasons_reach_diagnostics() {
+        let node = Node::bind_filtered(
+            "127.0.0.1:0".parse().unwrap(),
+            Keypair::generate(),
+            true,
+            RoutingPolicy::Unrestricted,
+            OverlayId::regional("test"),
+            Arc::new(|address| address.ip().is_loopback()),
+        )
+        .await
+        .unwrap();
+        let mut events = node.diagnostics().subscribe().unwrap();
+        let outside = Contact::new(
+            NodeId::from_bytes([199; 32]),
+            "192.0.2.1:1234".parse().unwrap(),
+        );
+        node.probe(outside).await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut retry = tokio::time::interval(Duration::from_millis(50));
+            let (mut outbound, mut inbound) = (false, false);
+            while !outbound || !inbound {
+                tokio::select! {
+                    _ = retry.tick(), if !inbound => {
+                        sender.send_to(b"wrong overlay", node.local_addr()).await.unwrap();
+                    }
+                    event = events.recv() => {
+                        let event = event.unwrap();
+                        if event.name != "dht.packet.rejected" { continue; }
+                        match event.error_code {
+                            "outbound_policy" => outbound = true,
+                            "inbound_overlay" => inbound = true,
+                            other => panic!("unexpected rejection {other}"),
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect(
+            "missing outbound-policy or inbound-overlay rejection diagnostics after UDP retries",
+        );
+        node.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn delayed_discovery_keeps_actor_live_and_cannot_replace_newer_network() {

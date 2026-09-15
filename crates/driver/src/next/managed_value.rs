@@ -1292,6 +1292,8 @@ mod tests {
                 let node = Node {
                     inner: Arc::new(Inner {
                         diagnostics: crate::diagnostics::Observer::new(),
+                        overlay: super::OverlayId::Global,
+                        address_filter: Arc::new(|_| true),
                         commands,
                         events,
                         translation: watch::channel(

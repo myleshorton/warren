@@ -14,6 +14,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use swarm::{Contact, NodeId};
 use transfer::{Link, NoiseLink};
 
+#[derive(Debug)]
+pub(crate) struct AddressPolicyRejected;
+
+impl std::fmt::Display for AddressPolicyRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("peer is outside this overlay's address policy")
+    }
+}
+
+impl std::error::Error for AddressPolicyRejected {}
+
 #[derive(Clone, Debug)]
 pub struct Member {
     pub id: NodeId,
@@ -179,9 +190,34 @@ impl NextNode {
         identity: crypto::Keypair,
         server: bool,
     ) -> io::Result<Self> {
-        let endpoint = transfer::next::Endpoint::bind(address, identity, server)
-            .await
-            .map_err(io_error)?;
+        Self::bind_in_overlay(address, identity, server, driver::next::OverlayId::Global).await
+    }
+    pub async fn bind_in_overlay(
+        address: SocketAddr,
+        identity: crypto::Keypair,
+        server: bool,
+        overlay: driver::next::OverlayId,
+    ) -> io::Result<Self> {
+        Self::bind_filtered(address, identity, server, overlay, Arc::new(|_| true)).await
+    }
+    pub async fn bind_filtered(
+        address: SocketAddr,
+        identity: crypto::Keypair,
+        server: bool,
+        overlay: driver::next::OverlayId,
+        address_filter: driver::next::AddressFilter,
+    ) -> io::Result<Self> {
+        let endpoint = transfer::next::Endpoint::bind_filtered(
+            address,
+            identity,
+            server,
+            dht_next::RoutingPolicy::Diverse,
+            transfer::next::Config::default(),
+            overlay,
+            address_filter,
+        )
+        .await
+        .map_err(io_error)?;
         Ok(Self {
             inner: Arc::new(NextInner {
                 endpoint,
@@ -210,6 +246,12 @@ impl NextNode {
         self.inner.seeds.lock().expect("seeds").clone()
     }
     pub async fn add_contact(&self, peer: Contact) -> io::Result<()> {
+        if !self.endpoint().dht().allows_address(peer.addr) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                AddressPolicyRejected,
+            ));
+        }
         let mut seeds = self.inner.seeds.lock().expect("seeds");
         if peer.id != self.id() && !seeds.iter().any(|s| s.id == peer.id) && seeds.len() < 8 {
             seeds.push(peer);
@@ -218,6 +260,48 @@ impl NextNode {
     }
     pub async fn bootstrap(&self) -> io::Result<()> {
         self.query(self.id()).await.map(|_| ()).map_err(io_error)
+    }
+    /// Revalidate an overlay-matched snapshot and replace stale bootstrap hints.
+    pub async fn restore_bootstrap(&self, state: &driver::next::BootstrapState) -> io::Result<()> {
+        let driver = self.endpoint().dht();
+        let mut events = driver.subscribe();
+        let query = driver
+            .restore_bootstrap(state)
+            .await
+            .map_err(io::Error::other)?;
+        let _guard = QueryGuard {
+            node: driver.clone(),
+            query,
+        };
+        tokio::time::timeout(Duration::from_secs(45), async {
+            loop {
+                match events.recv().await.map_err(io::Error::other)? {
+                    driver::next::Notice::Dht(event) => match *event {
+                        dht_next::Event::LookupDone {
+                            query: q, closest, ..
+                        } if q == query => {
+                            if closest.is_empty() {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::NotConnected,
+                                    "no reachable bootstrap peers",
+                                ));
+                            }
+                            *self.inner.seeds.lock().expect("seeds") =
+                                closest.into_iter().take(8).collect();
+                            return Ok(());
+                        }
+                        dht_next::Event::NetworkChanged(_) => {
+                            return Err(io::Error::other("network changed"))
+                        }
+                        _ => {}
+                    },
+                    driver::next::Notice::Stopped => return Err(io::Error::other("DHT stopped")),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "bootstrap deadline"))?
     }
     pub async fn bootstrap_contacts(&self) -> io::Result<Vec<Contact>> {
         self.inner

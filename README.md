@@ -62,6 +62,15 @@ lookups skip provider pagination. Coordinator quotas still apply (including
 service. Network notifications must still be forwarded to the underlying endpoint
 by the application. See `crates/warren/tests/session_next.rs` for real-UDP session,
 pagination, and offline-author mirror examples.
+Applications can use `Session<regional::RegionalNode>` for language-selected
+communities with optional independent local and global discovery. Native locale
+selection, stable saved choices and invitation overrides choose the community;
+separately configured local network ranges preserve domestic routing and registrations.
+Each overlay has independent signaling, bootstrap snapshots and request budgets.
+See [community and regional DHT design/API](docs/regional-dht.md) for setup,
+invitation exclusions, limitations and shutdown tests. Run
+`cargo run -p warren --example community` to inspect native locale selection.
+
 See the [topology evaluation](docs/benchmarks/dht-topology.md) and
 [HyperDHT/libtorrent comparison](docs/benchmarks/dht-value-lookup-comparison.md).
 

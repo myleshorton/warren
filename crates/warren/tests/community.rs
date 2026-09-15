@@ -466,3 +466,153 @@ async fn invitation_with_only_policy_rejections_fails_immediately() {
         .contains("1 of 1 invite peers outside the configured domain"));
     node.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn multiple_languages_validate_scopes_and_publish_independently() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fa = Community::from_locale("fa").unwrap().overlay();
+        let en = Community::from_locale("en").unwrap().overlay();
+        let fa_router = router("127.0.0.1", 201, fa).await;
+        let en_router = router("127.0.0.1", 202, en).await;
+        let identity = Keypair::from_seed(&[203; 32]);
+        let primary = NextNode::bind_in_overlay(addr("127.0.0.1"), identity.clone(), false, fa)
+            .await
+            .unwrap();
+        let secondary = NextNode::bind_in_overlay(addr("127.0.0.1"), identity.clone(), false, en)
+            .await
+            .unwrap();
+        assert!(RegionalNode::from_endpoints(primary.clone(), vec![primary.clone()]).is_err());
+        assert!(RegionalNode::from_endpoints(primary.clone(), vec![en_router.clone()]).is_err());
+        assert!(RegionalNode::from_endpoints(primary.clone(), vec![secondary.clone(); 5]).is_err());
+        let node = RegionalNode::from_endpoints(primary, vec![secondary]).unwrap();
+        node.add_contact(fa, fa_router.contact()).await.unwrap();
+        node.add_contact(en, en_router.contact()).await.unwrap();
+        for endpoint in node.nodes() {
+            endpoint.bootstrap().await.unwrap();
+        }
+        let topic = swarm::NodeId::from_bytes([204; 32]);
+        let handles = node
+            .keep_announced_all(Duration::from_millis(100), move || vec![topic])
+            .await;
+        for (_, handle) in &handles {
+            let mut status = handle.status();
+            while status.borrow().acknowledged == 0 {
+                status.changed().await.unwrap();
+            }
+        }
+        let results = node.lookup_all_overlays(topic).await;
+        assert_eq!(results.len(), 2);
+        for (_, result) in results {
+            assert!(result.unwrap().iter().any(|p| p.id == node.id()));
+        }
+        en_router.shutdown().await.unwrap();
+        assert!(node
+            .node(fa)
+            .unwrap()
+            .lookup(topic)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.id == node.id()));
+        node.shutdown().await.unwrap();
+        fa_router.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn composed_global_endpoint_is_visible_to_legacy_apis_and_invites_roundtrip() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let scope = Community::from_locale("fa").unwrap().overlay();
+        let identity = Keypair::from_seed(&[210; 32]);
+        let primary = NextNode::bind_in_overlay(addr("127.0.0.1"), identity.clone(), false, scope)
+            .await
+            .unwrap();
+        let global = NextNode::bind(addr("127.0.0.1"), identity).await.unwrap();
+        assert!(RegionalNode::from_endpoints(global.clone(), vec![]).is_err());
+        let regional_router = router("127.0.0.1", 211, scope).await;
+        let global_router = router("127.0.0.1", 212, OverlayId::Global).await;
+        let node = RegionalNode::from_endpoints(primary, vec![global.clone()]).unwrap();
+        assert_eq!(node.global().unwrap().local_addr(), global.local_addr());
+        assert_eq!(node.nodes().count(), 2);
+        node.add_contact(scope, regional_router.contact())
+            .await
+            .unwrap();
+        node.add_contact(OverlayId::Global, global_router.contact())
+            .await
+            .unwrap();
+        for endpoint in node.nodes() {
+            endpoint.bootstrap().await.unwrap();
+        }
+        let topic = swarm::NodeId::from_bytes([213; 32]);
+        let (local_handle, global_handle) = node
+            .keep_announced(Duration::from_millis(100), move || vec![topic])
+            .await;
+        let global_handle = global_handle.expect("legacy global announcer");
+        for handle in [&local_handle, &global_handle] {
+            let mut status = handle.status();
+            while status.borrow().acknowledged == 0 {
+                status.changed().await.unwrap();
+            }
+        }
+        let (local, global) = node.lookup_all(topic).await;
+        assert!(local.unwrap().iter().any(|m| m.id == node.id()));
+        assert!(global.unwrap().unwrap().iter().any(|m| m.id == node.id()));
+        let invite = RegionalInvite::create(
+            &node,
+            "channel".into(),
+            "content".into(),
+            &[],
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert!(RegionalInvite::decode(
+            "warren://",
+            &invite.encode("warren://"),
+            warren::util::now_secs()
+        )
+        .is_some());
+        node.shutdown().await.unwrap();
+        regional_router.shutdown().await.unwrap();
+        global_router.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn composed_listener_starts_with_failed_primary_and_reports_retries() {
+    let scope = Community::from_locale("fa").unwrap().overlay();
+    let identity = Keypair::from_seed(&[214; 32]);
+    let primary = NextNode::bind_in_overlay(addr("127.0.0.1"), identity.clone(), false, scope)
+        .await
+        .unwrap();
+    let mut events = primary.diagnostics().subscribe().unwrap();
+    primary.shutdown().await.unwrap();
+    let global = NextNode::bind(addr("127.0.0.1"), identity).await.unwrap();
+    let node = RegionalNode::from_endpoints(primary, vec![global]).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), node.listen())
+        .await
+        .unwrap()
+        .unwrap();
+    for expected in [1, 2, 4, 8] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.name == "network.accept.retry" {
+                    assert_eq!(event.error_code, "accept_failed");
+                    assert_eq!(
+                        event.fields,
+                        vec![("retry_count", driver::diagnostics::Value::Count(expected))]
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert!(node.shutdown().await.is_err());
+}

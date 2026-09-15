@@ -20,6 +20,7 @@ struct Inner {
     global: Option<NextNode>,
     community_node: Option<NextNode>,
     community: Option<crate::community::Community>,
+    additional: Vec<NextNode>,
     publication: Vec<mpsc::Sender<NodeId>>,
     tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     incoming: Mutex<Option<IncomingQueues>>,
@@ -150,8 +151,46 @@ impl RegionalNode {
         };
         let (regional, community_node, global) =
             tokio::try_join!(regional, community_node, global)?;
+        Self::assemble(
+            regional,
+            global,
+            community_node,
+            community.map(|(selection, _)| selection),
+            vec![],
+        )
+    }
+
+    /// Combine already-bound endpoints for one application session. Each overlay
+    /// has one socket and routing table; all endpoints must use the same identity.
+    /// The cap permits a home language, three invited languages, and global discovery.
+    pub fn from_endpoints(primary: NextNode, additional: Vec<NextNode>) -> io::Result<Self> {
+        if additional.len() > 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many discovery overlays",
+            ));
+        }
+        let mut scopes = std::collections::BTreeSet::new();
+        for node in std::iter::once(&primary).chain(additional.iter()) {
+            if node.id() != primary.id() || !scopes.insert(node.endpoint().dht().overlay()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate overlay or mismatched identity",
+                ));
+            }
+        }
+        Self::assemble(primary, None, None, None, additional)
+    }
+
+    fn assemble(
+        regional: NextNode,
+        global: Option<NextNode>,
+        community_node: Option<NextNode>,
+        community: Option<crate::community::Community>,
+        additional: Vec<NextNode>,
+    ) -> io::Result<Self> {
         let mut tasks = vec![];
-        let publication = community_node.iter().chain(global.iter()).map(|global| {
+        let publication = community_node.iter().chain(global.iter()).chain(additional.iter()).map(|global| {
             let global = global.clone();
             let (sender, mut receiver) = mpsc::channel(32);
             tasks.push(tokio::spawn(async move {
@@ -176,7 +215,8 @@ impl RegionalNode {
                 regional,
                 global,
                 community_node,
-                community: community.map(|(selection, _)| selection),
+                community,
+                additional,
                 publication,
                 tasks: std::sync::Mutex::new(tasks),
                 incoming: Mutex::new(None),
@@ -204,8 +244,9 @@ impl RegionalNode {
             .community_node
             .iter()
             .chain(self.inner.global.iter())
+            .chain(self.inner.additional.iter())
     }
-    fn nodes(&self) -> impl Iterator<Item = &NextNode> {
+    pub fn nodes(&self) -> impl Iterator<Item = &NextNode> {
         std::iter::once(self.regional()).chain(self.extras())
     }
     pub fn overlay(&self) -> OverlayId {
@@ -221,7 +262,7 @@ impl RegionalNode {
     pub fn supports_overlay(&self, overlay: OverlayId) -> bool {
         self.node(overlay).is_ok()
     }
-    fn node(&self, overlay: OverlayId) -> io::Result<&NextNode> {
+    pub fn node(&self, overlay: OverlayId) -> io::Result<&NextNode> {
         if let Some(node) = self
             .nodes()
             .find(|node| node.endpoint().dht().overlay() == overlay)
@@ -259,7 +300,9 @@ impl RegionalNode {
         if incoming.is_some() {
             return Ok(());
         }
-        self.regional().listen().await?;
+        if self.inner.additional.is_empty() {
+            self.regional().listen().await?;
+        }
         let mut queues = IncomingQueues {
             receivers: vec![],
             cursor: 0,
@@ -359,24 +402,18 @@ impl RegionalNode {
         &self,
         topic: NodeId,
     ) -> Vec<(OverlayId, Result<Vec<Member>, String>)> {
-        let (regional, community, global) = tokio::join!(
-            self.regional().lookup(topic),
-            async {
-                match &self.inner.community_node {
-                    Some(node) => Some((node.endpoint().dht().overlay(), node.lookup(topic).await)),
-                    None => None,
-                }
-            },
-            async {
-                match self.global() {
-                    Some(node) => Some((OverlayId::Global, node.lookup(topic).await)),
-                    None => None,
-                }
-            },
-        );
-        let mut results = vec![(self.overlay(), regional)];
-        results.extend(community);
-        results.extend(global);
+        let mut pending = tokio::task::JoinSet::new();
+        for node in self.nodes() {
+            let node = node.clone();
+            pending
+                .spawn(async move { (node.endpoint().dht().overlay(), node.lookup(topic).await) });
+        }
+        let mut results = vec![];
+        while let Some(result) = pending.join_next().await {
+            if let Ok(result) = result {
+                results.push(result);
+            }
+        }
         results.sort_by_key(|(overlay, _)| *overlay);
         results
     }

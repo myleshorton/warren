@@ -582,7 +582,7 @@ async fn composed_global_endpoint_is_visible_to_legacy_apis_and_invites_roundtri
     .unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn composed_listener_starts_with_failed_primary_and_reports_retries() {
     let scope = Community::from_locale("fa").unwrap().overlay();
     let identity = Keypair::from_seed(&[214; 32]);
@@ -597,16 +597,22 @@ async fn composed_listener_starts_with_failed_primary_and_reports_retries() {
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), async {
-        loop {
-            let event = events.recv().await.unwrap();
-            if event.name == "network.accept.retry" {
-                assert_eq!(event.error_code, "accept_failed");
-                break;
+    for expected in [1, 2, 4, 8] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.name == "network.accept.retry" {
+                    assert_eq!(event.error_code, "accept_failed");
+                    assert_eq!(
+                        event.fields,
+                        vec![("retry_count", driver::diagnostics::Value::Count(expected))]
+                    );
+                    break;
+                }
             }
-        }
-    })
-    .await
-    .unwrap();
+        })
+        .await
+        .unwrap();
+    }
     assert!(node.shutdown().await.is_err());
 }

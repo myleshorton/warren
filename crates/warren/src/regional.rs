@@ -324,6 +324,8 @@ impl RegionalNode {
     /// and retries independently. Cancellation cannot drop another worker's handshake.
     /// Initialize before starting the single accept loop. A pending `incoming()`
     /// holds the queue lock, so concurrent `listen()` calls wait for that accept.
+    /// Retry diagnostics report consecutive failure counts at powers of two;
+    /// accepting a connection resets the count.
     pub async fn listen(&self) -> io::Result<()> {
         let mut incoming = self.inner.incoming.lock().await;
         if incoming.is_some() {
@@ -341,19 +343,27 @@ impl RegionalNode {
             let (sender, receiver) = mpsc::channel(32);
             queues.receivers.push(receiver);
             let task = tokio::spawn(async move {
+                let mut retries = 0u64;
                 loop {
                     match node.incoming().await {
                         Ok(link) => {
+                            retries = 0;
                             if sender.send(link).await.is_err() {
                                 break;
                             }
                         }
                         Err(_) => {
-                            node.diagnostics().event(
-                                "network.accept.retry",
-                                "accept_failed",
-                                vec![],
-                            );
+                            retries = retries.saturating_add(1);
+                            if retries.is_power_of_two() {
+                                node.diagnostics().event(
+                                    "network.accept.retry",
+                                    "accept_failed",
+                                    vec![(
+                                        "retry_count",
+                                        driver::diagnostics::Value::Count(retries),
+                                    )],
+                                );
+                            }
                             if sender.is_closed() {
                                 break;
                             }

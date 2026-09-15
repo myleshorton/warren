@@ -1,5 +1,5 @@
 //! Candidate gathering on the exact socket later used for the data connection.
-use super::{mapping::MappingLease, time};
+use super::{mapping::MappingLease, time, AddressFilter, OverlayId};
 use crate::diagnostics::{io_code, Observer, Value};
 use crate::{connect_channel, Channel, PunchConfig};
 use crypto::Keypair;
@@ -19,6 +19,7 @@ pub struct DirectSocket {
     candidates: Vec<SocketAddr>,
     translation: super::nat64::Translation,
     mapping: Option<MappingLease>,
+    address_filter: AddressFilter,
 }
 impl DirectSocket {
     /// Bind once, ask up to three DHT reflectors, then keep that same mapping for
@@ -39,6 +40,7 @@ impl DirectSocket {
             translation,
             Observer::default(),
             None,
+            (OverlayId::Global, std::sync::Arc::new(|_| true)),
         )
         .await
     }
@@ -49,7 +51,9 @@ impl DirectSocket {
         translation: super::nat64::Translation,
         observer: Observer,
         parent: Option<u64>,
+        transport: (OverlayId, AddressFilter),
     ) -> io::Result<Self> {
+        let (overlay, address_filter) = transport;
         let mut observation = observer.child("nat.reflection", parent);
         observation.field("reflectors", Value::Count(reflectors.len().min(3) as u64));
         observation.field("translation", Value::Text(translation.mode()));
@@ -62,26 +66,34 @@ impl DirectSocket {
             let start = Instant::now();
             let mut pending = BTreeSet::new();
             let mut actions = Vec::new();
-            for peer in reflectors.iter().take(3) {
+            for peer in reflectors
+                .iter()
+                .filter(|peer| address_filter(translation.source(peer.addr)))
+                .take(3)
+            {
                 if let Ok((request, sent)) = core.reflect(*peer, time(start)) {
                     pending.insert(request);
                     actions.extend(sent);
                 }
             }
             let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
-            let mut bytes = [0; dht_next::protocol::MAX_PACKET + 1];
+            let mut bytes = [0; dht_next::protocol::MAX_PACKET + super::overlay::HEADER_LEN + 1];
             loop {
                 for action in actions.drain(..) {
                     match action {
                         Action::Send { to, bytes } => {
-                            let _ = socket.send_to(&bytes, translation.destination(to)).await;
+                            if address_filter(translation.source(to)) {
+                                let bytes = overlay.frame(bytes);
+                                let _ = socket.send_to(&bytes, translation.destination(to)).await;
+                            }
                         }
                         Action::Event(event) => match *event {
                             Event::ObservedAddress {
                                 request, address, ..
                             } if pending.remove(&request) => {
-                                let address = canonical(address);
+                                let address = translation.source(address);
                                 if usable(address)
+                                    && address_filter(address)
                                     && (dual_stack || address.is_ipv4())
                                     && !candidates.contains(&address)
                                 {
@@ -106,7 +118,14 @@ impl DirectSocket {
                 tokio::select! {
                     received = socket.recv_from(&mut bytes) => {
                         match received {
-                            Ok((len, from)) => actions = core.receive(translation.source(from), &bytes[..len], time(start)),
+                            Ok((len, from)) => {
+                                let from = translation.source(from);
+                                if address_filter(from) {
+                                    if let Some(payload) = overlay.payload(&bytes[..len]) {
+                                        actions = core.receive(from, payload, time(start));
+                                    }
+                                }
+                            },
                             Err(error) if super::transient_receive_error(error.kind()) => {},
                             Err(error) => return Err(error),
                         }
@@ -120,19 +139,24 @@ impl DirectSocket {
             observation.field("observed_candidates", Value::Count(candidates.len() as u64));
             observation.field("unanswered_reflectors", Value::Count(pending.len() as u64));
             observation.field("mapping_varies", Value::Flag(mapping_varies(&candidates)));
-            if usable(local) && !candidates.contains(&local) {
+            if usable(local)
+                && address_filter(translation.source(local))
+                && !candidates.contains(&local)
+            {
                 candidates.push(local);
             }
             let mapping = match gateway {
                 Some(gateway) => MappingLease::acquire(gateway, local).await,
                 None => None,
             };
-            let mapping = mapping.map(|(lease, external)| {
-                candidates.retain(|candidate| *candidate != external);
-                candidates.insert(0, external);
-                candidates.truncate(4);
-                lease
-            });
+            let mapping = mapping
+                .filter(|(_, external)| address_filter(translation.source(*external)))
+                .map(|(lease, external)| {
+                    candidates.retain(|candidate| *candidate != external);
+                    candidates.insert(0, external);
+                    candidates.truncate(4);
+                    lease
+                });
             if candidates.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrNotAvailable,
@@ -142,13 +166,16 @@ impl DirectSocket {
             observation.field("gateway_mapping", Value::Flag(mapping.is_some()));
             observation.field("candidates", Value::Count(candidates.len() as u64));
             Ok(Self {
-                observer, parent,
+                observer,
+                parent,
                 socket,
                 candidates,
                 translation,
                 mapping,
+                address_filter,
             })
-        }.await;
+        }
+        .await;
         observation.finish(result.as_ref().err().map(io_code).unwrap_or(""));
         result
     }
@@ -185,6 +212,18 @@ impl DirectSocket {
                     "invalid candidate set",
                 ));
             }
+            let peers: Vec<_> = peers
+                .iter()
+                .map(|peer| self.translation.source(*peer))
+                .filter(|peer| (self.address_filter)(*peer))
+                .collect();
+            if peers.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "all direct candidates are outside the address policy",
+                ));
+            }
+            let peers = peers.as_slice();
             if let Some(mapping) = &self.mapping {
                 mapping.check()?;
             }
@@ -206,13 +245,14 @@ impl DirectSocket {
                 .map(|p| self.translation.destination(canonical(*p)))
                 .collect();
             Ok(connect_channel(
-                puncher::rendezvous_with_strategy(
+                puncher::rendezvous_with_policy(
                     self.socket,
                     &peers,
                     config,
                     session,
                     initiator,
                     strategy,
+                    &|address| (self.address_filter)(self.translation.source(address)),
                 )
                 .await?,
             )
@@ -308,6 +348,121 @@ impl DirectChannel {
 #[cfg(test)]
 mod review_tests {
     use super::*;
+    #[tokio::test]
+    async fn regional_reflection_is_required_for_wildcard_bound_candidates() {
+        let overlay = OverlayId::regional("reflection-test");
+        let reflector = super::super::Node::bind_in_overlay(
+            "127.0.0.1:0".parse().unwrap(),
+            Keypair::generate(),
+            true,
+            dht_next::RoutingPolicy::Unrestricted,
+            overlay,
+        )
+        .await
+        .unwrap();
+        let node = super::super::Node::bind_filtered(
+            "0.0.0.0:0".parse().unwrap(),
+            Keypair::generate(),
+            false,
+            dht_next::RoutingPolicy::Unrestricted,
+            overlay,
+            std::sync::Arc::new(|address| address.ip().is_loopback()),
+        )
+        .await
+        .unwrap();
+        let direct = node
+            .direct_socket(
+                &[Contact::new(reflector.id(), reflector.local_addr())],
+                None,
+            )
+            .await
+            .unwrap();
+        // A wildcard bind has no usable local fallback: this must be reflected.
+        assert!(direct.socket.local_addr().unwrap().ip().is_unspecified());
+        assert_eq!(
+            direct.candidates(),
+            &[SocketAddr::new(
+                "127.0.0.1".parse().unwrap(),
+                direct.socket.local_addr().unwrap().port()
+            )]
+        );
+        drop(direct);
+        node.shutdown().await.unwrap();
+        reflector.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reflection_rejects_wrong_overlay_and_never_contacts_denied_reflectors() {
+        let overlay = OverlayId::regional("expected");
+        let wrong = super::super::Node::bind_in_overlay(
+            "127.0.0.1:0".parse().unwrap(),
+            Keypair::generate(),
+            true,
+            dht_next::RoutingPolicy::Unrestricted,
+            OverlayId::regional("wrong"),
+        )
+        .await
+        .unwrap();
+        let denied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let denied_address = denied.local_addr().unwrap();
+        let node = super::super::Node::bind_filtered(
+            "0.0.0.0:0".parse().unwrap(),
+            Keypair::generate(),
+            false,
+            dht_next::RoutingPolicy::Unrestricted,
+            overlay,
+            std::sync::Arc::new(move |address| address != denied_address),
+        )
+        .await
+        .unwrap();
+        let result = node
+            .direct_socket(
+                &[
+                    Contact::new(dht_next::NodeId::from_bytes([93; 32]), denied_address),
+                    Contact::new(wrong.id(), wrong.local_addr()),
+                ],
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::AddrNotAvailable));
+        let mut bytes = [0; 1500];
+        assert!(
+            matches!(denied.try_recv_from(&mut bytes), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        node.shutdown().await.unwrap();
+        wrong.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_candidates_cannot_bypass_policy_with_ipv4_mapped_ipv6() {
+        let denied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = denied.local_addr().unwrap();
+        let node = super::super::Node::bind_filtered(
+            "127.0.0.1:0".parse().unwrap(),
+            Keypair::generate(),
+            false,
+            dht_next::RoutingPolicy::Unrestricted,
+            OverlayId::regional("policy"),
+            std::sync::Arc::new(move |peer| peer != address),
+        )
+        .await
+        .unwrap();
+        let direct = node.direct_socket(&[], None).await.unwrap();
+        let mapped = SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped().into(),
+            address.port(),
+        );
+        let result = direct
+            .punch(&[mapped], &PunchConfig::default(), [91; 32], true)
+            .await;
+        assert!(matches!(result, Err(error) if error.kind() == io::ErrorKind::PermissionDenied));
+        let mut bytes = [0; 1500];
+        assert!(
+            matches!(denied.try_recv_from(&mut bytes), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+        );
+        node.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     async fn reflection_tolerates_loss_and_two_slow_round_trips() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();

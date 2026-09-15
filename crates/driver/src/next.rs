@@ -288,6 +288,7 @@ impl Node {
             translation,
             self.diagnostics(),
             parent,
+            (self.overlay(), self.inner.address_filter.clone()),
         )
         .await
     }

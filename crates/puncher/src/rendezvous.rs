@@ -99,6 +99,17 @@ pub async fn rendezvous(
     session: [u8; 32],
     initiator: bool,
 ) -> io::Result<Option<Established>> {
+    rendezvous_filtered(socket, peers, config, session, initiator, &|_| true).await
+}
+
+async fn rendezvous_filtered(
+    socket: UdpSocket,
+    peers: &[SocketAddr],
+    config: &Config,
+    session: [u8; 32],
+    initiator: bool,
+    allows: &(dyn Fn(SocketAddr) -> bool + Sync),
+) -> io::Result<Option<Established>> {
     if peers.is_empty() || peers.len() > 4 || config.probe_interval.is_zero() {
         return Ok(None);
     }
@@ -109,7 +120,9 @@ pub async fn rendezvous(
         let sent = Instant::now();
         let mut sent_any = false;
         for (peer, bytes) in nomination.probes() {
-            sent_any |= socket.send_to(&bytes, peer).await.is_ok();
+            if allows(peer) {
+                sent_any |= socket.send_to(&bytes, peer).await.is_ok();
+            }
         }
         if !sent_any {
             return Ok(None);
@@ -125,6 +138,9 @@ pub async fn rendezvous(
                 Ok(result) => result?,
                 Err(_) => break,
             };
+            if !allows(from) {
+                continue;
+            }
             if let Some(reply) = nomination.receive(from, &bytes[..len]) {
                 socket.send_to(&reply, from).await?;
             }
@@ -195,8 +211,30 @@ pub async fn rendezvous_with_strategy(
     initiator: bool,
     strategy: NatStrategy,
 ) -> io::Result<Option<Established>> {
+    rendezvous_with_policy(socket, peers, config, session, initiator, strategy, &|_| {
+        true
+    })
+    .await
+}
+
+/// Apply the peer policy to probes, searched ports, inbound nomination packets,
+/// and replies. Addresses are socket addresses; callers normalize translations.
+pub async fn rendezvous_with_policy(
+    socket: UdpSocket,
+    peers: &[SocketAddr],
+    config: &Config,
+    session: [u8; 32],
+    initiator: bool,
+    strategy: NatStrategy,
+    allows: &(dyn Fn(SocketAddr) -> bool + Sync),
+) -> io::Result<Option<Established>> {
+    if peers.is_empty() || peers.len() > 4 {
+        return Ok(None);
+    }
+    let peers: Vec<_> = peers.iter().copied().filter(|peer| allows(*peer)).collect();
+    let peers = peers.as_slice();
     if strategy == NatStrategy::Direct {
-        return rendezvous(socket, peers, config, session, initiator).await;
+        return rendezvous_filtered(socket, peers, config, session, initiator, allows).await;
     }
     if peers.is_empty() || peers.len() > 4 || config.probe_interval.is_zero() {
         return Ok(None);
@@ -248,17 +286,23 @@ pub async fn rendezvous_with_strategy(
             if let Some(index) = selected_socket {
                 for (to, bytes) in nomination.probes() {
                     let socket: &std::sync::Arc<UdpSocket> = &sockets[index];
-                    socket.send_to(&bytes, to).await?;
+                    if allows(to) {
+                        socket.send_to(&bytes, to).await?;
+                    }
                 }
             } else {
                 for socket in &sockets {
                     for (to, bytes) in nomination.probes() {
-                        let _ = socket.send_to(&bytes, to).await;
+                        if allows(to) {
+                            let _ = socket.send_to(&bytes, to).await;
+                        }
                     }
                 }
                 if strategy == NatStrategy::SearchPorts {
                     for target in search.batch(peers) {
-                        let _ = sockets[0].send_to(&packet(session, PROBE), target).await;
+                        if allows(target) {
+                            let _ = sockets[0].send_to(&packet(session, PROBE), target).await;
+                        }
                     }
                 }
             }
@@ -269,6 +313,9 @@ pub async fn rendezvous_with_strategy(
                         Ok(None) => return Ok(None),
                         Err(_) => break,
                     };
+                if !allows(from) {
+                    continue;
+                }
                 if selected_socket.is_some_and(|selected| selected != index) {
                     continue;
                 }
@@ -300,6 +347,109 @@ pub async fn rendezvous_with_strategy(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn policy_blocks_candidates_and_unsolicited_nomination_in_every_strategy() {
+        for strategy in [
+            NatStrategy::Direct,
+            NatStrategy::OpenMappings,
+            NatStrategy::SearchPorts,
+        ] {
+            let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let target = client.local_addr().unwrap();
+            let allowed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let allowed_address = allowed.local_addr().unwrap();
+            let denied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let denied_address = denied.local_addr().unwrap();
+            let config = Config {
+                overall: std::time::Duration::from_secs(2),
+                probe_interval: std::time::Duration::from_millis(10),
+            };
+            let client_config = config;
+            let task = tokio::spawn(async move {
+                rendezvous_with_policy(
+                    client,
+                    &[allowed_address, denied_address],
+                    &client_config,
+                    [71; 32],
+                    false,
+                    strategy,
+                    &move |peer| peer == allowed_address,
+                )
+                .await
+                .unwrap()
+                .unwrap()
+            });
+            // Same host and correct session: only the policy excludes this sender.
+            for _ in 0..5 {
+                denied
+                    .send_to(&packet([71; 32], PROBE), target)
+                    .await
+                    .unwrap();
+                denied
+                    .send_to(&packet([71; 32], SELECT), target)
+                    .await
+                    .unwrap();
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let peer = rendezvous(allowed, &[target], &config, [71; 32], true)
+                .await
+                .unwrap()
+                .unwrap();
+            let established = task.await.unwrap();
+            assert_eq!(established.peer, allowed_address);
+            assert_eq!(peer.peer, established.socket.local_addr().unwrap());
+            let mut bytes = [0; 1500];
+            assert!(
+                matches!(denied.try_recv_from(&mut bytes), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+                "denied peer received a probe or nomination reply for {strategy:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_blocks_generated_port_search_targets() {
+        let allowed = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = allowed.local_addr().unwrap();
+        let mut trapped = None;
+        for seed in 1..=32 {
+            let session = [seed; 32];
+            let target = PortSearch::new(session).batch(&[address])[0];
+            if target != address {
+                if let Ok(socket) = UdpSocket::bind(target).await {
+                    trapped = Some((session, socket));
+                    break;
+                }
+            }
+        }
+        let (session, denied) = trapped.expect("bind a predicted port-search destination");
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let config = Config {
+            overall: std::time::Duration::from_millis(150),
+            probe_interval: std::time::Duration::from_millis(10),
+        };
+        assert!(rendezvous_with_policy(
+            client,
+            &[address],
+            &config,
+            session,
+            true,
+            NatStrategy::SearchPorts,
+            &move |peer| peer == address
+        )
+        .await
+        .unwrap()
+        .is_none());
+        let mut bytes = [0; 1500];
+        assert!(
+            allowed.try_recv_from(&mut bytes).is_ok(),
+            "permitted candidate must receive probes"
+        );
+        assert!(
+            matches!(denied.try_recv_from(&mut bytes), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "port search bypassed policy"
+        );
+    }
+
     #[test]
     fn replies_bind_session_role_and_exact_control_encoding() {
         let session = [1; 32];

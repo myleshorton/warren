@@ -345,3 +345,29 @@ Use one `incoming()` accept loop per `RegionalNode`, and initialize `listen()`
 before starting it. Pending accepts hold the queue mutex; concurrent accepts and
 `listen()` calls serialize behind it. Cancelling an accept releases the lock
 without consuming a connection.
+
+
+## Direct-socket reflection and peer admission
+
+Data sockets inherit the owning DHT's overlay and immutable address policy.
+Their reflection requests and responses use the same overlay envelope as routing
+traffic. Reflection targets and response sources are checked against the policy;
+only usable, permitted reflected, local, and gateway-mapped addresses are advertised.
+A wildcard bind therefore requires reflection or a usable gateway mapping.
+
+Peer candidates are normalized through the current NAT64/IPv4-mapped translation
+before policy checks. The puncher enforces the policy on candidate probes, generated
+port-search targets, inbound nomination packets, and replies across direct,
+multiple-socket, and port-search strategies. The nominated UDP socket is then
+connected to the admitted peer for Noise and data traffic. A candidate set with no
+permitted destination fails explicitly. The session-bound punching wire format is
+unchanged; the overlay envelope applies to DHT reflection RPCs.
+
+An explicitly supplied router gateway is local infrastructure, not a remote peer;
+its mapping-control traffic is separate from peer admission. An out-of-policy
+external mapping is not advertised and its lease is released.
+
+Regression coverage requires reflected candidates from wildcard-bound sockets,
+rejects wrong overlays and disallowed reflectors, checks IPv4-mapped policy
+normalization, and verifies zero traffic to denied advertised and generated
+port-search destinations, including unsolicited nomination senders.

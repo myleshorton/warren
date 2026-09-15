@@ -15,11 +15,13 @@
 //! adapter schedules renewal tasks and drop-time lookup cancellation on it.
 
 pub mod channel;
+pub mod community;
 pub mod invite;
 pub mod merge;
 pub mod network;
 pub mod protocol;
 pub mod record;
+pub mod regional;
 pub mod room;
 pub mod roster;
 pub mod session;

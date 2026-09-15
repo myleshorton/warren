@@ -149,3 +149,209 @@ mod tests {
         assert!(decode_invite(PFX, &empty_key).is_none());
     }
 }
+
+/// A regional invitation is a separate versioned format. It is not encrypted or
+/// a membership credential; possession reveals the channel keys and peer hints.
+#[derive(Clone, Debug)]
+pub struct RegionalInvite {
+    pub community_language: Option<String>,
+    pub community_bootstrap: Option<driver::next::BootstrapState>,
+    pub channel_key: String,
+    pub content_key: String,
+    pub bootstrap: driver::next::BootstrapState,
+    pub expires: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegionalWire {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    community_language: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    community_bootstrap: Option<String>,
+    version: u8,
+    channel: String,
+    content: String,
+    bootstrap: String,
+    expires: u64,
+}
+
+impl RegionalInvite {
+    /// Export at most eight verified regional contacts. Explicit exclusions are
+    /// never bypassed; no global or configured-but-unverified seeds are included.
+    pub async fn create(
+        node: &crate::regional::RegionalNode,
+        channel_key: String,
+        content_key: String,
+        excluded: &[swarm::NodeId],
+        lifetime: std::time::Duration,
+    ) -> std::io::Result<Self> {
+        if channel_key.is_empty()
+            || channel_key.len().saturating_add(content_key.len()) > 1024
+            || lifetime.as_secs() == 0
+            || lifetime.as_secs() > 86_400
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid invite lifetime or channel",
+            ));
+        }
+        let state = node.bootstrap_state(node.overlay()).await?;
+        let contacts = state
+            .contacts()
+            .iter()
+            .copied()
+            .filter(|peer| !excluded.contains(&peer.id))
+            .take(8)
+            .collect::<Vec<_>>();
+        if contacts.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "no eligible regional introduction peers",
+            ));
+        }
+        let community_bootstrap = match node.community_endpoint() {
+            Some(endpoint) if endpoint.endpoint().dht().overlay() != node.overlay() => {
+                let state = endpoint
+                    .endpoint()
+                    .dht()
+                    .bootstrap_state()
+                    .await
+                    .map_err(std::io::Error::other)?;
+                let contacts = state
+                    .contacts()
+                    .iter()
+                    .copied()
+                    .filter(|peer| !excluded.contains(&peer.id))
+                    .take(8)
+                    .collect::<Vec<_>>();
+                (!contacts.is_empty())
+                    .then(|| driver::next::BootstrapState::in_overlay(contacts, state.overlay()))
+            }
+            _ => None,
+        };
+        Ok(Self {
+            community_bootstrap,
+            community_language: node
+                .community()
+                .and_then(|c| c.language().map(str::to_owned)),
+            channel_key,
+            content_key,
+            bootstrap: driver::next::BootstrapState::in_overlay(contacts, node.overlay()),
+            expires: crate::util::now_secs().saturating_add(lifetime.as_secs()),
+        })
+    }
+    pub fn encode(&self, prefix: &str) -> String {
+        let wire = RegionalWire {
+            community_bootstrap: self
+                .community_bootstrap
+                .as_ref()
+                .map(|state| to_hex(&state.encode())),
+            community_language: self.community_language.clone(),
+            version: if self.community_language.is_some() {
+                2
+            } else {
+                1
+            },
+            channel: self.channel_key.clone(),
+            content: self.content_key.clone(),
+            bootstrap: to_hex(&self.bootstrap.encode()),
+            expires: self.expires,
+        };
+        format!(
+            "{prefix}{}",
+            to_hex(&serde_json::to_vec(&wire).expect("regional invite"))
+        )
+    }
+    pub fn decode(prefix: &str, text: &str, now: u64) -> Option<Self> {
+        let body = text.trim().strip_prefix(prefix)?;
+        if body.len() > 24_576 {
+            return None;
+        }
+        let wire: RegionalWire = serde_json::from_slice(&from_hex(body)?).ok()?;
+        if !matches!(
+            (wire.version, wire.community_language.is_some()),
+            (1, false) | (2, true)
+        ) || wire
+            .community_language
+            .as_ref()
+            .is_some_and(|language| crate::community::Community::from_locale(language).is_none())
+            || wire.channel.is_empty()
+            || wire.channel.len().saturating_add(wire.content.len()) > 1024
+            || wire.expires <= now
+            || wire.expires > now.saturating_add(86_400)
+        {
+            return None;
+        }
+        let bootstrap = driver::next::BootstrapState::decode(&from_hex(&wire.bootstrap)?).ok()?;
+        if bootstrap.overlay() == driver::next::OverlayId::Global
+            || bootstrap.contacts().is_empty()
+            || bootstrap.contacts().len() > 8
+        {
+            return None;
+        }
+        let community_bootstrap = match wire.community_bootstrap {
+            Some(encoded) => {
+                let community =
+                    crate::community::Community::from_locale(wire.community_language.as_ref()?)?;
+                let state = driver::next::BootstrapState::decode(&from_hex(&encoded)?).ok()?;
+                if state.overlay() != community.overlay()
+                    || state.contacts().is_empty()
+                    || state.contacts().len() > 8
+                {
+                    return None;
+                }
+                Some(state)
+            }
+            None => None,
+        };
+        Some(Self {
+            community_bootstrap,
+            community_language: wire.community_language,
+            channel_key: wire.channel,
+            content_key: wire.content,
+            bootstrap,
+            expires: wire.expires,
+        })
+    }
+    pub async fn join(&self, node: &crate::regional::RegionalNode) -> std::io::Result<()> {
+        if self.expires <= crate::util::now_secs() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "expired invite",
+            ));
+        }
+        if let Some(language) = &self.community_language {
+            let expected = crate::community::Community::from_locale(language);
+            if expected.as_ref() != node.community() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invitation selects a different community",
+                ));
+            }
+        }
+        let mut pending = tokio::task::JoinSet::new();
+        for state in std::iter::once(&self.bootstrap).chain(self.community_bootstrap.iter()) {
+            if !node.supports_overlay(state.overlay()) {
+                continue;
+            }
+            for peer in state.contacts() {
+                let _ = node.add_contact(state.overlay(), *peer).await;
+            }
+            let state = state.clone();
+            let node = node.clone();
+            pending.spawn(async move { node.restore_bootstrap(&state).await });
+        }
+        let mut error = std::io::Error::new(
+            std::io::ErrorKind::NotConnected,
+            "no reachable invitation peers for the configured overlays",
+        );
+        while let Some(result) = pending.join_next().await {
+            match result.map_err(std::io::Error::other).and_then(|r| r) {
+                Ok(()) => return Ok(()),
+                Err(failure) => error = failure,
+            }
+        }
+        Err(error)
+    }
+}

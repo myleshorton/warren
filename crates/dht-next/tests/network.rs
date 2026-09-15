@@ -899,3 +899,130 @@ fn value_lookup_follows_referrals_to_content_and_finishes_without_a_second_get_p
     assert!(n.events.iter().any(|(node, event)| *node == 4 && matches!(event, Event::ValueLookupDone { query: id, result, .. } if *id == query && result.value.as_ref() == Some(&value) && result.responses == 3 && result.attempted == 3)));
     assert_eq!(n.nodes[4].1.pending_len(), 0);
 }
+
+#[test]
+fn independent_regional_overlay_survives_two_hours_of_global_blackhole_and_origin_loss() {
+    // Separate actors for each overlay, including a dual-participating provider.
+    let mut n = Network::new(&[true, true, true, true, false, false, false, false]);
+    n.nodes[5].1 = Dht::new(identity(5), [99; 32], false);
+    let topic = contact(5).id;
+    for server in 0..3 {
+        let actions = n.nodes[server].1.maintain_routing(at(n.now));
+        n.pump(server, actions);
+        for other in 0..3 {
+            if other != server {
+                let actions = n.nodes[server]
+                    .1
+                    .probe(contact(other as u8 + 1), at(n.now))
+                    .unwrap();
+                n.pump(server, actions);
+            }
+        }
+    }
+    for (provider, seed) in [(4, 1), (5, 4)] {
+        let actions = n.nodes[provider]
+            .1
+            .publish(topic, &[contact(seed)], at(n.now))
+            .unwrap();
+        n.pump(provider, actions);
+    }
+    for _ in 0..5 {
+        n.tick();
+    }
+    assert!(n
+        .events
+        .iter()
+        .any(|(i, e)| *i == 4 && matches!(e, Event::Registered(_))));
+    assert!(n
+        .events
+        .iter()
+        .any(|(i, e)| *i == 5 && matches!(e, Event::Registered(_))));
+    let (_, actions) = n.nodes[6].1.bootstrap(&[contact(2)], at(n.now)).unwrap();
+    n.pump(6, actions);
+    let saved = n.nodes[6].1.bootstrap_contacts(at(n.now));
+    assert!(!saved.is_empty());
+    assert!(saved.iter().all(|c| c.addr != address(4)));
+    let cutoff = n.now;
+    let blocked = |from: SocketAddr, to: SocketAddr, _: &[u8]| {
+        [address(1), address(4)].contains(&from) || [address(1), address(4)].contains(&to)
+    };
+    for step in 1..=720 {
+        n.now = cutoff + step * 10;
+        for i in 1..n.nodes.len() {
+            if i == 3 {
+                continue;
+            }
+            let actions = n.nodes[i].1.tick(at(n.now));
+            n.pump_with(i, actions, blocked);
+        }
+        if step % 120 != 0 {
+            continue;
+        }
+        // A fresh process has no routes or old provider records to fall back on.
+        n.nodes[6].1 = Dht::new(identity(7), [step as u8; 32], false);
+        let (_, actions) = n.nodes[6].1.bootstrap(&saved, at(n.now)).unwrap();
+        n.pump_with(6, actions, blocked);
+        // Finish the dead origin's bounded retries before testing discovery.
+        for _ in 0..5 {
+            n.now += 1;
+            let actions = n.nodes[6].1.tick(at(n.now));
+            n.pump_with(6, actions, blocked);
+        }
+        n.events.clear();
+        let (query, actions) = n.nodes[6]
+            .1
+            .lookup(topic, &[contact(2)], at(n.now))
+            .unwrap();
+        n.pump_with(6, actions, blocked);
+        let records: Vec<_> = n
+            .events
+            .iter()
+            .filter_map(|(i, e)| match e {
+                Event::Providers { query: q, records } if *i == 6 && *q == query => {
+                    Some(records.clone())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            !records.is_empty(),
+            "regional publication failed at {}",
+            n.now
+        );
+        assert!(records.iter().all(|r| r.expires > n.now
+            && r.expires > cutoff + 300
+            && [address(2), address(3)].contains(&r.coordinator.addr)));
+        let (session, actions) = n.nodes[6]
+            .1
+            .signal_via(&records, b"partition offer".to_vec(), at(n.now))
+            .unwrap();
+        n.pump_with(6, actions, blocked);
+        let actions = n.nodes[4]
+            .1
+            .answer(session, b"regional answer".to_vec(), at(n.now))
+            .unwrap();
+        n.pump_with(4, actions, blocked);
+        assert!(n
+            .events
+            .iter()
+            .any(|(i, e)| *i == 6
+                && matches!(e, Event::Answered(s) if s.payload == b"regional answer")));
+        n.events.clear();
+    }
+    // Recovery re-establishes global registrations without replacing local state.
+    for _ in 0..120 {
+        n.tick();
+    }
+    assert!(n
+        .events
+        .iter()
+        .any(|(i, e)| *i == 5 && matches!(e, Event::Registered(r) if r.expires > n.now)));
+    n.events.clear();
+    let (query, actions) = n.nodes[6]
+        .1
+        .lookup(topic, &[contact(2)], at(n.now))
+        .unwrap();
+    n.pump(6, actions);
+    assert!(n.events.iter().any(|(i, e)| *i == 6 && matches!(e, Event::Providers { query: q, records } if *q == query && records.iter().any(|r| r.provider == identity(5).public() && r.expires > n.now))));
+}

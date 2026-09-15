@@ -122,6 +122,44 @@ impl Endpoint {
         policy: RoutingPolicy,
         config: Config,
     ) -> Result<Self, Error> {
+        Self::bind_in_overlay(
+            address,
+            identity,
+            server,
+            policy,
+            config,
+            driver::next::OverlayId::Global,
+        )
+        .await
+    }
+    pub async fn bind_in_overlay(
+        address: SocketAddr,
+        identity: Keypair,
+        server: bool,
+        policy: RoutingPolicy,
+        config: Config,
+        overlay: driver::next::OverlayId,
+    ) -> Result<Self, Error> {
+        Self::bind_filtered(
+            address,
+            identity,
+            server,
+            policy,
+            config,
+            overlay,
+            Arc::new(|_| true),
+        )
+        .await
+    }
+    pub async fn bind_filtered(
+        address: SocketAddr,
+        identity: Keypair,
+        server: bool,
+        policy: RoutingPolicy,
+        config: Config,
+        overlay: driver::next::OverlayId,
+        address_filter: driver::next::AddressFilter,
+    ) -> Result<Self, Error> {
         if config.deadline.is_zero()
             || config.deadline > Duration::from_secs(120)
             || config.punch.overall.is_zero()
@@ -129,9 +167,16 @@ impl Endpoint {
         {
             return Err(Error::InvalidConfig);
         }
-        let node = Node::bind_with_policy(address, identity.clone(), server, policy)
-            .await
-            .map_err(Error::Socket)?;
+        let node = Node::bind_filtered(
+            address,
+            identity.clone(),
+            server,
+            policy,
+            overlay,
+            address_filter,
+        )
+        .await
+        .map_err(Error::Socket)?;
         Ok(Self {
             inner: Arc::new(Inner {
                 node,
@@ -1009,16 +1054,15 @@ mod tests {
         };
         dead.shutdown().await.unwrap();
         let observation = client.dht().diagnostics().operation("connect.result");
-        let (outgoing, incoming) = tokio::join!(
+        let (outgoing, incoming) = tokio::try_join!(
             guarded(
                 client.dht(),
                 Duration::from_secs(15),
                 client.connect_records(server.public_key(), &records, &observation)
             ),
             listener.accept()
-        );
-        let outgoing = outgoing.unwrap();
-        let incoming = incoming.unwrap();
+        )
+        .unwrap();
         outgoing
             .send(b"alternate coordinator worked")
             .await

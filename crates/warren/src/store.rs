@@ -246,6 +246,49 @@ pub fn write_blob(data_dir: &Path, blob_hex: &str, blob_bytes: &[u8]) -> std::io
     Ok(())
 }
 
+/// Select and atomically persist the language community. A saved choice wins over
+/// device locale changes; corrupt saved state is an error unless explicitly replaced.
+pub fn load_or_select_community(
+    data_dir: &Path,
+    explicit: Option<&crate::community::Community>,
+    invite: Option<&crate::invite::RegionalInvite>,
+) -> std::io::Result<crate::community::Community> {
+    use std::io::{Read, Write};
+    let path = data_dir.join("community.json");
+    if explicit.is_none() && invite.is_none() {
+        match fs::File::open(&path) {
+            Ok(file) => {
+                let mut bytes = Vec::new();
+                file.take(513).read_to_end(&mut bytes)?;
+                return crate::community::Community::decode(&bytes);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let choice = crate::community::Community::detect(explicit, invite, None)?;
+    fs::create_dir_all(data_dir)?;
+    let nonce = crypto::Keypair::generate().public();
+    let temporary = data_dir.join(format!(
+        ".community-{}.tmp",
+        crate::util::to_hex(nonce.as_bytes())
+    ));
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&choice.encode())?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(choice)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,5 @@
 //! Versioned, bounded contact hints. Import never installs trusted routing state.
+use super::OverlayId;
 use dht_next::{Contact, NodeId, MAX_CANDIDATES};
 use std::collections::BTreeSet;
 use std::io;
@@ -10,12 +11,21 @@ const RECORD: usize = 51;
 #[derive(Clone, Debug)]
 pub struct BootstrapState {
     contacts: Vec<Contact>,
+    overlay: OverlayId,
 }
 impl BootstrapState {
     pub fn contacts(&self) -> &[Contact] {
         &self.contacts
     }
+    pub fn overlay(&self) -> OverlayId {
+        self.overlay
+    }
+    #[cfg(test)]
     pub(super) fn new(contacts: Vec<Contact>) -> Self {
+        Self::in_overlay(contacts, OverlayId::Global)
+    }
+    /// Build bounded, untrusted hints; restoration always revalidates reachability.
+    pub fn in_overlay(contacts: Vec<Contact>, overlay: OverlayId) -> Self {
         let mut ids = BTreeSet::new();
         let mut addresses = BTreeSet::new();
         let contacts = contacts
@@ -35,13 +45,19 @@ impl BootstrapState {
             })
             .take(MAX_CANDIDATES)
             .collect();
-        Self { contacts }
+        Self { contacts, overlay }
     }
     /// Caller chooses storage and atomic-write policy. No private keys, cookies,
     /// provider leases, monotonic timestamps or encryption state are serialized.
     pub fn encode(&self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(6 + self.contacts.len() * RECORD);
-        bytes.extend_from_slice(HEADER);
+        match self.overlay {
+            OverlayId::Global => bytes.extend_from_slice(HEADER),
+            OverlayId::Regional(id) => {
+                bytes.extend_from_slice(b"WBS2");
+                bytes.extend_from_slice(&id);
+            }
+        }
         bytes.extend_from_slice(&(self.contacts.len() as u16).to_be_bytes());
         for contact in &self.contacts {
             bytes.extend_from_slice(contact.id.as_bytes());
@@ -62,17 +78,27 @@ impl BootstrapState {
     }
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid bootstrap state");
-        if bytes.len() < 6 || &bytes[..4] != HEADER {
+        let (overlay, bytes) = if bytes.starts_with(b"WBS2") && bytes.len() >= 34 {
+            (
+                OverlayId::Regional(bytes[4..32].try_into().map_err(|_| invalid())?),
+                &bytes[32..],
+            )
+        } else if bytes.starts_with(HEADER) && bytes.len() >= 6 {
+            (OverlayId::Global, &bytes[4..])
+        } else {
+            return Err(invalid());
+        };
+        if bytes.len() < 2 {
             return Err(invalid());
         }
-        let count = u16::from_be_bytes(bytes[4..6].try_into().unwrap()) as usize;
-        if count > MAX_CANDIDATES || bytes.len() != 6 + count * RECORD {
+        let count = u16::from_be_bytes(bytes[..2].try_into().unwrap()) as usize;
+        if count > MAX_CANDIDATES || bytes.len() != 2 + count * RECORD {
             return Err(invalid());
         }
         let mut contacts = Vec::with_capacity(count);
         let mut ids = BTreeSet::new();
         let mut addresses = BTreeSet::new();
-        for record in bytes[6..].chunks_exact(RECORD) {
+        for record in bytes[2..].chunks_exact(RECORD) {
             let id = NodeId::from_bytes(record[..32].try_into().unwrap());
             let ip = match record[32] {
                 4 if record[37..49] == [0; 12] => IpAddr::V4(Ipv4Addr::from(
@@ -91,7 +117,7 @@ impl BootstrapState {
             }
             contacts.push(Contact::new(id, address));
         }
-        Ok(Self { contacts })
+        Ok(Self { contacts, overlay })
     }
 }
 
@@ -123,6 +149,28 @@ mod tests {
             state.contacts()
         );
     }
+    #[test]
+    fn regional_snapshot_roundtrip_and_strict_framing() {
+        let overlay = OverlayId::regional("ir");
+        let state = BootstrapState::in_overlay(
+            vec![Contact::new(
+                NodeId::from_bytes([7; 32]),
+                "192.0.2.1:9000".parse().unwrap(),
+            )],
+            overlay,
+        );
+        let bytes = state.encode();
+        let restored = BootstrapState::decode(&bytes).unwrap();
+        assert_eq!(restored.overlay(), overlay);
+        assert_eq!(restored.contacts(), state.contacts());
+        for end in 0..bytes.len() {
+            assert!(BootstrapState::decode(&bytes[..end]).is_err());
+        }
+        let mut trailing = bytes;
+        trailing.push(0);
+        assert!(BootstrapState::decode(&trailing).is_err());
+    }
+
     #[test]
     fn snapshot_roundtrip_and_strict_framing() {
         let state = BootstrapState::new(vec![

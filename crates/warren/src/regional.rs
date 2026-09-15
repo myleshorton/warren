@@ -21,6 +21,7 @@ struct Inner {
     community_node: Option<NextNode>,
     community: Option<crate::community::Community>,
     additional: Vec<NextNode>,
+    deferred_listen: bool,
     publication: Vec<mpsc::Sender<NodeId>>,
     tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
     incoming: Mutex<Option<IncomingQueues>>,
@@ -157,12 +158,15 @@ impl RegionalNode {
             community_node,
             community.map(|(selection, _)| selection),
             vec![],
+            false,
         )
     }
 
     /// Combine already-bound endpoints for one application session. Each overlay
     /// has one socket and routing table; all endpoints must use the same identity.
-    /// The cap permits a home language, three invited languages, and global discovery.
+    /// The primary must be regional. The cap permits a home language, three
+    /// invited languages, and global discovery. All listeners start independently;
+    /// `listen()` starts their workers without waiting for readiness.
     pub fn from_endpoints(primary: NextNode, additional: Vec<NextNode>) -> io::Result<Self> {
         if additional.len() > 4 {
             return Err(io::Error::new(
@@ -172,23 +176,42 @@ impl RegionalNode {
         }
         let mut scopes = std::collections::BTreeSet::new();
         for node in std::iter::once(&primary).chain(additional.iter()) {
-            if node.id() != primary.id() || !scopes.insert(node.endpoint().dht().overlay()) {
+            if node.id() != primary.id() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "duplicate overlay or mismatched identity",
+                    "mismatched endpoint identity",
+                ));
+            }
+            if !scopes.insert(node.endpoint().dht().overlay()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "duplicate discovery overlay",
                 ));
             }
         }
-        Self::assemble(primary, None, None, None, additional)
+        Self::assemble(primary, None, None, None, additional, true)
     }
 
     fn assemble(
         regional: NextNode,
-        global: Option<NextNode>,
+        mut global: Option<NextNode>,
         community_node: Option<NextNode>,
         community: Option<crate::community::Community>,
-        additional: Vec<NextNode>,
+        mut additional: Vec<NextNode>,
+        deferred_listen: bool,
     ) -> io::Result<Self> {
+        if regional.endpoint().dht().overlay() == OverlayId::Global {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "expected regional overlay",
+            ));
+        }
+        if let Some(index) = additional
+            .iter()
+            .position(|node| node.endpoint().dht().overlay() == OverlayId::Global)
+        {
+            global = Some(additional.remove(index));
+        }
         let mut tasks = vec![];
         let publication = community_node.iter().chain(global.iter()).chain(additional.iter()).map(|global| {
             let global = global.clone();
@@ -217,6 +240,7 @@ impl RegionalNode {
                 community_node,
                 community,
                 additional,
+                deferred_listen,
                 publication,
                 tasks: std::sync::Mutex::new(tasks),
                 incoming: Mutex::new(None),
@@ -246,6 +270,8 @@ impl RegionalNode {
             .chain(self.inner.global.iter())
             .chain(self.inner.additional.iter())
     }
+    /// Borrow each configured endpoint once, primary first. Endpoint storage is
+    /// private; callers may use the handles for scoped bootstrap and diagnostics.
     pub fn nodes(&self) -> impl Iterator<Item = &NextNode> {
         std::iter::once(self.regional()).chain(self.extras())
     }
@@ -262,6 +288,7 @@ impl RegionalNode {
     pub fn supports_overlay(&self, overlay: OverlayId) -> bool {
         self.node(overlay).is_ok()
     }
+    /// Borrow the endpoint for an explicitly configured discovery scope.
     pub fn node(&self, overlay: OverlayId) -> io::Result<&NextNode> {
         if let Some(node) = self
             .nodes()
@@ -290,9 +317,11 @@ impl RegionalNode {
             .map_err(io::Error::other)
     }
 
-    /// Start primary listening before returning. Secondary listening/recovery runs
-    /// independently, with separate accept tasks so cancellation cannot drop the
-    /// other overlay's in-progress handshake.
+    /// Start one independent accept worker per endpoint. For `bind` and
+    /// `bind_community`, first await primary readiness and return its failure.
+    /// For `from_endpoints`, return after starting workers, without a readiness
+    /// guarantee; each worker reports failures through its endpoint's diagnostics
+    /// and retries independently. Cancellation cannot drop another worker's handshake.
     /// Initialize before starting the single accept loop. A pending `incoming()`
     /// holds the queue lock, so concurrent `listen()` calls wait for that accept.
     pub async fn listen(&self) -> io::Result<()> {
@@ -300,7 +329,7 @@ impl RegionalNode {
         if incoming.is_some() {
             return Ok(());
         }
-        if self.inner.additional.is_empty() {
+        if !self.inner.deferred_listen {
             self.regional().listen().await?;
         }
         let mut queues = IncomingQueues {
@@ -320,6 +349,11 @@ impl RegionalNode {
                             }
                         }
                         Err(_) => {
+                            node.diagnostics().event(
+                                "network.accept.retry",
+                                "accept_failed",
+                                vec![],
+                            );
                             if sender.is_closed() {
                                 break;
                             }
@@ -403,17 +437,14 @@ impl RegionalNode {
         topic: NodeId,
     ) -> Vec<(OverlayId, Result<Vec<Member>, String>)> {
         let mut pending = tokio::task::JoinSet::new();
+        let mut scopes = std::collections::HashMap::new();
         for node in self.nodes() {
             let node = node.clone();
-            pending
-                .spawn(async move { (node.endpoint().dht().overlay(), node.lookup(topic).await) });
+            let overlay = node.endpoint().dht().overlay();
+            let task = pending.spawn(async move { node.lookup(topic).await });
+            scopes.insert(task.id(), overlay);
         }
-        let mut results = vec![];
-        while let Some(result) = pending.join_next().await {
-            if let Ok(result) = result {
-                results.push(result);
-            }
-        }
+        let mut results = collect_lookups(pending, scopes).await;
         results.sort_by_key(|(overlay, _)| *overlay);
         results
     }
@@ -435,6 +466,21 @@ impl RegionalNode {
         }
         error.map_or(Ok(()), Err)
     }
+}
+
+async fn collect_lookups(
+    mut pending: tokio::task::JoinSet<Result<Vec<Member>, String>>,
+    mut scopes: std::collections::HashMap<tokio::task::Id, OverlayId>,
+) -> Vec<(OverlayId, Result<Vec<Member>, String>)> {
+    let mut results = vec![];
+    while let Some(result) = pending.join_next_with_id().await {
+        let (id, result) = match result {
+            Ok((id, result)) => (id, result),
+            Err(error) => (error.id(), Err(error.to_string())),
+        };
+        results.push((scopes.remove(&id).expect("configured lookup task"), result));
+    }
+    results
 }
 
 /// First useful result wins; an empty lookup or error cannot mask the other
@@ -575,6 +621,32 @@ impl Network for RegionalNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn lookup_task_failures_keep_their_overlay_rows() {
+        let mut pending = tokio::task::JoinSet::new();
+        let mut scopes = std::collections::HashMap::new();
+        let panic_scope = OverlayId::regional("panic");
+        let cancelled_scope = OverlayId::regional("cancelled");
+        let panic = pending.spawn(async {
+            panic!("lookup failed");
+        });
+        scopes.insert(panic.id(), panic_scope);
+        let cancelled = pending.spawn(std::future::pending());
+        scopes.insert(cancelled.id(), cancelled_scope);
+        cancelled.abort();
+        let success = pending.spawn(async { Ok(vec![]) });
+        scopes.insert(success.id(), OverlayId::Global);
+        let rows = collect_lookups(pending, scopes).await;
+        assert_eq!(rows.len(), 3);
+        assert!(rows.iter().any(|(scope, result)| *scope == panic_scope
+            && result.as_ref().unwrap_err().contains("panicked")));
+        assert!(rows.iter().any(|(scope, result)| *scope == cancelled_scope
+            && result.as_ref().unwrap_err().contains("cancelled")));
+        assert!(rows
+            .iter()
+            .any(|(scope, result)| *scope == OverlayId::Global && result.is_ok()));
+    }
+
     #[tokio::test]
     async fn stalled_or_failed_overlay_does_not_delay_the_other() {
         let local = first_success(async { Ok(7) }, std::future::pending());

@@ -239,8 +239,8 @@ this is not a persistent blacklist of routing participation.
 
 Regional invitations use a separate versioned JSON schema encoded as hex, with
 channel/content keys, an overlay-tagged bootstrap snapshot, and expiry (maximum
-24 hours). Version 2 adds a canonical community language and an optional separately
-tagged community snapshot; each snapshot is bounded to eight peers and respects
+24 hours). Version 2 adds an optional canonical community language and an optional separately
+tagged community snapshot (at least one is required); each snapshot is bounded to eight peers and respects
 export exclusions. Global contacts are never included. A recipient selects the
 community from the invitation before binding, and joins compatible overlay hints
 concurrently. A reachable local introduction does not wait on overseas hints.
@@ -300,3 +300,43 @@ possible partition topology. Deployment reachability still needs field measureme
 
 Run `cargo test -p warren --test community`, `cargo test -p warren --test regional`, and
 `cargo test -p dht-next --test network independent_regional_overlay`.
+
+
+## Passive observation and application defaults
+
+The `WRO1` envelope and overlay ID are sent in cleartext. A passive observer can
+precompute the standardized language IDs and identify a language community from
+packets, then link traffic using that ID. Hashing a language label does not hide
+it. This exposure is especially relevant on domestic links during a shutdown.
+An opaque deployment label also remains a stable fingerprint; it is not transport
+obfuscation or a secret membership credential.
+
+`Community::detect` is an explicit application API, not a process-wide networking
+default. When an application invokes it without an override, it derives the
+community from locale. Applications should explain this wire exposure before
+enabling that behavior and provide an explicit community or invitation override.
+Locale selection remains available as requested; it does not itself open sockets.
+
+Version-2 invitations can also carry a shared opaque community snapshot without
+language metadata. Recipients select that shared overlay, preserving the ability
+to join outside the inviter's local connectivity domain. Version 1 remains the
+single opaque-overlay format.
+
+Invitation joining installs accepted hints for all compatible overlays, then
+returns on the first successful bootstrap. Pending sibling revalidation is
+cancelled: per-overlay bootstrap is best effort so an unavailable external network
+does not delay a local join. An application requiring every overlay to finish can
+call `restore_bootstrap` separately. If policy excludes every compatible invite
+peer, joining fails immediately with the rejected-peer count.
+
+Driver health events include cumulative outbound-policy, inbound-policy, and
+inbound-overlay rejection counters. `dht.packet.rejected` events report the reason
+and count at powers of two to bound event volume; neither addresses nor community
+IDs are logged. `inbound_datagrams` continues to count all received datagrams.
+Bind addresses are not required to lie in peer CIDRs: wildcard binds and private
+interfaces behind NAT need not match the public network policy.
+
+Use one `incoming()` accept loop per `RegionalNode`, and initialize `listen()`
+before starting it. Pending accepts hold the queue mutex; concurrent accepts and
+`listen()` calls serialize behind it. Cancelling an accept releases the lock
+without consuming a connection.

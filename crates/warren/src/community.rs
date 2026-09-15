@@ -74,12 +74,16 @@ impl Community {
             return Self::from_locale(language)
                 .ok_or_else(|| invalid("invalid invitation language"));
         }
-        if invite.bootstrap.overlay() == OverlayId::Global {
+        let bootstrap = invite
+            .community_bootstrap
+            .as_ref()
+            .unwrap_or(&invite.bootstrap);
+        if bootstrap.overlay() == OverlayId::Global {
             return Err(invalid("global invitation"));
         }
         Ok(Self {
             language: None,
-            overlay: invite.bootstrap.overlay(),
+            overlay: bootstrap.overlay(),
         })
     }
 
@@ -110,6 +114,9 @@ impl Community {
             })
     }
 
+    /// Select from native locale when no override exists. Language overlay IDs are
+    /// visible on the wire and enumerable by passive observers; applications should
+    /// explain this exposure before enabling locale-derived networking.
     pub fn detect(
         explicit: Option<&Self>,
         invite: Option<&RegionalInvite>,

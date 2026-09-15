@@ -658,6 +658,8 @@ async fn run(
     let mut health = tokio::time::interval(Duration::from_secs(30));
     health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let (mut outbound, mut send_errors, mut receive_errors) = (0u64, 0u64, 0u64);
+    let (mut outbound_rejected, mut inbound_policy_rejected, mut inbound_overlay_rejected) =
+        (0u64, 0u64, 0u64);
     let mut translation = mappings.borrow().clone();
     let mut pending: Option<PendingRebind> = None;
     #[cfg(test)]
@@ -672,6 +674,7 @@ async fn run(
             match action {
                 Action::Send { to, bytes } => {
                     if !address_filter(to) {
+                        record_rejection(&diagnostics, "outbound_policy", &mut outbound_rejected);
                         continue;
                     }
                     let destination = translation.destination(to);
@@ -785,9 +788,17 @@ async fn run(
                 Ok((len, from)) => {
                     inbound.fetch_add(1, Ordering::Relaxed);
                     let from = translation.source(from);
-                    match overlay.payload(&buffer[..len]).filter(|_| address_filter(from)) {
-                        Some(bytes) => core.receive(from, bytes, time(start)),
-                        None => vec![],
+                    if !address_filter(from) {
+                        record_rejection(&diagnostics, "inbound_policy", &mut inbound_policy_rejected);
+                        vec![]
+                    } else {
+                        match overlay.payload(&buffer[..len]) {
+                            Some(bytes) => core.receive(from, bytes, time(start)),
+                            None => {
+                                record_rejection(&diagnostics, "inbound_overlay", &mut inbound_overlay_rejected);
+                                vec![]
+                            }
+                        }
                     }
                 },
                 Err(error) => {
@@ -806,6 +817,9 @@ async fn run(
                     ("routing_contacts", DiagnosticValue::Count(core.routing_len() as u64)),
                     ("inbound_datagrams", DiagnosticValue::Count(inbound.load(Ordering::Relaxed))),
                     ("outbound_datagrams", DiagnosticValue::Count(outbound)),
+                    ("outbound_policy_rejected", DiagnosticValue::Count(outbound_rejected)),
+                    ("inbound_policy_rejected", DiagnosticValue::Count(inbound_policy_rejected)),
+                    ("inbound_overlay_rejected", DiagnosticValue::Count(inbound_overlay_rejected)),
                     ("send_errors", DiagnosticValue::Count(send_errors)),
                     ("receive_errors", DiagnosticValue::Count(receive_errors)),
                     ("generation", DiagnosticValue::Count(network.borrow().generation)),
@@ -820,6 +834,17 @@ async fn run(
     let _ = events.send(Notice::Stopped);
     if let Some(reply) = stopped {
         let _ = reply.send(());
+    }
+}
+
+fn record_rejection(observer: &Observer, reason: &'static str, count: &mut u64) {
+    *count = count.saturating_add(1);
+    if count.is_power_of_two() {
+        observer.event(
+            "dht.packet.rejected",
+            reason,
+            vec![("count", DiagnosticValue::Count(*count))],
+        );
     }
 }
 
@@ -869,6 +894,56 @@ fn transient_receive_error(kind: io::ErrorKind) -> bool {
 #[cfg(test)]
 mod review_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn packet_rejections_are_distinct_and_sampled() {
+        let node = Node::bind_filtered(
+            "127.0.0.1:0".parse().unwrap(),
+            Keypair::generate(),
+            true,
+            RoutingPolicy::Unrestricted,
+            OverlayId::regional("test"),
+            Arc::new(|address| address.ip().is_loopback()),
+        )
+        .await
+        .unwrap();
+        let mut events = node.diagnostics().subscribe().unwrap();
+        let outside = Contact::new(
+            NodeId::from_bytes([199; 32]),
+            "192.0.2.1:1234".parse().unwrap(),
+        );
+        node.probe(outside).await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        for _ in 0..5 {
+            sender
+                .send_to(b"wrong overlay", node.local_addr())
+                .await
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut outbound = false;
+            let mut counts = Vec::new();
+            while !outbound || counts.len() < 3 {
+                let event = events.recv().await.unwrap();
+                if event.name != "dht.packet.rejected" {
+                    continue;
+                }
+                match event.error_code {
+                    "outbound_policy" => outbound = true,
+                    "inbound_overlay" => {
+                        if let Some((_, DiagnosticValue::Count(count))) = event.fields.first() {
+                            counts.push(*count);
+                        }
+                    }
+                    other => panic!("unexpected rejection {other}"),
+                }
+            }
+            assert_eq!(counts, vec![1, 2, 4]);
+        })
+        .await
+        .unwrap();
+        node.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn delayed_discovery_keeps_actor_live_and_cannot_replace_newer_network() {

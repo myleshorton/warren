@@ -35,6 +35,8 @@ impl Drop for Inner {
 /// Endpoints use the same identity but independent sockets, routing tables,
 /// coordinator leases, caches, and request budgets. Region membership is configured,
 /// not inferred from IP geolocation and not an authorization boundary.
+/// Initialize `listen()` before starting a single `Network::incoming` accept loop;
+/// concurrent accepts and listen calls serialize behind a pending accept.
 #[derive(Clone)]
 pub struct RegionalNode {
     inner: Arc<Inner>,
@@ -124,19 +126,30 @@ impl RegionalNode {
             server,
             region,
             address_filter.unwrap_or_else(|| Arc::new(|_| true)),
-        )
-        .await?;
-        let community_node = match &community {
-            Some((selection, Some(address))) => Some(
-                NextNode::bind_in_overlay(*address, identity.clone(), server, selection.overlay())
-                    .await?,
-            ),
-            _ => None,
+        );
+        let community_node = async {
+            match &community {
+                Some((selection, Some(address))) => NextNode::bind_in_overlay(
+                    *address,
+                    identity.clone(),
+                    server,
+                    selection.overlay(),
+                )
+                .await
+                .map(Some),
+                _ => Ok(None),
+            }
         };
-        let global = match global_address {
-            Some(address) => Some(NextNode::bind_with_role(address, identity, server).await?),
-            None => None,
+        let global = async {
+            match global_address {
+                Some(address) => NextNode::bind_with_role(address, identity.clone(), server)
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            }
         };
+        let (regional, community_node, global) =
+            tokio::try_join!(regional, community_node, global)?;
         let mut tasks = vec![];
         let publication = community_node.iter().chain(global.iter()).map(|global| {
             let global = global.clone();
@@ -239,6 +252,8 @@ impl RegionalNode {
     /// Start primary listening before returning. Secondary listening/recovery runs
     /// independently, with separate accept tasks so cancellation cannot drop the
     /// other overlay's in-progress handshake.
+    /// Initialize before starting the single accept loop. A pending `incoming()`
+    /// holds the queue lock, so concurrent `listen()` calls wait for that accept.
     pub async fn listen(&self) -> io::Result<()> {
         let mut incoming = self.inner.incoming.lock().await;
         if incoming.is_some() {
@@ -490,6 +505,8 @@ impl Network for RegionalNode {
         )
         .await
     }
+    /// Use one accept loop per node. Concurrent accepts are serialized; cancellation
+    /// releases the queue lock without consuming a connection.
     async fn incoming(&self) -> Result<Incoming, String> {
         self.listen().await.map_err(|e| e.to_string())?;
         let mut incoming = self.inner.incoming.lock().await;

@@ -248,7 +248,7 @@ impl RegionalInvite {
                 .as_ref()
                 .map(|state| to_hex(&state.encode())),
             community_language: self.community_language.clone(),
-            version: if self.community_language.is_some() {
+            version: if self.community_language.is_some() || self.community_bootstrap.is_some() {
                 2
             } else {
                 1
@@ -269,13 +269,15 @@ impl RegionalInvite {
             return None;
         }
         let wire: RegionalWire = serde_json::from_slice(&from_hex(body)?).ok()?;
-        if !matches!(
-            (wire.version, wire.community_language.is_some()),
-            (1, false) | (2, true)
-        ) || wire
-            .community_language
-            .as_ref()
-            .is_some_and(|language| crate::community::Community::from_locale(language).is_none())
+        let valid_version = match wire.version {
+            1 => wire.community_language.is_none() && wire.community_bootstrap.is_none(),
+            2 => wire.community_language.is_some() || wire.community_bootstrap.is_some(),
+            _ => false,
+        };
+        if !valid_version
+            || wire.community_language.as_ref().is_some_and(|language| {
+                crate::community::Community::from_locale(language).is_none()
+            })
             || wire.channel.is_empty()
             || wire.channel.len().saturating_add(wire.content.len()) > 1024
             || wire.expires <= now
@@ -292,10 +294,13 @@ impl RegionalInvite {
         }
         let community_bootstrap = match wire.community_bootstrap {
             Some(encoded) => {
-                let community =
-                    crate::community::Community::from_locale(wire.community_language.as_ref()?)?;
+                let community = wire
+                    .community_language
+                    .as_deref()
+                    .and_then(crate::community::Community::from_locale);
                 let state = driver::next::BootstrapState::decode(&from_hex(&encoded)?).ok()?;
-                if state.overlay() != community.overlay()
+                if state.overlay() == driver::next::OverlayId::Global
+                    || community.is_some_and(|community| state.overlay() != community.overlay())
                     || state.contacts().is_empty()
                     || state.contacts().len() > 8
                 {
@@ -314,6 +319,9 @@ impl RegionalInvite {
             expires: wire.expires,
         })
     }
+    /// Join through the first reachable compatible overlay. All accepted hints are
+    /// installed first; success cancels sibling revalidation lookups so an offline
+    /// external overlay cannot delay local joining. Sibling bootstrap is best effort.
     pub async fn join(&self, node: &crate::regional::RegionalNode) -> std::io::Result<()> {
         if self.expires <= crate::util::now_secs() {
             return Err(std::io::Error::new(
@@ -331,16 +339,33 @@ impl RegionalInvite {
             }
         }
         let mut pending = tokio::task::JoinSet::new();
+        let mut rejected = 0;
+        let mut considered = 0;
         for state in std::iter::once(&self.bootstrap).chain(self.community_bootstrap.iter()) {
             if !node.supports_overlay(state.overlay()) {
                 continue;
             }
+            let mut accepted = Vec::new();
             for peer in state.contacts() {
-                let _ = node.add_contact(state.overlay(), *peer).await;
+                considered += 1;
+                match node.add_contact(state.overlay(), *peer).await {
+                    Ok(()) => accepted.push(*peer),
+                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => rejected += 1,
+                    Err(error) => return Err(error),
+                }
             }
-            let state = state.clone();
+            if accepted.is_empty() {
+                continue;
+            }
+            let state = driver::next::BootstrapState::in_overlay(accepted, state.overlay());
             let node = node.clone();
             pending.spawn(async move { node.restore_bootstrap(&state).await });
+        }
+        if pending.is_empty() && rejected > 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{rejected} of {considered} invite peers outside the configured domain"),
+            ));
         }
         let mut error = std::io::Error::new(
             std::io::ErrorKind::NotConnected,

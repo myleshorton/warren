@@ -294,6 +294,13 @@ async fn local_namespace_rejects_outside_peers_even_with_a_matching_overlay() {
             .add_contact(node.overlay(), outsider.contact())
             .await
             .is_err());
+        let mut diagnostics = node
+            .regional()
+            .endpoint()
+            .dht()
+            .diagnostics()
+            .subscribe()
+            .unwrap();
         outsider
             .endpoint()
             .dht()
@@ -302,6 +309,17 @@ async fn local_namespace_rejects_outside_peers_even_with_a_matching_overlay() {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(node.regional().inbound_datagrams() > 0);
+        let rejected = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let event = diagnostics.recv().await.unwrap();
+                if event.name == "dht.packet.rejected" {
+                    break event;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(rejected.error_code, "inbound_policy");
         assert!(node
             .bootstrap_state(node.overlay())
             .await
@@ -319,4 +337,132 @@ async fn local_namespace_rejects_outside_peers_even_with_a_matching_overlay() {
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn opaque_community_invites_roundtrip_and_join_the_shared_overlay() {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let shared_overlay = OverlayId::regional("opaque-community");
+        let shared = router("127.0.0.1", 171, shared_overlay).await;
+        let legacy = RegionalInvite {
+            community_language: None,
+            community_bootstrap: None,
+            bootstrap: driver::next::BootstrapState::in_overlay(
+                vec![shared.contact()],
+                shared_overlay,
+            ),
+            channel_key: "channel".into(),
+            content_key: "key".into(),
+            expires: warren::util::now_secs() + 600,
+        };
+        let choice = Community::from_invite(&legacy, warren::util::now_secs()).unwrap();
+        let domain = ConnectivityDomain::new("local", &["127.0.0.1/32"]).unwrap();
+        let local = router(
+            "127.0.0.1",
+            172,
+            choice.local_overlay(domain.label()).unwrap(),
+        )
+        .await;
+        let author = RegionalNode::bind_community(
+            addr("127.0.0.1"),
+            Some(addr("127.0.0.1")),
+            None,
+            Keypair::from_seed(&[173; 32]),
+            false,
+            &choice,
+            Some(&domain),
+        )
+        .await
+        .unwrap();
+        for peer in [&local, &shared] {
+            let overlay = peer.endpoint().dht().overlay();
+            author
+                .restore_bootstrap(&driver::next::BootstrapState::in_overlay(
+                    vec![peer.contact()],
+                    overlay,
+                ))
+                .await
+                .unwrap();
+        }
+        let invite = RegionalInvite::create(
+            &author,
+            "channel".into(),
+            "key".into(),
+            &[],
+            Duration::from_secs(600),
+        )
+        .await
+        .unwrap();
+        assert!(invite.community_language.is_none());
+        assert!(invite.community_bootstrap.is_some());
+        let decoded = RegionalInvite::decode(
+            "warren://",
+            &invite.encode("warren://"),
+            warren::util::now_secs(),
+        )
+        .unwrap();
+        assert_eq!(
+            Community::from_invite(&decoded, warren::util::now_secs()).unwrap(),
+            choice
+        );
+        let newcomer = RegionalNode::bind_community(
+            addr("127.0.0.1"),
+            None,
+            None,
+            Keypair::from_seed(&[174; 32]),
+            false,
+            &choice,
+            None,
+        )
+        .await
+        .unwrap();
+        decoded.join(&newcomer).await.unwrap();
+        for node in [&author, &newcomer] {
+            node.shutdown().await.unwrap();
+        }
+        local.shutdown().await.unwrap();
+        shared.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn invitation_with_only_policy_rejections_fails_immediately() {
+    let choice = Community::from_locale("fa").unwrap();
+    let domain = ConnectivityDomain::new("local", &["127.0.0.1/32"]).unwrap();
+    let node = RegionalNode::bind_community(
+        addr("127.0.0.1"),
+        Some(addr("127.0.0.1")),
+        None,
+        Keypair::from_seed(&[175; 32]),
+        false,
+        &choice,
+        Some(&domain),
+    )
+    .await
+    .unwrap();
+    let invite = RegionalInvite {
+        community_language: Some("fa".into()),
+        community_bootstrap: None,
+        bootstrap: driver::next::BootstrapState::in_overlay(
+            vec![swarm::Contact::new(
+                swarm::NodeId::from_bytes([176; 32]),
+                "192.0.2.1:1234".parse().unwrap(),
+            )],
+            node.overlay(),
+        ),
+        channel_key: "channel".into(),
+        content_key: "key".into(),
+        expires: warren::util::now_secs() + 600,
+    };
+    let error = tokio::time::timeout(Duration::from_secs(1), invite.join(&node))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(error
+        .to_string()
+        .contains("1 of 1 invite peers outside the configured domain"));
+    node.shutdown().await.unwrap();
 }

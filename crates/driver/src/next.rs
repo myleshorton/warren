@@ -895,8 +895,29 @@ fn transient_receive_error(kind: io::ErrorKind) -> bool {
 mod review_tests {
     use super::*;
 
+    #[test]
+    fn rejection_sampling_preserves_counts_without_udp() {
+        let observer = Observer::new();
+        let mut events = observer.subscribe().unwrap();
+        let mut total = 0;
+        for _ in 0..1000 {
+            record_rejection(&observer, "inbound_overlay", &mut total);
+        }
+        assert_eq!(total, 1000);
+        let mut sampled = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            assert_eq!(event.name, "dht.packet.rejected");
+            assert_eq!(event.error_code, "inbound_overlay");
+            let (_, DiagnosticValue::Count(count)) = event.fields[0] else {
+                panic!("missing rejection count");
+            };
+            sampled.push(count);
+        }
+        assert_eq!(sampled, vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512]);
+    }
+
     #[tokio::test]
-    async fn packet_rejections_are_distinct_and_sampled() {
+    async fn packet_rejection_reasons_reach_diagnostics() {
         let node = Node::bind_filtered(
             "127.0.0.1:0".parse().unwrap(),
             Keypair::generate(),
@@ -914,34 +935,30 @@ mod review_tests {
         );
         node.probe(outside).await.unwrap();
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        for _ in 0..5 {
-            sender
-                .send_to(b"wrong overlay", node.local_addr())
-                .await
-                .unwrap();
-        }
-        tokio::time::timeout(Duration::from_secs(2), async {
-            let mut outbound = false;
-            let mut counts = Vec::new();
-            while !outbound || counts.len() < 3 {
-                let event = events.recv().await.unwrap();
-                if event.name != "dht.packet.rejected" {
-                    continue;
-                }
-                match event.error_code {
-                    "outbound_policy" => outbound = true,
-                    "inbound_overlay" => {
-                        if let Some((_, DiagnosticValue::Count(count))) = event.fields.first() {
-                            counts.push(*count);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut retry = tokio::time::interval(Duration::from_millis(50));
+            let (mut outbound, mut inbound) = (false, false);
+            while !outbound || !inbound {
+                tokio::select! {
+                    _ = retry.tick(), if !inbound => {
+                        sender.send_to(b"wrong overlay", node.local_addr()).await.unwrap();
+                    }
+                    event = events.recv() => {
+                        let event = event.unwrap();
+                        if event.name != "dht.packet.rejected" { continue; }
+                        match event.error_code {
+                            "outbound_policy" => outbound = true,
+                            "inbound_overlay" => inbound = true,
+                            other => panic!("unexpected rejection {other}"),
                         }
                     }
-                    other => panic!("unexpected rejection {other}"),
                 }
             }
-            assert_eq!(counts, vec![1, 2, 4]);
         })
         .await
-        .unwrap();
+        .expect(
+            "missing outbound-policy or inbound-overlay rejection diagnostics after UDP retries",
+        );
         node.shutdown().await.unwrap();
     }
 

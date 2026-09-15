@@ -350,7 +350,13 @@ impl RegionalInvite {
                 considered += 1;
                 match node.add_contact(state.overlay(), *peer).await {
                     Ok(()) => accepted.push(*peer),
-                    Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => rejected += 1,
+                    Err(error)
+                        if error.get_ref().is_some_and(|cause| {
+                            cause.is::<crate::network::AddressPolicyRejected>()
+                        }) =>
+                    {
+                        rejected += 1
+                    }
                     Err(error) => return Err(error),
                 }
             }

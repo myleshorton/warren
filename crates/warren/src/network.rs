@@ -14,6 +14,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use swarm::{Contact, NodeId};
 use transfer::{Link, NoiseLink};
 
+#[derive(Debug)]
+pub(crate) struct AddressPolicyRejected;
+
+impl std::fmt::Display for AddressPolicyRejected {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("peer is outside this overlay's address policy")
+    }
+}
+
+impl std::error::Error for AddressPolicyRejected {}
+
 #[derive(Clone, Debug)]
 pub struct Member {
     pub id: NodeId,
@@ -238,7 +249,7 @@ impl NextNode {
         if !self.endpoint().dht().allows_address(peer.addr) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "peer is outside this overlay's address policy",
+                AddressPolicyRejected,
             ));
         }
         let mut seeds = self.inner.seeds.lock().expect("seeds");

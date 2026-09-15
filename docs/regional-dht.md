@@ -320,7 +320,12 @@ Locale selection remains available as requested; it does not itself open sockets
 Version-2 invitations can also carry a shared opaque community snapshot without
 language metadata. Recipients select that shared overlay, preserving the ability
 to join outside the inviter's local connectivity domain. Version 1 remains the
-single opaque-overlay format.
+single opaque-overlay format. In both versions, the invitation author controls the
+opaque community ID: without a language label there is no independent value to
+cross-check. An attacker who supplies or modifies an invitation can choose this
+ID. Decode validates structure, not the inviter's authority; `join()` still only
+uses overlays configured on the recipient. Obtain invitations through a trusted
+channel or explicitly select the intended community before binding.
 
 Invitation joining installs accepted hints for all compatible overlays, then
 returns on the first successful bootstrap. Pending sibling revalidation is

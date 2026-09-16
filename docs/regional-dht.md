@@ -244,10 +244,11 @@ languages remain in the invitation with empty peer lists; these still require
 reachable peers from a cache or another introduction to bootstrap.
 
 Use `invite::InvitePayload` for multi-community channel invitations. Its bounded
-hex JSON format preserves legacy `k`, `c`, and `b` fields and adds `communities`.
-Each group carries a canonical language and its own peer hints. Missing `c`
-retains the legacy single-key meaning; an explicitly empty `c` means a blind
-mirror. This format has no expiry and is separate from `RegionalInvite` below.
+hex JSON format carries `channel_key`, `content_key`, `bootstrap` and `communities`.
+Each group carries a canonical language and its own peer hints. A missing
+`content_key` means the content key is the channel key; an explicitly empty one
+means a blind mirror. This format has no expiry and is separate from
+`RegionalInvite` below.
 
 Applications can flatten `InvitePayload` into their own serde envelope, use
 `encode_payload`/`decode_payload`, and validate both the shared payload and their
@@ -260,10 +261,10 @@ envelope exceeds 16,384 hex characters, including application metadata. The
 low-level envelope codec does not validate application data. Envelopes are capped
 at 16 KiB of hex; the regional snapshot format keeps a separate 24 KiB cap because
 it carries bulkier bootstrap state. Peer hints use one shape wherever they appear,
-`n`/`a`, in both `b` and each community group. An absent `c` carries the legacy
-single-key meaning, so it is omitted rather than written as null, and a named
-community with no reachable peers omits `peers` while keeping its membership
-metadata.
+`node_id`/`addr`, in both `bootstrap` and each community group. Fields whose
+absence already carries meaning are omitted rather than written out: no
+`content_key` when it equals the channel key, and no `peers` on a named community
+with no reachable peers, which still keeps its membership metadata.
 
 On receipt, preserve the saved home language, add the invited languages within
 the four-community limit, bind their distinct endpoints, and install each group's

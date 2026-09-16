@@ -163,7 +163,7 @@ const MAX_REGIONAL_INVITE_HEX: usize = 24 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommunityPeers {
     pub language: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "compact_peers")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub peers: Vec<Peer>,
 }
 
@@ -207,11 +207,10 @@ pub fn validate_communities(groups: &[CommunityPeers]) -> std::io::Result<()> {
 /// Hex encoding does not encrypt the keys or peer addresses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvitePayload {
-    #[serde(rename = "k")]
     pub channel_key: String,
-    #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_key: Option<String>,
-    #[serde(rename = "b", default, with = "compact_peers")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bootstrap: Vec<Peer>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub communities: Vec<CommunityPeers>,
@@ -273,34 +272,6 @@ pub fn decode_payload<T: serde::de::DeserializeOwned>(prefix: &str, text: &str) 
         return None;
     }
     serde_json::from_slice(&from_hex(body)?).ok()
-}
-
-mod compact_peers {
-    use super::*;
-    pub fn serialize<S: serde::Serializer>(
-        peers: &[Peer],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
-        peers
-            .iter()
-            .map(|p| WirePeer {
-                n: p.node_id.clone(),
-                a: p.addr.clone(),
-            })
-            .collect::<Vec<_>>()
-            .serialize(serializer)
-    }
-    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Vec<Peer>, D::Error> {
-        Ok(Vec::<WirePeer>::deserialize(deserializer)?
-            .into_iter()
-            .map(|p| Peer {
-                node_id: p.n,
-                addr: p.a,
-            })
-            .collect())
-    }
 }
 
 /// A regional invitation is a separate versioned format. It is not encrypted or
@@ -582,21 +553,26 @@ mod community_payload_tests {
     }
 
     #[test]
-    fn legacy_payloads_and_application_metadata_remain_compatible() {
+    fn application_metadata_flattens_around_the_shared_payload() {
         #[derive(Serialize, Deserialize)]
         struct ApplicationInvite {
             #[serde(flatten)]
             payload: InvitePayload,
-            f: String,
+            founder: String,
         }
-        let old = format!("app://{}", to_hex(br#"{"k":"legacy","f":"founder"}"#));
-        let envelope: ApplicationInvite = decode_payload("app://", &old).unwrap();
+        // Only `channel_key` is required; everything else defaults, so an envelope
+        // carrying just its own metadata still parses.
+        let minimal = format!(
+            "app://{}",
+            to_hex(br#"{"channel_key":"chan","founder":"founder-key"}"#)
+        );
+        let envelope: ApplicationInvite = decode_payload("app://", &minimal).unwrap();
         envelope.payload.validate().unwrap();
-        assert_eq!(envelope.payload.content_key(), "legacy");
+        assert_eq!(envelope.payload.content_key(), "chan");
         assert!(envelope.payload.communities.is_empty());
         let encoded = encode_payload("app://", &envelope).unwrap();
         let decoded: ApplicationInvite = decode_payload("app://", &encoded).unwrap();
-        assert_eq!(decoded.f, "founder");
+        assert_eq!(decoded.founder, "founder-key");
         let oversized = format!("app://{}", "0".repeat(MAX_INVITE_HEX + 1));
         assert!(decode_payload::<InvitePayload>("app://", &oversized).is_none());
     }
@@ -664,16 +640,145 @@ mod community_payload_tests {
         assert!(payload.validate().is_err());
     }
 
+    /// Whatever an encoder accepts, the matching decoder must accept back.
+    ///
+    /// Three separate defects in this module had that exact shape: a version-1
+    /// regional invite that carried `community_bootstrap` (the version field and
+    /// the optional field disagreed), an invitation built on a global overlay
+    /// (which `decode` rejects unconditionally), and an envelope encoder with no
+    /// size bound against a decoder that had one. Each produced a string that
+    /// encoded cleanly and that no recipient could ever open, and each was caught
+    /// by reading rather than by a test. This sweeps those three dimensions --
+    /// optional-field presence, overlay kind, and size boundaries -- across both
+    /// formats so the next one fails here instead.
     #[test]
-    fn peer_hints_use_one_wire_shape_everywhere() {
-        // One `Peer` type, one encoding, wherever it appears. An absent `c` already
-        // means "content = channel key", and a named community with no reachable
-        // peers is still membership metadata.
+    fn whatever_encodes_must_decode() {
+        const NOW: u64 = 1_700_000_000;
+        let contact = || {
+            swarm::Contact::new(
+                swarm::NodeId::from_bytes([7; 32]),
+                "192.0.2.1:9000".parse().unwrap(),
+            )
+        };
+        let peer = || Peer {
+            node_id: "ab".repeat(32),
+            addr: "127.0.0.1:1234".into(),
+        };
+
+        // --- InvitePayload: encode() validates, so Ok(..) must always decode.
+        let languages = ["fa", "en", "ru", "de"];
+        for content_key in [None, Some(String::new()), Some("content".to_owned())] {
+            for bootstrap in [0usize, 1, 8] {
+                for groups in [0usize, 1, MAX_COMMUNITIES] {
+                    for peers in [0usize, 1, 8] {
+                        for channel_len in [1usize, MAX_INVITE_KEY_BYTES / 2] {
+                            let payload = InvitePayload {
+                                channel_key: "k".repeat(channel_len),
+                                content_key: content_key.clone(),
+                                bootstrap: vec![peer(); bootstrap],
+                                communities: languages[..groups]
+                                    .iter()
+                                    .map(|language| CommunityPeers {
+                                        language: (*language).to_owned(),
+                                        peers: vec![peer(); peers],
+                                    })
+                                    .collect(),
+                            };
+                            let label = format!(
+                                "content={content_key:?} bootstrap={bootstrap} groups={groups} peers={peers} channel={channel_len}"
+                            );
+                            let Ok(encoded) = payload.encode("app://") else {
+                                continue; // Refused up front is fine; silently unopenable is not.
+                            };
+                            let decoded = InvitePayload::decode("app://", &encoded)
+                                .unwrap_or_else(|| panic!("encoded but did not decode: {label}"));
+                            assert_eq!(decoded.channel_key, payload.channel_key, "{label}");
+                            assert_eq!(decoded.content_key(), payload.content_key(), "{label}");
+                            assert_eq!(decoded.bootstrap, payload.bootstrap, "{label}");
+                            assert_eq!(decoded.communities, payload.communities, "{label}");
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- RegionalInvite: encode() is infallible, so the invariant is over the
+        // constraints create() enforces. A global overlay is not among them.
+        let local = driver::next::OverlayId::regional("local-domain");
+        let farsi = crate::community::Community::from_locale("fa").unwrap();
+        for language in [None, Some("fa".to_owned())] {
+            for carries_community in [false, true] {
+                for keys in [(1usize, 0usize), (MAX_INVITE_KEY_BYTES - 1, 1)] {
+                    let community_overlay = match &language {
+                        Some(_) => farsi.overlay(),
+                        None => driver::next::OverlayId::regional("opaque-community"),
+                    };
+                    let invite = RegionalInvite {
+                        community_language: language.clone(),
+                        community_bootstrap: carries_community.then(|| {
+                            driver::next::BootstrapState::in_overlay(
+                                vec![contact()],
+                                community_overlay,
+                            )
+                        }),
+                        channel_key: "k".repeat(keys.0),
+                        content_key: "c".repeat(keys.1),
+                        bootstrap: driver::next::BootstrapState::in_overlay(vec![contact()], local),
+                        expires: NOW + 600,
+                    };
+                    let label = format!(
+                        "language={language:?} community={carries_community} keys={keys:?}"
+                    );
+                    let encoded = invite.encode("warren://");
+                    let decoded = RegionalInvite::decode("warren://", &encoded, NOW)
+                        .unwrap_or_else(|| panic!("encoded but did not decode: {label}"));
+                    assert_eq!(
+                        decoded.community_language, invite.community_language,
+                        "{label}"
+                    );
+                    assert_eq!(decoded.channel_key, invite.channel_key, "{label}");
+                    assert_eq!(decoded.content_key, invite.content_key, "{label}");
+                    assert_eq!(
+                        decoded.community_bootstrap.is_some(),
+                        carries_community,
+                        "{label}"
+                    );
+                    assert_eq!(decoded.bootstrap.overlay(), local, "{label}");
+                }
+            }
+        }
+
+        // Unlike `InvitePayload::encode`, `RegionalInvite::encode` does not validate.
+        // The guard against a global overlay therefore lives in `create` and in
+        // `RegionalNode::assemble`, not in the format. Pinned so that the next person
+        // to touch either knows the encoder is not a backstop.
+        let global_backed = RegionalInvite {
+            community_language: None,
+            community_bootstrap: None,
+            channel_key: "channel".into(),
+            content_key: String::new(),
+            bootstrap: driver::next::BootstrapState::in_overlay(
+                vec![contact()],
+                driver::next::OverlayId::Global,
+            ),
+            expires: NOW + 600,
+        };
+        assert!(
+            RegionalInvite::decode("warren://", &global_backed.encode("warren://"), NOW).is_none(),
+            "a global bootstrap stays undecodable; the upstream guard is what prevents emitting one"
+        );
+    }
+
+    #[test]
+    fn wire_shape_is_readable_and_omits_defaulted_fields() {
+        // One `Peer` representation everywhere, and nothing is written just to say
+        // "absent": a missing content key already means "content = channel key",
+        // and a named community with no reachable peers is still membership metadata.
         let fixture = serde_json::json!({
-            "k": "channel",
-            "b": [{ "n": "ab".repeat(32), "a": "127.0.0.1:1234" }],
+            "channel_key": "channel",
+            "bootstrap": [{ "node_id": "ab".repeat(32), "addr": "127.0.0.1:1234" }],
             "communities": [
-                { "language": "fa", "peers": [{ "n": "cd".repeat(32), "a": "127.0.0.1:5678" }] },
+                { "language": "fa", "peers": [{ "node_id": "cd".repeat(32), "addr": "127.0.0.1:5678" }] },
                 { "language": "en" },
             ]
         });
@@ -685,7 +790,7 @@ mod community_payload_tests {
         assert_eq!(
             decode_payload::<serde_json::Value>("app://", &reencoded).unwrap(),
             fixture,
-            "re-encoding must reproduce the fixture exactly: one peer shape, no null `c`, no empty `peers`"
+            "re-encoding must reproduce the fixture exactly: one peer shape, no defaulted fields"
         );
     }
 }

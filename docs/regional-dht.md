@@ -220,6 +220,45 @@ endpoint with that overlay's own seeds. Router mapping and promotion to a routin
 server are deployment responsibilities; this change does not automatically map
 the DHT socket or infer inbound reachability from a successful router request.
 
+## Channels across language DHTs
+
+A channel does not create a DHT. English, Farsi, and global discovery are shared
+by many channels; channel-derived topics separate their discovery records, and
+channel keys/rosters control access. Members of one channel can participate in
+different sets of language DHTs.
+
+For sessions built with `RegionalNode::from_endpoints`, call
+`with_communities(Vec<Community>)` to associate language names with the bound
+scopes. Warren rejects duplicate languages, more than four languages, opaque
+communities, and names whose corresponding endpoint is absent. The association
+is explicit: a hashed overlay ID cannot be reversed to recover a language name.
+`bind_community` already records its language association.
+
+`invitation_communities(excluded, include_self)` exports up to eight verified
+contacts per named language, never mixing them with global or other language
+peers. Exclusions apply in every scope, including to the exporting node. Set
+`include_self` only for an explicitly reachable routing server. Unavailable
+languages remain in the invitation with empty peer lists; these still require
+reachable peers from a cache or another introduction to bootstrap.
+
+Use `invite::InvitePayload` for multi-community channel invitations. Its bounded
+hex JSON format preserves legacy `k`, `c`, and `b` fields and adds `communities`.
+Each group carries a canonical language and its own peer hints. Missing `c`
+retains the legacy single-key meaning; an explicitly empty `c` means a blind
+mirror. This format has no expiry and is separate from `RegionalInvite` below.
+
+Applications can flatten `InvitePayload` into their own serde envelope, use
+`encode_payload`/`decode_payload`, and validate both the shared payload and their
+application metadata. Murmur uses this to retain its founder key and display
+name without duplicating the discovery format. `decode_payload` bounds the hex
+body before allocation; `InvitePayload::decode` additionally validates the
+shared fields. The low-level envelope codec does not validate application data.
+
+On receipt, preserve the saved home language, add the invited languages within
+the four-community limit, bind their distinct endpoints, and install each group's
+hints only in its matching scope. Receiving an English invitation on a Farsi
+device therefore adds English discovery without replacing Farsi discovery.
+
 ## Restart caches and invitations
 
 Global `BootstrapState` keeps the existing `WBS1` encoding. Regional snapshots use

@@ -616,3 +616,54 @@ async fn composed_listener_starts_with_failed_primary_and_reports_retries() {
     }
     assert!(node.shutdown().await.is_err());
 }
+
+#[tokio::test]
+async fn endpoint_invites_name_each_language_without_mixing_peers() {
+    use warren::invite::InvitePayload;
+    let en = Community::from_locale("en").unwrap();
+    let fa = Community::from_locale("fa").unwrap();
+    let english = router("127.0.0.1", 91, en.overlay()).await;
+    let farsi = router("127.0.0.1", 91, fa.overlay()).await;
+    let global = router("127.0.0.1", 91, OverlayId::Global).await;
+    let node = RegionalNode::from_endpoints(english.clone(), vec![farsi.clone(), global]).unwrap();
+    assert!(node
+        .clone()
+        .with_communities(vec![Community::from_locale("ru").unwrap()])
+        .is_err());
+    assert!(node
+        .clone()
+        .with_communities(vec![en.clone(), en.clone()])
+        .is_err());
+    let node = node.with_communities(vec![en, fa]).unwrap();
+    let groups = node.invitation_communities(&[], true).await.unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].language, "en");
+    assert_eq!(groups[0].peers[0].addr, english.contact().addr.to_string());
+    assert_eq!(groups[1].language, "fa");
+    assert_eq!(groups[1].peers[0].addr, farsi.contact().addr.to_string());
+    let payload = InvitePayload {
+        channel_key: "channel-a".into(),
+        content_key: Some(String::new()),
+        bootstrap: vec![],
+        communities: groups.clone(),
+    };
+    let encoded = payload.encode("warren://").unwrap();
+    let decoded = InvitePayload::decode("warren://", &encoded).unwrap();
+    assert_eq!(decoded.communities, groups);
+    assert_eq!(decoded.content_key(), "");
+    // Another channel uses the same named discovery overlays.
+    let other = InvitePayload {
+        channel_key: "channel-b".into(),
+        ..decoded
+    };
+    assert_eq!(other.communities, payload.communities);
+    for include_self in [false, true] {
+        let excluded = node
+            .invitation_communities(&[node.id()], include_self)
+            .await
+            .unwrap();
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded.iter().all(|g| g.peers.is_empty()));
+    }
+    node.shutdown().await.unwrap();
+}

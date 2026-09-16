@@ -41,6 +41,7 @@ impl Drop for Inner {
 /// concurrent accepts and listen calls serialize behind a pending accept.
 #[derive(Clone)]
 pub struct RegionalNode {
+    communities: Vec<crate::community::Community>,
     inner: Arc<Inner>,
 }
 
@@ -192,6 +193,71 @@ impl RegionalNode {
         Self::assemble(primary, None, None, None, additional, true)
     }
 
+    /// Associate canonical languages with already-bound endpoints. Every named
+    /// scope must exist in this session; opaque local scopes may remain unnamed.
+    /// This returns a configured handle without changing previously cloned handles.
+    pub fn with_communities(
+        mut self,
+        communities: Vec<crate::community::Community>,
+    ) -> io::Result<Self> {
+        let groups = communities
+            .iter()
+            .map(|c| crate::invite::CommunityPeers {
+                language: c.language().unwrap_or_default().to_owned(),
+                peers: vec![],
+            })
+            .collect::<Vec<_>>();
+        crate::invite::validate_communities(&groups)?;
+        for community in &communities {
+            self.node(community.overlay())?;
+        }
+        self.communities = communities;
+        Ok(self)
+    }
+
+    pub fn communities(&self) -> &[crate::community::Community] {
+        &self.communities
+    }
+
+    /// Export verified peers separately for every named language DHT. Exclusions
+    /// also apply to this node. Only pass `include_self` for a publicly reachable
+    /// server; clients behind NAT should export verified introduction peers only.
+    /// Empty groups retain membership metadata while an overlay is unavailable.
+    pub async fn invitation_communities(
+        &self,
+        excluded: &[NodeId],
+        include_self: bool,
+    ) -> io::Result<Vec<crate::invite::CommunityPeers>> {
+        let mut groups = Vec::new();
+        for community in &self.communities {
+            let node = self.node(community.overlay())?;
+            let mut contacts = node.bootstrap_contacts().await.unwrap_or_default();
+            if include_self {
+                contacts.insert(0, node.contact());
+            }
+            let mut seen = std::collections::HashSet::new();
+            let peers = contacts
+                .into_iter()
+                .filter(|p| !excluded.contains(&p.id) && seen.insert(p.id))
+                .filter(|p| {
+                    p.addr.port() != 0
+                        && !p.addr.ip().is_unspecified()
+                        && !p.addr.ip().is_multicast()
+                })
+                .take(8)
+                .map(|p| crate::Peer {
+                    node_id: crate::util::to_hex(p.id.as_bytes()),
+                    addr: p.addr.to_string(),
+                })
+                .collect();
+            groups.push(crate::invite::CommunityPeers {
+                language: community.language().expect("validated language").to_owned(),
+                peers,
+            });
+        }
+        Ok(groups)
+    }
+
     fn assemble(
         regional: NextNode,
         mut global: Option<NextNode>,
@@ -234,6 +300,11 @@ impl RegionalNode {
             sender
         }).collect();
         Ok(Self {
+            communities: community
+                .iter()
+                .filter(|c| c.language().is_some())
+                .cloned()
+                .collect(),
             inner: Arc::new(Inner {
                 regional,
                 global,

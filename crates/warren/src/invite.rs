@@ -150,6 +150,149 @@ mod tests {
     }
 }
 
+/// Maximum language communities advertised by one invitation or session.
+pub const MAX_COMMUNITIES: usize = 4;
+pub const MAX_INVITE_HEX: usize = 16 * 1024;
+
+/// Bootstrap hints belong exclusively to the DHT derived from `language`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommunityPeers {
+    pub language: String,
+    pub peers: Vec<Peer>,
+}
+
+/// Validate canonical language names, unique scopes, and bounded peer hints.
+pub fn validate_communities(groups: &[CommunityPeers]) -> std::io::Result<()> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid discovery communities",
+        )
+    };
+    if groups.len() > MAX_COMMUNITIES {
+        return Err(invalid());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for group in groups {
+        let community =
+            crate::community::Community::from_locale(&group.language).ok_or_else(invalid)?;
+        if community.language() != Some(group.language.as_str())
+            || !seen.insert(&group.language)
+            || group.peers.len() > 8
+        {
+            return Err(invalid());
+        }
+        for peer in &group.peers {
+            let addr: std::net::SocketAddr = peer.addr.parse().map_err(|_| invalid())?;
+            if crate::util::hash_from_hex(&peer.node_id).is_none()
+                || addr.port() == 0
+                || addr.ip().is_unspecified()
+                || addr.ip().is_multicast()
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Shared invitation payload, compatible with legacy single-key invitations.
+/// Applications may flatten this into an envelope containing their own metadata.
+/// Hex encoding does not encrypt the keys or peer addresses.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InvitePayload {
+    #[serde(rename = "k")]
+    pub channel_key: String,
+    #[serde(rename = "c", default)]
+    pub content_key: Option<String>,
+    #[serde(rename = "b", default, with = "compact_peers")]
+    pub bootstrap: Vec<Peer>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub communities: Vec<CommunityPeers>,
+}
+
+impl InvitePayload {
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.channel_key.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "empty channel key",
+            ));
+        }
+        validate_communities(&self.communities)
+    }
+
+    pub fn content_key(&self) -> &str {
+        self.content_key.as_deref().unwrap_or(&self.channel_key)
+    }
+
+    /// Encode a validated payload. Application envelopes should use `encode_payload`.
+    pub fn encode(&self, prefix: &str) -> std::io::Result<String> {
+        self.validate()?;
+        let encoded = encode_payload(prefix, self);
+        if encoded.len() - prefix.len() > MAX_INVITE_HEX {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invite too large",
+            ));
+        }
+        Ok(encoded)
+    }
+
+    pub fn decode(prefix: &str, text: &str) -> Option<Self> {
+        let payload: Self = decode_payload(prefix, text)?;
+        payload.validate().ok()?;
+        Some(payload)
+    }
+}
+
+/// Serialize a payload or application envelope. The application validates its
+/// metadata and the shared payload before distributing the result.
+pub fn encode_payload<T: Serialize>(prefix: &str, payload: &T) -> String {
+    format!(
+        "{prefix}{}",
+        to_hex(&serde_json::to_vec(payload).expect("invite serializes"))
+    )
+}
+
+/// Decode a bounded payload or application envelope. Callers must validate the
+/// shared payload and their own metadata before using it.
+pub fn decode_payload<T: serde::de::DeserializeOwned>(prefix: &str, text: &str) -> Option<T> {
+    let body = text.trim().strip_prefix(prefix)?;
+    if body.len() > MAX_INVITE_HEX {
+        return None;
+    }
+    serde_json::from_slice(&from_hex(body)?).ok()
+}
+
+mod compact_peers {
+    use super::*;
+    pub fn serialize<S: serde::Serializer>(
+        peers: &[Peer],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        peers
+            .iter()
+            .map(|p| WirePeer {
+                n: p.node_id.clone(),
+                a: p.addr.clone(),
+            })
+            .collect::<Vec<_>>()
+            .serialize(serializer)
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<Peer>, D::Error> {
+        Ok(Vec::<WirePeer>::deserialize(deserializer)?
+            .into_iter()
+            .map(|p| Peer {
+                node_id: p.n,
+                addr: p.a,
+            })
+            .collect())
+    }
+}
+
 /// A regional invitation is a separate versioned format. It is not encrypted or
 /// a membership credential; possession reveals the channel keys and peer hints.
 #[derive(Clone, Debug)]
@@ -384,5 +527,67 @@ impl RegionalInvite {
             }
         }
         Err(error)
+    }
+}
+
+#[cfg(test)]
+mod community_payload_tests {
+    use super::*;
+
+    #[test]
+    fn rejects_invalid_scopes_and_peer_hints() {
+        let valid = CommunityPeers {
+            language: "fa".into(),
+            peers: vec![Peer {
+                node_id: "ab".repeat(32),
+                addr: "127.0.0.1:1234".into(),
+            }],
+        };
+        validate_communities(std::slice::from_ref(&valid)).unwrap();
+        assert!(validate_communities(&[valid.clone(), valid.clone()]).is_err());
+        for language in ["fa-IR", "FA", "../fa", "und", ""] {
+            let mut group = valid.clone();
+            group.language = language.into();
+            assert!(validate_communities(&[group]).is_err());
+        }
+        for address in ["0.0.0.0:1", "[::]:1", "127.0.0.1:0", "224.0.0.1:1", "bad"] {
+            let mut group = valid.clone();
+            group.peers[0].addr = address.into();
+            assert!(validate_communities(&[group]).is_err());
+        }
+        let mut group = valid.clone();
+        group.peers[0].node_id = "abcd".into();
+        assert!(validate_communities(&[group]).is_err());
+        let mut group = valid.clone();
+        group.peers = vec![valid.peers[0].clone(); 9];
+        assert!(validate_communities(&[group]).is_err());
+        let groups = ["en", "fa", "ru", "de", "fr"]
+            .into_iter()
+            .map(|language| CommunityPeers {
+                language: language.into(),
+                peers: vec![],
+            })
+            .collect::<Vec<_>>();
+        assert!(validate_communities(&groups).is_err());
+    }
+
+    #[test]
+    fn legacy_payloads_and_application_metadata_remain_compatible() {
+        #[derive(Serialize, Deserialize)]
+        struct ApplicationInvite {
+            #[serde(flatten)]
+            payload: InvitePayload,
+            f: String,
+        }
+        let old = format!("app://{}", to_hex(br#"{"k":"legacy","f":"founder"}"#));
+        let envelope: ApplicationInvite = decode_payload("app://", &old).unwrap();
+        envelope.payload.validate().unwrap();
+        assert_eq!(envelope.payload.content_key(), "legacy");
+        assert!(envelope.payload.communities.is_empty());
+        let encoded = encode_payload("app://", &envelope);
+        let decoded: ApplicationInvite = decode_payload("app://", &encoded).unwrap();
+        assert_eq!(decoded.f, "founder");
+        let oversized = format!("app://{}", "0".repeat(MAX_INVITE_HEX + 1));
+        assert!(decode_payload::<InvitePayload>("app://", &oversized).is_none());
     }
 }

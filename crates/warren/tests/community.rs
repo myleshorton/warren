@@ -149,7 +149,7 @@ async fn language_community_keeps_domestic_discovery_when_overseas_peers_disappe
         .unwrap();
         let invite = RegionalInvite::decode(
             "warren://",
-            &invite.encode("warren://"),
+            &invite.encode("warren://").unwrap(),
             warren::util::now_secs(),
         )
         .unwrap();
@@ -160,12 +160,7 @@ async fn language_community_keeps_domestic_discovery_when_overseas_peers_disappe
         );
         let mut mismatched = invite.clone();
         mismatched.community_language = Some("ru".into());
-        assert!(RegionalInvite::decode(
-            "warren://",
-            &mismatched.encode("warren://"),
-            warren::util::now_secs()
-        )
-        .is_none());
+        assert!(mismatched.encode("warren://").is_err());
         let overseas = RegionalNode::bind_community(
             addr("::1"),
             None,
@@ -397,7 +392,7 @@ async fn opaque_community_invites_roundtrip_and_join_the_shared_overlay() {
         assert!(invite.community_bootstrap.is_some());
         let decoded = RegionalInvite::decode(
             "warren://",
-            &invite.encode("warren://"),
+            &invite.encode("warren://").unwrap(),
             warren::util::now_secs(),
         )
         .unwrap();
@@ -570,7 +565,7 @@ async fn composed_global_endpoint_is_visible_to_legacy_apis_and_invites_roundtri
         .unwrap();
         assert!(RegionalInvite::decode(
             "warren://",
-            &invite.encode("warren://"),
+            &invite.encode("warren://").unwrap(),
             warren::util::now_secs()
         )
         .is_some());

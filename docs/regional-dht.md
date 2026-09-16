@@ -263,7 +263,7 @@ at 16 KiB of hex; the regional snapshot format keeps a separate 24 KiB cap becau
 it carries bulkier bootstrap state. Peer hints use one shape wherever they appear,
 `node_id`/`addr`, in both `bootstrap` and each community group. Fields whose
 absence already carries meaning are omitted rather than written out: no
-`content_key` when it equals the channel key, and no `peers` on a named community
+`content_key` when it is `None` (which means to use the channel key), and no `peers` on a named community
 with no reachable peers, which still keeps its membership metadata.
 
 On receipt, preserve the saved home language, add the invited languages within
@@ -302,7 +302,14 @@ global, empty, oversized, mismatched community snapshots and unknown-version
 invitations. Legacy invite decoding does not silently downgrade regional
 invitations. `join` checks expiry, community selection and configured overlay IDs before
 restoring compatible hints.
-Clock accuracy is required for expiry checks, as for signed DHT leases.
+Both regional encoding and decoding share validation of keys, expiry, scopes,
+contact snapshots, and community matching. `RegionalInvite::encode` returns a
+`Result` and rejects invalid or oversized invitations, including caller-constructed
+values. Clock accuracy is required for expiry checks, as for signed DHT leases.
+
+Use `InvitePayload` for ordinary invitations and `RegionalInvite` for expiring,
+scoped snapshots. The unused short-key `Invite` codec and its `encode_invite` /
+`decode_invite` helpers have been removed.
 
 These invitations are **not encrypted, signed authorization, or membership
 credentials**. Anyone holding one can read its keys and contact hints. Invitations

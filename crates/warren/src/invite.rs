@@ -1,154 +1,10 @@
-//! Shareable channel invites.
-//!
-//! An invite bundles the channel key(s) with one or more bootstrap peers to join
-//! the DHT through, so a new member can paste a single string and land in the same
-//! channel with a reachable entry point. The wire form is `<prefix><hex>` where
-//! `<hex>` is a small JSON payload — hex keeps it URL-safe and copy/paste-proof
-//! without a base64 dependency, and the whole thing is opaque to anyone who
-//! doesn't already have it. The application chooses `prefix` (its URL scheme).
-
-use serde::{Deserialize, Serialize};
+//! Shareable channel invitations with bounded JSON encoded as hex.
+//! The application chooses the URL prefix. Hex is not encryption: holders can
+//! read the channel keys and peer hints.
 
 use crate::util::{from_hex, to_hex};
 use crate::Peer;
-
-/// A decoded invite: which channel (discovery key), the content key needed to
-/// decrypt (empty for a blind-mirror invite), and where to bootstrap in.
-#[derive(Debug, Clone)]
-pub struct Invite {
-    pub channel_key: String,
-    pub content_key: String,
-    pub bootstrap: Vec<Peer>,
-}
-
-/// Compact JSON form with short keys (`k`ey, `c`ontent-key, `b`ootstrap).
-#[derive(Serialize, Deserialize)]
-struct Wire {
-    k: String,
-    /// Absent ⇒ a legacy single-key invite (content defaults to the channel key);
-    /// present ⇒ the content key (may be empty for a blind-mirror invite).
-    #[serde(default)]
-    c: Option<String>,
-    #[serde(default)]
-    b: Vec<WirePeer>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct WirePeer {
-    n: String,
-    a: String,
-}
-
-/// Encode a discovery key + content key + bootstrap peers into a shareable
-/// `<prefix><hex>` invite. Pass an empty `content_key` for a blind-mirror invite.
-pub fn encode_invite(
-    prefix: &str,
-    channel_key: String,
-    content_key: String,
-    bootstrap: Vec<Peer>,
-) -> String {
-    let wire = Wire {
-        k: channel_key,
-        c: Some(content_key),
-        b: bootstrap
-            .into_iter()
-            .map(|p| WirePeer {
-                n: p.node_id,
-                a: p.addr,
-            })
-            .collect(),
-    };
-    // A `Wire` is plain data and can't fail to serialize; `expect` rather than
-    // silently emitting an empty/invalid invite on the impossible error.
-    let json = serde_json::to_vec(&wire).expect("invite serializes");
-    format!("{prefix}{}", to_hex(&json))
-}
-
-/// Parse a `<prefix><hex>` invite. Returns `None` if it isn't a well-formed invite
-/// or carries no channel key. Whitespace is trimmed so a pasted string with stray
-/// newlines still works.
-pub fn decode_invite(prefix: &str, text: &str) -> Option<Invite> {
-    let body = text.trim().strip_prefix(prefix)?;
-    let json = from_hex(body)?;
-    let wire: Wire = serde_json::from_slice(&json).ok()?;
-    if wire.k.is_empty() {
-        return None;
-    }
-    // Legacy invite (no `c`) ⇒ single-key channel: content = discovery key.
-    let content_key = wire.c.unwrap_or_else(|| wire.k.clone());
-    Some(Invite {
-        channel_key: wire.k,
-        content_key,
-        bootstrap: wire
-            .b
-            .into_iter()
-            .map(|p| Peer {
-                node_id: p.n,
-                addr: p.a,
-            })
-            .collect(),
-    })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const PFX: &str = "warren://";
-
-    #[test]
-    fn invite_round_trips() {
-        let peers = vec![
-            Peer {
-                node_id: "ab12".repeat(16),
-                addr: "1.2.3.4:9000".into(),
-            },
-            Peer {
-                node_id: "cd34".repeat(16),
-                addr: "[::1]:7000".into(),
-            },
-        ];
-        let s = encode_invite(
-            PFX,
-            "my-secret-channel".into(),
-            "the-content-key".into(),
-            peers.clone(),
-        );
-        assert!(s.starts_with(PFX));
-
-        let back = decode_invite(PFX, &s).expect("decodes");
-        assert_eq!(back.channel_key, "my-secret-channel");
-        assert_eq!(back.content_key, "the-content-key");
-        assert_eq!(back.bootstrap, peers);
-    }
-
-    #[test]
-    fn blind_mirror_invite_carries_no_content_key() {
-        let s = encode_invite(PFX, "chan".into(), String::new(), vec![]);
-        let back = decode_invite(PFX, &s).unwrap();
-        assert_eq!(back.channel_key, "chan");
-        assert!(
-            back.content_key.is_empty(),
-            "blind: discovery only, no content key"
-        );
-    }
-
-    #[test]
-    fn tolerates_surrounding_whitespace() {
-        let s = encode_invite(PFX, "chan".into(), "chan".into(), vec![]);
-        let padded = format!("  \n{s}\n ");
-        assert_eq!(decode_invite(PFX, &padded).unwrap().channel_key, "chan");
-    }
-
-    #[test]
-    fn rejects_junk_and_empty_channel() {
-        assert!(decode_invite(PFX, "hello").is_none());
-        assert!(decode_invite(PFX, "warren://zzzz").is_none()); // not hex
-        assert!(decode_invite(PFX, "warren://").is_none()); // empty payload
-        let empty_key = encode_invite(PFX, "".into(), "".into(), vec![]);
-        assert!(decode_invite(PFX, &empty_key).is_none());
-    }
-}
+use serde::{Deserialize, Serialize};
 
 /// Maximum language communities advertised by one invitation or session.
 pub const MAX_COMMUNITIES: usize = 4;
@@ -202,7 +58,7 @@ pub fn validate_communities(groups: &[CommunityPeers]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Shared invitation payload, compatible with legacy single-key invitations.
+/// Shared invitation payload with optional separate content keys.
 /// Applications may flatten this into an envelope containing their own metadata.
 /// Hex encoding does not encrypt the keys or peer addresses.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -365,7 +221,56 @@ impl RegionalInvite {
             expires: crate::util::now_secs().saturating_add(lifetime.as_secs()),
         })
     }
-    pub fn encode(&self, prefix: &str) -> String {
+    /// Validate the complete invitation at a given time, including snapshots
+    /// supplied directly by callers rather than through `create`.
+    pub fn validate(&self, now: u64) -> std::io::Result<()> {
+        let invalid = || {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid regional invitation",
+            )
+        };
+        if self.channel_key.is_empty()
+            || self
+                .channel_key
+                .len()
+                .saturating_add(self.content_key.len())
+                > MAX_INVITE_KEY_BYTES
+            || self.expires <= now
+            || self.expires > now.saturating_add(86_400)
+            || self.community_language.as_ref().is_some_and(|language| {
+                crate::community::Community::from_locale(language).is_none()
+            })
+        {
+            return Err(invalid());
+        }
+        for state in std::iter::once(&self.bootstrap).chain(self.community_bootstrap.iter()) {
+            if state.overlay() == driver::next::OverlayId::Global
+                || state.contacts().is_empty()
+                || state.contacts().len() > 8
+            {
+                return Err(invalid());
+            }
+            driver::next::BootstrapState::decode(&state.encode()).map_err(|_| invalid())?;
+        }
+        if let (Some(language), Some(state)) = (&self.community_language, &self.community_bootstrap)
+        {
+            let community =
+                crate::community::Community::from_locale(language).ok_or_else(invalid)?;
+            if state.overlay() != community.overlay() {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
+    /// Encode only invitations valid at the current time.
+    pub fn encode(&self, prefix: &str) -> std::io::Result<String> {
+        self.encode_at(prefix, crate::util::now_secs())
+    }
+
+    fn encode_at(&self, prefix: &str, now: u64) -> std::io::Result<String> {
+        self.validate(now)?;
         let wire = RegionalWire {
             community_bootstrap: self
                 .community_bootstrap
@@ -382,10 +287,14 @@ impl RegionalInvite {
             bootstrap: to_hex(&self.bootstrap.encode()),
             expires: self.expires,
         };
-        format!(
-            "{prefix}{}",
-            to_hex(&serde_json::to_vec(&wire).expect("regional invite"))
-        )
+        let json = serde_json::to_vec(&wire).map_err(std::io::Error::other)?;
+        if json.len() > MAX_REGIONAL_INVITE_HEX / 2 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "regional invite too large",
+            ));
+        }
+        Ok(format!("{prefix}{}", to_hex(&json)))
     }
     pub fn decode(prefix: &str, text: &str, now: u64) -> Option<Self> {
         let body = text.trim().strip_prefix(prefix)?;
@@ -398,50 +307,24 @@ impl RegionalInvite {
             2 => wire.community_language.is_some() || wire.community_bootstrap.is_some(),
             _ => false,
         };
-        if !valid_version
-            || wire.community_language.as_ref().is_some_and(|language| {
-                crate::community::Community::from_locale(language).is_none()
-            })
-            || wire.channel.is_empty()
-            || wire.channel.len().saturating_add(wire.content.len()) > MAX_INVITE_KEY_BYTES
-            || wire.expires <= now
-            || wire.expires > now.saturating_add(86_400)
-        {
+        if !valid_version {
             return None;
         }
         let bootstrap = driver::next::BootstrapState::decode(&from_hex(&wire.bootstrap)?).ok()?;
-        if bootstrap.overlay() == driver::next::OverlayId::Global
-            || bootstrap.contacts().is_empty()
-            || bootstrap.contacts().len() > 8
-        {
-            return None;
-        }
         let community_bootstrap = match wire.community_bootstrap {
-            Some(encoded) => {
-                let community = wire
-                    .community_language
-                    .as_deref()
-                    .and_then(crate::community::Community::from_locale);
-                let state = driver::next::BootstrapState::decode(&from_hex(&encoded)?).ok()?;
-                if state.overlay() == driver::next::OverlayId::Global
-                    || community.is_some_and(|community| state.overlay() != community.overlay())
-                    || state.contacts().is_empty()
-                    || state.contacts().len() > 8
-                {
-                    return None;
-                }
-                Some(state)
-            }
+            Some(encoded) => Some(driver::next::BootstrapState::decode(&from_hex(&encoded)?).ok()?),
             None => None,
         };
-        Some(Self {
+        let invite = Self {
             community_bootstrap,
             community_language: wire.community_language,
             channel_key: wire.channel,
             content_key: wire.content,
             bootstrap,
             expires: wire.expires,
-        })
+        };
+        invite.validate(now).ok()?;
+        Some(invite)
     }
     /// Join through the first reachable compatible overlay. All accepted hints are
     /// installed first; success cancels sibling revalidation lookups so an offline
@@ -702,8 +585,7 @@ mod community_payload_tests {
             }
         }
 
-        // --- RegionalInvite: encode() is infallible, so the invariant is over the
-        // constraints create() enforces. A global overlay is not among them.
+        // Regional encoding validates the same constraints as decoding.
         let local = driver::next::OverlayId::regional("local-domain");
         let farsi = crate::community::Community::from_locale("fa").unwrap();
         for language in [None, Some("fa".to_owned())] {
@@ -729,7 +611,7 @@ mod community_payload_tests {
                     let label = format!(
                         "language={language:?} community={carries_community} keys={keys:?}"
                     );
-                    let encoded = invite.encode("warren://");
+                    let encoded = invite.encode_at("warren://", NOW).unwrap();
                     let decoded = RegionalInvite::decode("warren://", &encoded, NOW)
                         .unwrap_or_else(|| panic!("encoded but did not decode: {label}"));
                     assert_eq!(
@@ -748,10 +630,6 @@ mod community_payload_tests {
             }
         }
 
-        // Unlike `InvitePayload::encode`, `RegionalInvite::encode` does not validate.
-        // The guard against a global overlay therefore lives in `create` and in
-        // `RegionalNode::assemble`, not in the format. Pinned so that the next person
-        // to touch either knows the encoder is not a backstop.
         let global_backed = RegionalInvite {
             community_language: None,
             community_bootstrap: None,
@@ -763,10 +641,125 @@ mod community_payload_tests {
             ),
             expires: NOW + 600,
         };
-        assert!(
-            RegionalInvite::decode("warren://", &global_backed.encode("warren://"), NOW).is_none(),
-            "a global bootstrap stays undecodable; the upstream guard is what prevents emitting one"
+        assert!(global_backed.encode_at("warren://", NOW).is_err());
+    }
+
+    #[test]
+    fn regional_encode_and_decode_reject_the_same_invalid_values() {
+        use driver::next::{BootstrapState, OverlayId};
+        const NOW: u64 = 1_700_000_000;
+        let scope = crate::community::Community::from_locale("fa")
+            .unwrap()
+            .overlay();
+        let state = |scope, count: u8| {
+            BootstrapState::in_overlay(
+                (1..=count)
+                    .map(|n| {
+                        swarm::Contact::new(
+                            swarm::NodeId::from_bytes([n; 32]),
+                            format!("192.0.2.{n}:9000").parse().unwrap(),
+                        )
+                    })
+                    .collect(),
+                scope,
+            )
+        };
+        let valid = RegionalInvite {
+            community_language: Some("fa".into()),
+            community_bootstrap: Some(state(scope, 8)),
+            channel_key: "k".repeat(MAX_INVITE_KEY_BYTES),
+            content_key: String::new(),
+            bootstrap: state(OverlayId::regional("local"), 8),
+            expires: NOW + 86_400,
+        };
+        let encoded = valid.encode_at("region://", NOW).unwrap();
+        assert!(RegionalInvite::decode("region://", &encoded, NOW).is_some());
+        let mut cases = vec![];
+        for expires in [NOW - 1, NOW, NOW + 86_401] {
+            cases.push((
+                "expiry",
+                RegionalInvite {
+                    expires,
+                    ..valid.clone()
+                },
+            ));
+        }
+        for channel_key in [String::new(), "k".repeat(MAX_INVITE_KEY_BYTES + 1)] {
+            cases.push((
+                "channel key",
+                RegionalInvite {
+                    channel_key,
+                    ..valid.clone()
+                },
+            ));
+        }
+        cases.push((
+            "combined keys",
+            RegionalInvite {
+                content_key: "c".into(),
+                ..valid.clone()
+            },
+        ));
+        cases.push((
+            "language",
+            RegionalInvite {
+                community_language: Some("und".into()),
+                ..valid.clone()
+            },
+        ));
+        cases.push((
+            "mismatched community",
+            RegionalInvite {
+                community_language: Some("ru".into()),
+                ..valid.clone()
+            },
+        ));
+        for (scope, count) in [(OverlayId::Global, 1), (scope, 0), (scope, 9)] {
+            cases.push((
+                "primary snapshot",
+                RegionalInvite {
+                    bootstrap: state(scope, count),
+                    ..valid.clone()
+                },
+            ));
+            cases.push((
+                "community snapshot",
+                RegionalInvite {
+                    community_bootstrap: Some(state(scope, count)),
+                    ..valid.clone()
+                },
+            ));
+        }
+        for (label, invite) in cases {
+            assert!(invite.encode_at("region://", NOW).is_err(), "{label}");
+            // Forge the corresponding wire input independently of the encoder.
+            let wire = serde_json::json!({
+                "version": 2, "community_language": invite.community_language,
+                "community_bootstrap": invite.community_bootstrap.map(|s| to_hex(&s.encode())),
+                "channel": invite.channel_key, "content": invite.content_key,
+                "bootstrap": to_hex(&invite.bootstrap.encode()), "expires": invite.expires,
+            });
+            let encoded = format!("region://{}", to_hex(&serde_json::to_vec(&wire).unwrap()));
+            assert!(
+                RegionalInvite::decode("region://", &encoded, NOW).is_none(),
+                "{label}"
+            );
+        }
+        let mut wrong_version: serde_json::Value =
+            serde_json::from_slice(&from_hex(encoded.strip_prefix("region://").unwrap()).unwrap())
+                .unwrap();
+        wrong_version["version"] = 1.into();
+        let encoded = format!(
+            "region://{}",
+            to_hex(&serde_json::to_vec(&wrong_version).unwrap())
         );
+        assert!(RegionalInvite::decode("region://", &encoded, NOW).is_none());
+        assert!(RegionalInvite::decode(
+            "region://",
+            &format!("region://{}", "0".repeat(MAX_REGIONAL_INVITE_HEX + 1)),
+            NOW
+        )
+        .is_none());
     }
 
     #[test]

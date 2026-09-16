@@ -76,11 +76,11 @@ async fn global_shutdown_allows_regional_restart_invitation_and_authenticated_tr
             .contacts()
             .iter()
             .all(|c| c.id != origin.id() && c.id != global.id()));
-        let encoded = invite.encode("warren-region://");
+        let encoded = invite.encode("warren-region://").unwrap();
         let invite =
             RegionalInvite::decode("warren-region://", &encoded, warren::util::now_secs()).unwrap();
         assert!(RegionalInvite::decode("warren-region://", &encoded, invite.expires).is_none());
-        assert!(warren::invite::decode_invite("warren-region://", &encoded).is_none());
+        assert!(warren::invite::InvitePayload::decode("warren-region://", &encoded).is_none());
         assert!(RegionalInvite::create(
             &author,
             "channel".into(),

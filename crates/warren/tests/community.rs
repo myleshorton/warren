@@ -149,7 +149,7 @@ async fn language_community_keeps_domestic_discovery_when_overseas_peers_disappe
         .unwrap();
         let invite = RegionalInvite::decode(
             "warren://",
-            &invite.encode("warren://"),
+            &invite.encode("warren://").unwrap(),
             warren::util::now_secs(),
         )
         .unwrap();
@@ -160,12 +160,7 @@ async fn language_community_keeps_domestic_discovery_when_overseas_peers_disappe
         );
         let mut mismatched = invite.clone();
         mismatched.community_language = Some("ru".into());
-        assert!(RegionalInvite::decode(
-            "warren://",
-            &mismatched.encode("warren://"),
-            warren::util::now_secs()
-        )
-        .is_none());
+        assert!(mismatched.encode("warren://").is_err());
         let overseas = RegionalNode::bind_community(
             addr("::1"),
             None,
@@ -397,7 +392,7 @@ async fn opaque_community_invites_roundtrip_and_join_the_shared_overlay() {
         assert!(invite.community_bootstrap.is_some());
         let decoded = RegionalInvite::decode(
             "warren://",
-            &invite.encode("warren://"),
+            &invite.encode("warren://").unwrap(),
             warren::util::now_secs(),
         )
         .unwrap();
@@ -464,5 +459,218 @@ async fn invitation_with_only_policy_rejections_fails_immediately() {
     assert!(error
         .to_string()
         .contains("1 of 1 invite peers outside the configured domain"));
+    node.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn multiple_languages_validate_scopes_and_publish_independently() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let fa = Community::from_locale("fa").unwrap().overlay();
+        let en = Community::from_locale("en").unwrap().overlay();
+        let fa_router = router("127.0.0.1", 201, fa).await;
+        let en_router = router("127.0.0.1", 202, en).await;
+        let identity = Keypair::from_seed(&[203; 32]);
+        let primary = NextNode::bind_in_overlay(addr("127.0.0.1"), identity.clone(), false, fa)
+            .await
+            .unwrap();
+        let secondary = NextNode::bind_in_overlay(addr("127.0.0.1"), identity.clone(), false, en)
+            .await
+            .unwrap();
+        assert!(RegionalNode::from_endpoints(primary.clone(), vec![primary.clone()]).is_err());
+        assert!(RegionalNode::from_endpoints(primary.clone(), vec![en_router.clone()]).is_err());
+        assert!(RegionalNode::from_endpoints(primary.clone(), vec![secondary.clone(); 5]).is_err());
+        let node = RegionalNode::from_endpoints(primary, vec![secondary]).unwrap();
+        node.add_contact(fa, fa_router.contact()).await.unwrap();
+        node.add_contact(en, en_router.contact()).await.unwrap();
+        for endpoint in node.nodes() {
+            endpoint.bootstrap().await.unwrap();
+        }
+        let topic = swarm::NodeId::from_bytes([204; 32]);
+        let handles = node
+            .keep_announced_all(Duration::from_millis(100), move || vec![topic])
+            .await;
+        for (_, handle) in &handles {
+            let mut status = handle.status();
+            while status.borrow().acknowledged == 0 {
+                status.changed().await.unwrap();
+            }
+        }
+        let results = node.lookup_all_overlays(topic).await;
+        assert_eq!(results.len(), 2);
+        for (_, result) in results {
+            assert!(result.unwrap().iter().any(|p| p.id == node.id()));
+        }
+        en_router.shutdown().await.unwrap();
+        assert!(node
+            .node(fa)
+            .unwrap()
+            .lookup(topic)
+            .await
+            .unwrap()
+            .iter()
+            .any(|p| p.id == node.id()));
+        node.shutdown().await.unwrap();
+        fa_router.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn composed_global_endpoint_is_visible_to_legacy_apis_and_invites_roundtrip() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let scope = Community::from_locale("fa").unwrap().overlay();
+        let identity = Keypair::from_seed(&[210; 32]);
+        let primary = NextNode::bind_in_overlay(addr("127.0.0.1"), identity.clone(), false, scope)
+            .await
+            .unwrap();
+        let global = NextNode::bind(addr("127.0.0.1"), identity).await.unwrap();
+        assert!(RegionalNode::from_endpoints(global.clone(), vec![]).is_err());
+        let regional_router = router("127.0.0.1", 211, scope).await;
+        let global_router = router("127.0.0.1", 212, OverlayId::Global).await;
+        let node = RegionalNode::from_endpoints(primary, vec![global.clone()]).unwrap();
+        assert_eq!(node.global().unwrap().local_addr(), global.local_addr());
+        assert_eq!(node.nodes().count(), 2);
+        node.add_contact(scope, regional_router.contact())
+            .await
+            .unwrap();
+        node.add_contact(OverlayId::Global, global_router.contact())
+            .await
+            .unwrap();
+        for endpoint in node.nodes() {
+            endpoint.bootstrap().await.unwrap();
+        }
+        let topic = swarm::NodeId::from_bytes([213; 32]);
+        let (local_handle, global_handle) = node
+            .keep_announced(Duration::from_millis(100), move || vec![topic])
+            .await;
+        let global_handle = global_handle.expect("legacy global announcer");
+        for handle in [&local_handle, &global_handle] {
+            let mut status = handle.status();
+            while status.borrow().acknowledged == 0 {
+                status.changed().await.unwrap();
+            }
+        }
+        let (local, global) = node.lookup_all(topic).await;
+        assert!(local.unwrap().iter().any(|m| m.id == node.id()));
+        assert!(global.unwrap().unwrap().iter().any(|m| m.id == node.id()));
+        let invite = RegionalInvite::create(
+            &node,
+            "channel".into(),
+            "content".into(),
+            &[],
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert!(RegionalInvite::decode(
+            "warren://",
+            &invite.encode("warren://").unwrap(),
+            warren::util::now_secs()
+        )
+        .is_some());
+        node.shutdown().await.unwrap();
+        regional_router.shutdown().await.unwrap();
+        global_router.shutdown().await.unwrap();
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn composed_listener_starts_with_failed_primary_and_reports_retries() {
+    let scope = Community::from_locale("fa").unwrap().overlay();
+    let identity = Keypair::from_seed(&[214; 32]);
+    let primary = NextNode::bind_in_overlay(addr("127.0.0.1"), identity.clone(), false, scope)
+        .await
+        .unwrap();
+    let mut events = primary.diagnostics().subscribe().unwrap();
+    primary.shutdown().await.unwrap();
+    let global = NextNode::bind(addr("127.0.0.1"), identity).await.unwrap();
+    let node = RegionalNode::from_endpoints(primary, vec![global]).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), node.listen())
+        .await
+        .unwrap()
+        .unwrap();
+    for expected in [1, 2, 4, 8] {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let event = events.recv().await.unwrap();
+                if event.name == "network.accept.retry" {
+                    assert_eq!(event.error_code, "accept_failed");
+                    assert_eq!(
+                        event.fields,
+                        vec![("retry_count", driver::diagnostics::Value::Count(expected))]
+                    );
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert!(node.shutdown().await.is_err());
+}
+
+#[tokio::test]
+async fn endpoint_invites_name_each_language_without_mixing_peers() {
+    use warren::invite::InvitePayload;
+    let en = Community::from_locale("en").unwrap();
+    let fa = Community::from_locale("fa").unwrap();
+    let english = router("127.0.0.1", 91, en.overlay()).await;
+    let farsi = router("127.0.0.1", 91, fa.overlay()).await;
+    let global = router("127.0.0.1", 91, OverlayId::Global).await;
+    let node = RegionalNode::from_endpoints(english.clone(), vec![farsi.clone(), global]).unwrap();
+    assert!(node
+        .clone()
+        .with_communities(vec![Community::from_locale("ru").unwrap()])
+        .is_err());
+    assert!(node
+        .clone()
+        .with_communities(vec![en.clone(), en.clone()])
+        .is_err());
+    let unnamed = node.clone();
+    let node = node.with_communities(vec![en, fa]).unwrap();
+    assert_eq!(
+        unnamed
+            .invitation_communities(&[], false)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let empty = node.invitation_communities(&[], false).await.unwrap();
+    assert_eq!(empty.len(), 2);
+    assert!(empty.iter().all(|group| group.peers.is_empty()));
+    let groups = node.invitation_communities(&[], true).await.unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].language, "en");
+    assert_eq!(groups[0].peers[0].addr, english.contact().addr.to_string());
+    assert_eq!(groups[1].language, "fa");
+    assert_eq!(groups[1].peers[0].addr, farsi.contact().addr.to_string());
+    let payload = InvitePayload {
+        channel_key: "channel-a".into(),
+        content_key: Some(String::new()),
+        bootstrap: vec![],
+        communities: groups.clone(),
+    };
+    let encoded = payload.encode("warren://").unwrap();
+    let decoded = InvitePayload::decode("warren://", &encoded).unwrap();
+    assert_eq!(decoded.communities, groups);
+    assert_eq!(decoded.content_key(), "");
+    // Another channel uses the same named discovery overlays.
+    let other = InvitePayload {
+        channel_key: "channel-b".into(),
+        ..decoded
+    };
+    assert_eq!(other.communities, payload.communities);
+    for include_self in [false, true] {
+        let excluded = node
+            .invitation_communities(&[node.id()], include_self)
+            .await
+            .unwrap();
+        assert_eq!(excluded.len(), 2);
+        assert!(excluded.iter().all(|g| g.peers.is_empty()));
+    }
     node.shutdown().await.unwrap();
 }

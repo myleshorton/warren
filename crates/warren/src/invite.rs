@@ -152,7 +152,12 @@ mod tests {
 
 /// Maximum language communities advertised by one invitation or session.
 pub const MAX_COMMUNITIES: usize = 4;
+/// Preserve the existing Murmur-compatible envelope limit.
 pub const MAX_INVITE_HEX: usize = 16 * 1024;
+/// Combined discovery and effective content key size, shared by both formats.
+pub const MAX_INVITE_KEY_BYTES: usize = 1024;
+/// The older snapshot-based regional format retains its original wire limit.
+const MAX_REGIONAL_INVITE_HEX: usize = 24 * 1024;
 
 /// Bootstrap hints belong exclusively to the DHT derived from `language`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -213,10 +218,16 @@ pub struct InvitePayload {
 
 impl InvitePayload {
     pub fn validate(&self) -> std::io::Result<()> {
-        if self.channel_key.is_empty() {
+        if self.channel_key.is_empty()
+            || self
+                .channel_key
+                .len()
+                .saturating_add(self.content_key().len())
+                > MAX_INVITE_KEY_BYTES
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "empty channel key",
+                "empty or oversized channel keys",
             ));
         }
         validate_communities(&self.communities)
@@ -229,14 +240,7 @@ impl InvitePayload {
     /// Encode a validated payload. Application envelopes should use `encode_payload`.
     pub fn encode(&self, prefix: &str) -> std::io::Result<String> {
         self.validate()?;
-        let encoded = encode_payload(prefix, self);
-        if encoded.len() - prefix.len() > MAX_INVITE_HEX {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "invite too large",
-            ));
-        }
-        Ok(encoded)
+        encode_payload(prefix, self)
     }
 
     pub fn decode(prefix: &str, text: &str) -> Option<Self> {
@@ -246,13 +250,18 @@ impl InvitePayload {
     }
 }
 
-/// Serialize a payload or application envelope. The application validates its
-/// metadata and the shared payload before distributing the result.
-pub fn encode_payload<T: Serialize>(prefix: &str, payload: &T) -> String {
-    format!(
-        "{prefix}{}",
-        to_hex(&serde_json::to_vec(payload).expect("invite serializes"))
-    )
+/// Serialize a bounded payload or application envelope. The application validates
+/// its metadata and shared payload first. Serialization and size failures are
+/// returned as errors, including when application metadata exceeds the wire cap.
+pub fn encode_payload<T: Serialize>(prefix: &str, payload: &T) -> std::io::Result<String> {
+    let json = serde_json::to_vec(payload).map_err(std::io::Error::other)?;
+    if json.len() > MAX_INVITE_HEX / 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invite too large",
+        ));
+    }
+    Ok(format!("{prefix}{}", to_hex(&json)))
 }
 
 /// Decode a bounded payload or application envelope. Callers must validate the
@@ -330,7 +339,7 @@ impl RegionalInvite {
         lifetime: std::time::Duration,
     ) -> std::io::Result<Self> {
         if channel_key.is_empty()
-            || channel_key.len().saturating_add(content_key.len()) > 1024
+            || channel_key.len().saturating_add(content_key.len()) > MAX_INVITE_KEY_BYTES
             || lifetime.as_secs() == 0
             || lifetime.as_secs() > 86_400
         {
@@ -408,7 +417,7 @@ impl RegionalInvite {
     }
     pub fn decode(prefix: &str, text: &str, now: u64) -> Option<Self> {
         let body = text.trim().strip_prefix(prefix)?;
-        if body.len() > 24_576 {
+        if body.len() > MAX_REGIONAL_INVITE_HEX {
             return None;
         }
         let wire: RegionalWire = serde_json::from_slice(&from_hex(body)?).ok()?;
@@ -422,7 +431,7 @@ impl RegionalInvite {
                 crate::community::Community::from_locale(language).is_none()
             })
             || wire.channel.is_empty()
-            || wire.channel.len().saturating_add(wire.content.len()) > 1024
+            || wire.channel.len().saturating_add(wire.content.len()) > MAX_INVITE_KEY_BYTES
             || wire.expires <= now
             || wire.expires > now.saturating_add(86_400)
         {
@@ -584,10 +593,91 @@ mod community_payload_tests {
         envelope.payload.validate().unwrap();
         assert_eq!(envelope.payload.content_key(), "legacy");
         assert!(envelope.payload.communities.is_empty());
-        let encoded = encode_payload("app://", &envelope);
+        let encoded = encode_payload("app://", &envelope).unwrap();
         let decoded: ApplicationInvite = decode_payload("app://", &encoded).unwrap();
         assert_eq!(decoded.f, "founder");
         let oversized = format!("app://{}", "0".repeat(MAX_INVITE_HEX + 1));
         assert!(decode_payload::<InvitePayload>("app://", &oversized).is_none());
+    }
+    #[test]
+    fn envelope_encoding_bounds_application_metadata_and_returns_serialization_errors() {
+        #[derive(Serialize, Deserialize)]
+        struct Envelope {
+            #[serde(flatten)]
+            payload: InvitePayload,
+            metadata: String,
+        }
+        let mut envelope = Envelope {
+            payload: InvitePayload {
+                channel_key: "channel".into(),
+                content_key: None,
+                bootstrap: vec![],
+                communities: vec![],
+            },
+            metadata: String::new(),
+        };
+        envelope.payload.validate().unwrap();
+        let overhead = serde_json::to_vec(&envelope).unwrap().len();
+        envelope.metadata = "x".repeat(MAX_INVITE_HEX / 2 - overhead);
+        let encoded = encode_payload("app://", &envelope).unwrap();
+        assert_eq!(encoded.len() - "app://".len(), MAX_INVITE_HEX);
+        assert!(decode_payload::<Envelope>("app://", &encoded).is_some());
+        envelope.metadata.push('x');
+        assert_eq!(
+            encode_payload("app://", &envelope).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        struct Unserializable;
+        impl Serialize for Unserializable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom(
+                    "intentional serialization failure",
+                ))
+            }
+        }
+        assert!(encode_payload("app://", &Unserializable).is_err());
+    }
+
+    #[test]
+    fn key_limits_apply_to_validation_and_untrusted_decoding() {
+        let mut payload = InvitePayload {
+            channel_key: "k".repeat(MAX_INVITE_KEY_BYTES),
+            content_key: Some(String::new()),
+            bootstrap: vec![],
+            communities: vec![],
+        };
+        payload.validate().unwrap();
+        assert!(InvitePayload::decode("app://", &payload.encode("app://").unwrap()).is_some());
+        payload.content_key = Some("c".into());
+        assert!(payload.validate().is_err());
+        assert!(payload.encode("app://").is_err());
+        let untrusted = encode_payload("app://", &payload).unwrap();
+        assert!(InvitePayload::decode("app://", &untrusted).is_none());
+        payload.channel_key = "k".into();
+        payload.content_key = Some("c".repeat(MAX_INVITE_KEY_BYTES));
+        assert!(payload.validate().is_err());
+        payload.content_key = None;
+        payload.channel_key = "k".repeat(MAX_INVITE_KEY_BYTES / 2);
+        payload.validate().unwrap();
+        payload.channel_key.push('k');
+        assert!(payload.validate().is_err());
+    }
+
+    #[test]
+    fn existing_murmur_peer_field_names_are_preserved() {
+        let fixture = serde_json::json!({
+            "k": "channel", "c": null,
+            "b": [{ "n": "ab".repeat(32), "a": "127.0.0.1:1234" }],
+            "communities": [{ "language": "fa", "peers": [{
+                "node_id": "cd".repeat(32), "addr": "127.0.0.1:5678"
+            }] }]
+        });
+        let encoded = encode_payload("app://", &fixture).unwrap();
+        let payload = InvitePayload::decode("app://", &encoded).unwrap();
+        let reencoded = payload.encode("app://").unwrap();
+        assert_eq!(
+            decode_payload::<serde_json::Value>("app://", &reencoded).unwrap(),
+            fixture
+        );
     }
 }

@@ -222,12 +222,19 @@ impl RegionalNode {
     /// Export verified peers separately for every named language DHT. Exclusions
     /// also apply to this node. Only pass `include_self` for a publicly reachable
     /// server; clients behind NAT should export verified introduction peers only.
-    /// Empty groups retain membership metadata while an overlay is unavailable.
+    /// Returns `InvalidInput` if this handle has no named communities. Named
+    /// groups retain membership metadata even when their peer lists are empty.
     pub async fn invitation_communities(
         &self,
         excluded: &[NodeId],
         include_self: bool,
     ) -> io::Result<Vec<crate::invite::CommunityPeers>> {
+        if self.communities.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no named communities configured",
+            ));
+        }
         let mut groups = Vec::new();
         for community in &self.communities {
             let node = self.node(community.overlay())?;

@@ -634,7 +634,19 @@ async fn endpoint_invites_name_each_language_without_mixing_peers() {
         .clone()
         .with_communities(vec![en.clone(), en.clone()])
         .is_err());
+    let unnamed = node.clone();
     let node = node.with_communities(vec![en, fa]).unwrap();
+    assert_eq!(
+        unnamed
+            .invitation_communities(&[], false)
+            .await
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+    let empty = node.invitation_communities(&[], false).await.unwrap();
+    assert_eq!(empty.len(), 2);
+    assert!(empty.iter().all(|group| group.peers.is_empty()));
     let groups = node.invitation_communities(&[], true).await.unwrap();
     assert_eq!(groups.len(), 2);
     assert_eq!(groups[0].language, "en");

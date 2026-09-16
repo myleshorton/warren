@@ -232,9 +232,11 @@ For sessions built with `RegionalNode::from_endpoints`, call
 scopes. Warren rejects duplicate languages, more than four languages, opaque
 communities, and names whose corresponding endpoint is absent. The association
 is explicit: a hashed overlay ID cannot be reversed to recover a language name.
-`bind_community` already records its language association.
+`bind_community` already records its language association. Configuration applies
+only to the returned handle; use that handle (or a subsequent clone) for exports.
 
-`invitation_communities(excluded, include_self)` exports up to eight verified
+`invitation_communities(excluded, include_self)` returns `InvalidInput` when no
+language names are configured on the handle. Otherwise, it exports up to eight verified
 contacts per named language, never mixing them with global or other language
 peers. Exclusions apply in every scope, including to the exporting node. Set
 `include_self` only for an explicitly reachable routing server. Unavailable
@@ -252,7 +254,13 @@ Applications can flatten `InvitePayload` into their own serde envelope, use
 application metadata. Murmur uses this to retain its founder key and display
 name without duplicating the discovery format. `decode_payload` bounds the hex
 body before allocation; `InvitePayload::decode` additionally validates the
-shared fields. The low-level envelope codec does not validate application data.
+shared fields, including a 1024-byte combined discovery/effective-content key
+limit. `encode_payload` returns an error if serialization fails or the complete
+envelope exceeds 16,384 hex characters, including application metadata. The
+low-level envelope codec does not validate application data. The 16 KiB hex cap
+preserves Murmur compatibility; the older regional snapshot format retains its
+separate 24 KiB cap. Existing field names are preserved too: global hints use
+`n`/`a`, while community hints use `node_id`/`addr`.
 
 On receipt, preserve the saved home language, add the invited languages within
 the four-community limit, bind their distinct endpoints, and install each group's

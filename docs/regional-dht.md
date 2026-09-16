@@ -257,10 +257,13 @@ body before allocation; `InvitePayload::decode` additionally validates the
 shared fields, including a 1024-byte combined discovery/effective-content key
 limit. `encode_payload` returns an error if serialization fails or the complete
 envelope exceeds 16,384 hex characters, including application metadata. The
-low-level envelope codec does not validate application data. The 16 KiB hex cap
-preserves Murmur compatibility; the older regional snapshot format retains its
-separate 24 KiB cap. Existing field names are preserved too: global hints use
-`n`/`a`, while community hints use `node_id`/`addr`.
+low-level envelope codec does not validate application data. Envelopes are capped
+at 16 KiB of hex; the regional snapshot format keeps a separate 24 KiB cap because
+it carries bulkier bootstrap state. Peer hints use one shape wherever they appear,
+`n`/`a`, in both `b` and each community group. An absent `c` carries the legacy
+single-key meaning, so it is omitted rather than written as null, and a named
+community with no reachable peers omits `peers` while keeping its membership
+metadata.
 
 On receipt, preserve the saved home language, add the invited languages within
 the four-community limit, bind their distinct endpoints, and install each group's

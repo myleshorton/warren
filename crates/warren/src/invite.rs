@@ -152,17 +152,18 @@ mod tests {
 
 /// Maximum language communities advertised by one invitation or session.
 pub const MAX_COMMUNITIES: usize = 4;
-/// Preserve the existing Murmur-compatible envelope limit.
+/// Maximum hex body of one invitation envelope, application metadata included.
 pub const MAX_INVITE_HEX: usize = 16 * 1024;
 /// Combined discovery and effective content key size, shared by both formats.
 pub const MAX_INVITE_KEY_BYTES: usize = 1024;
-/// The older snapshot-based regional format retains its original wire limit.
+/// The snapshot-based regional format carries bulkier bootstrap state.
 const MAX_REGIONAL_INVITE_HEX: usize = 24 * 1024;
 
 /// Bootstrap hints belong exclusively to the DHT derived from `language`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommunityPeers {
     pub language: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", with = "compact_peers")]
     pub peers: Vec<Peer>,
 }
 
@@ -208,7 +209,7 @@ pub fn validate_communities(groups: &[CommunityPeers]) -> std::io::Result<()> {
 pub struct InvitePayload {
     #[serde(rename = "k")]
     pub channel_key: String,
-    #[serde(rename = "c", default)]
+    #[serde(rename = "c", default, skip_serializing_if = "Option::is_none")]
     pub content_key: Option<String>,
     #[serde(rename = "b", default, with = "compact_peers")]
     pub bootstrap: Vec<Peer>,
@@ -664,20 +665,27 @@ mod community_payload_tests {
     }
 
     #[test]
-    fn existing_murmur_peer_field_names_are_preserved() {
+    fn peer_hints_use_one_wire_shape_everywhere() {
+        // One `Peer` type, one encoding, wherever it appears. An absent `c` already
+        // means "content = channel key", and a named community with no reachable
+        // peers is still membership metadata.
         let fixture = serde_json::json!({
-            "k": "channel", "c": null,
+            "k": "channel",
             "b": [{ "n": "ab".repeat(32), "a": "127.0.0.1:1234" }],
-            "communities": [{ "language": "fa", "peers": [{
-                "node_id": "cd".repeat(32), "addr": "127.0.0.1:5678"
-            }] }]
+            "communities": [
+                { "language": "fa", "peers": [{ "n": "cd".repeat(32), "a": "127.0.0.1:5678" }] },
+                { "language": "en" },
+            ]
         });
-        let encoded = encode_payload("app://", &fixture).unwrap();
-        let payload = InvitePayload::decode("app://", &encoded).unwrap();
+        let payload =
+            InvitePayload::decode("app://", &encode_payload("app://", &fixture).unwrap()).unwrap();
+        assert!(payload.content_key.is_none());
+        assert!(payload.communities[1].peers.is_empty());
         let reencoded = payload.encode("app://").unwrap();
         assert_eq!(
             decode_payload::<serde_json::Value>("app://", &reencoded).unwrap(),
-            fixture
+            fixture,
+            "re-encoding must reproduce the fixture exactly: one peer shape, no null `c`, no empty `peers`"
         );
     }
 }

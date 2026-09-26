@@ -1070,6 +1070,7 @@ dependencies = [
  "feed-redb",
  "ipnet",
  "language-tags",
+ "proptest",
  "serde",
  "serde_json",
  "swarm",

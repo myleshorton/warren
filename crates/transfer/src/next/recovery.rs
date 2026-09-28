@@ -148,8 +148,10 @@ impl Endpoint {
         let endpoint = self.clone();
         let seeds = seeds.to_vec();
         let (status, receiver) = tokio::sync::watch::channel(NetworkStatus::Idle);
+        // Subscribed before the task is spawned, which may be after this returns: a socket
+        // failure in between would otherwise reach no one.
+        let mut notices = endpoint.dht().subscribe();
         let task = tokio::spawn(async move {
-            let mut notices = endpoint.dht().subscribe();
             loop {
                 // A platform report, or the socket failing under us. The platform can't
                 // report the second: iOS defuncts a suspended app's sockets with no path

@@ -50,6 +50,19 @@ impl RecoveryConfig {
         .await;
     }
 }
+/// Wait for the DHT to report a socket that can't recover by itself. `false` once
+/// the DHT has stopped.
+async fn broken_socket(notices: &mut broadcast::Receiver<Notice>) -> bool {
+    loop {
+        match notices.recv().await {
+            Ok(Notice::IoError(kind)) if driver::next::socket_broken(kind) => return true,
+            Ok(Notice::Stopped) | Err(broadcast::error::RecvError::Closed) => return false,
+            // Dropped notices can't be recovered; the next failure reports again.
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+        }
+    }
+}
+
 fn retry_transfer(error: &crate::TransferError) -> bool {
     match error {
         crate::TransferError::Timeout => true,
@@ -122,6 +135,8 @@ impl Endpoint {
     /// Automatically recover when the platform publishes a new bind address.
     /// The initial watch value is not applied. Publishing the same address again
     /// handles resume/NAT expiry. New notifications supersede pending retries.
+    /// Also recovers, on a fresh port, when the DHT socket breaks (see
+    /// [`driver::next::socket_broken`]) with no platform report at all.
     pub fn watch_network(
         &self,
         mut changes: tokio::sync::watch::Receiver<SocketAddr>,
@@ -134,8 +149,21 @@ impl Endpoint {
         let seeds = seeds.to_vec();
         let (status, receiver) = tokio::sync::watch::channel(NetworkStatus::Idle);
         let task = tokio::spawn(async move {
-            while changes.changed().await.is_ok() {
-                let mut address = *changes.borrow_and_update();
+            let mut notices = endpoint.dht().subscribe();
+            loop {
+                // A platform report, or the socket failing under us. The platform can't
+                // report the second: iOS defuncts a suspended app's sockets with no path
+                // change. A fresh port on the same host replaces the dead socket.
+                let mut address = tokio::select! {
+                    changed = changes.changed() => {
+                        if changed.is_err() { return; }
+                        *changes.borrow_and_update()
+                    }
+                    broken = broken_socket(&mut notices) => {
+                        if !broken { return; }
+                        SocketAddr::new(endpoint.dht().local_addr().ip(), 0)
+                    }
+                };
                 let mut failures = 0u32;
                 loop {
                     status.send_replace(NetworkStatus::Recovering);
@@ -152,6 +180,9 @@ impl Endpoint {
                     match result {
                         Ok(bound) => {
                             status.send_replace(NetworkStatus::Ready(bound));
+                            // The old socket's errors are still queued; they describe the
+                            // socket just replaced, not this one.
+                            notices = notices.resubscribe();
                             break;
                         }
                         Err(error) => {
@@ -517,6 +548,97 @@ mod lifecycle_tests {
             }
             drop(monitor);
             status.changed().await.unwrap_err();
+            endpoint.dht().shutdown().await.unwrap();
+            router.shutdown().await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    async fn ready(status: &mut tokio::sync::watch::Receiver<NetworkStatus>) -> SocketAddr {
+        loop {
+            status.changed().await.unwrap();
+            if let NetworkStatus::Ready(bound) = *status.borrow_and_update() {
+                return bound;
+            }
+        }
+    }
+
+    /// The iOS case: the socket dies with no network-path change, so only the DHT's
+    /// own error can prompt recovery. Transient errors must not rebind, and a burst
+    /// of errors from one dead socket must replace it once.
+    #[tokio::test]
+    async fn monitor_replaces_a_socket_that_breaks_without_a_platform_change() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let router = Node::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                Keypair::from_seed(&[171; 32]),
+                true,
+            )
+            .await
+            .unwrap();
+            let endpoint = Endpoint::bind(
+                "127.0.0.1:0".parse().unwrap(),
+                Keypair::from_seed(&[172; 32]),
+                false,
+            )
+            .await
+            .unwrap();
+            let seed = Contact::new(router.id(), router.local_addr());
+            let (_platform, changes) = tokio::sync::watch::channel(endpoint.dht().local_addr());
+            let monitor = endpoint.watch_network(changes, &[seed]).unwrap();
+            let mut status = monitor.status();
+            let before = endpoint.dht().local_addr();
+
+            endpoint
+                .dht()
+                .inject_socket_error(io::ErrorKind::ConnectionReset)
+                .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(matches!(*status.borrow(), NetworkStatus::Idle));
+            assert_eq!(endpoint.dht().network().borrow().generation, 0);
+
+            // Queued together, as a dead socket's errors pile up before the rebind; issued
+            // one at a time, later ones would break the replacement and rightly rebind again.
+            let dht = endpoint.dht();
+            tokio::join!(
+                dht.inject_socket_error(io::ErrorKind::BrokenPipe),
+                dht.inject_socket_error(io::ErrorKind::BrokenPipe),
+                dht.inject_socket_error(io::ErrorKind::BrokenPipe),
+            );
+            let bound = ready(&mut status).await;
+            assert_eq!(endpoint.dht().network().borrow().generation, 1);
+            assert_eq!(bound.ip(), before.ip());
+            assert_ne!(
+                bound.port(),
+                before.port(),
+                "a fresh socket, not the dead one"
+            );
+
+            // The queued errors described the old socket: no second rebind.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            assert_eq!(endpoint.dht().network().borrow().generation, 1);
+
+            // And the new socket carries traffic both ways.
+            let mut events = endpoint.dht().subscribe();
+            endpoint.dht().probe(seed).await.unwrap();
+            loop {
+                if let Notice::Dht(event) = events.recv().await.unwrap() {
+                    if matches!(*event, Event::Ready(_)) {
+                        break;
+                    }
+                }
+            }
+
+            // A replacement that breaks in turn is replaced again.
+            endpoint
+                .dht()
+                .inject_socket_error(io::ErrorKind::NotConnected)
+                .await;
+            ready(&mut status).await;
+            assert_eq!(endpoint.dht().network().borrow().generation, 2);
+
+            drop(monitor);
             endpoint.dht().shutdown().await.unwrap();
             router.shutdown().await.unwrap();
         })

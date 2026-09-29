@@ -592,10 +592,10 @@ mod lifecycle_tests {
             let mut status = monitor.status();
             let before = endpoint.dht().local_addr();
 
-            endpoint
-                .dht()
-                .inject_socket_error(io::ErrorKind::ConnectionReset)
-                .await;
+            // Transient, or a down network a fresh socket can't fix: no rebind.
+            for kind in [io::ErrorKind::ConnectionReset, io::ErrorKind::NetworkDown] {
+                endpoint.dht().inject_socket_error(kind).await;
+            }
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(matches!(*status.borrow(), NetworkStatus::Idle));
             assert_eq!(endpoint.dht().network().borrow().generation, 0);

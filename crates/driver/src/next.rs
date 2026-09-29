@@ -904,10 +904,14 @@ fn observe_dht_event(observer: &Observer, event: &Event) {
 /// carry traffic again. iOS defuncts a suspended app's UDP sockets without any
 /// network-path change: every send then fails with `BrokenPipe` and nothing
 /// arrives, however long the app keeps running.
+///
+/// `NetworkDown` is excluded: a fresh socket on a down network fails the same way,
+/// so rebinding on it would replace a working socket once per send until the
+/// network returns. The platform's path report covers that case.
 pub fn socket_broken(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
-        io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected | io::ErrorKind::NetworkDown
+        io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
     )
 }
 

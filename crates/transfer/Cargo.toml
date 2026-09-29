@@ -25,6 +25,7 @@ snow = "0.10"
 thiserror.workspace = true
 
 [dev-dependencies]
+driver = { path = "../driver", features = ["testing"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "macros", "sync", "test-util"] }
 
 [[example]]

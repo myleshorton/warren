@@ -7,6 +7,10 @@ repository.workspace = true
 rust-version.workspace = true
 publish = false
 
+[features]
+# Test hooks for other crates' tests (`Node::inject_socket_error`).
+testing = []
+
 [dependencies]
 dht-next = { path = "../dht-next" }
 swarm = { path = "../swarm" }

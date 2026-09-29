@@ -86,7 +86,7 @@ type Operation = Box<dyn FnOnce(&mut Dht, Time) -> Vec<Action> + Send>;
 enum Command {
     Apply(Operation),
     Stop(oneshot::Sender<()>),
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testing"))]
     ReceiveError(io::ErrorKind, oneshot::Sender<()>),
     #[cfg(test)]
     DelayDiscovery(oneshot::Receiver<()>),
@@ -240,6 +240,22 @@ impl Node {
     }
     pub fn local_addr(&self) -> SocketAddr {
         self.inner.network.borrow().address
+    }
+    /// Fail the socket as if a receive had returned `kind`, for tests of what
+    /// heals it. Not a way to drive a real node.
+    #[cfg(any(test, feature = "testing"))]
+    #[doc(hidden)]
+    pub async fn inject_socket_error(&self, kind: io::ErrorKind) {
+        let (sender, receiver) = oneshot::channel();
+        if self
+            .inner
+            .commands
+            .send(Command::ReceiveError(kind, sender))
+            .await
+            .is_ok()
+        {
+            let _ = receiver.await;
+        }
     }
     pub fn network(&self) -> watch::Receiver<NetworkState> {
         self.inner.network.subscribe()
@@ -743,9 +759,11 @@ async fn run(
                 }
                 #[cfg(test)]
                 Some(Command::DelayDiscovery(gate)) => { discovery_gate = Some(gate); vec![] }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testing"))]
                 Some(Command::ReceiveError(kind, reply)) => {
+                    // Mirror a real receive failure: stop receiving unless transient, and report it.
                     receive_enabled = transient_receive_error(kind);
+                    let _ = events.send(Notice::IoError(kind));
                     let _ = reply.send(());
                     vec![]
                 }
@@ -880,6 +898,21 @@ fn observe_dht_event(observer: &Observer, event: &Event) {
         _ => return,
     };
     observer.event(name, error, fields);
+}
+
+/// Whether a socket error means the socket itself is gone, so only a new one can
+/// carry traffic again. iOS defuncts a suspended app's UDP sockets without any
+/// network-path change: every send then fails with `BrokenPipe` and nothing
+/// arrives, however long the app keeps running.
+///
+/// `NetworkDown` is excluded: a fresh socket on a down network fails the same way,
+/// so rebinding on it would replace a working socket once per send until the
+/// network returns. The platform's path report covers that case.
+pub fn socket_broken(kind: io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        io::ErrorKind::BrokenPipe | io::ErrorKind::NotConnected
+    )
 }
 
 fn transient_receive_error(kind: io::ErrorKind) -> bool {

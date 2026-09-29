@@ -21,6 +21,11 @@ pub use recovery::{NetworkMonitor, NetworkStatus, RecoveryConfig, RecoveryError}
 
 const MAGIC: &[u8] = b"warren-connect\x02";
 const CAPACITY: usize = 32;
+/// How long to wait for an answer before offering again. A relayed answer normally
+/// arrives in well under a second, so this is a lost signal, not a slow one.
+const SIGNAL_RESEND: Duration = Duration::from_secs(4);
+/// Offers per connection attempt, each its own session.
+const SIGNAL_OFFERS: usize = 3;
 
 #[derive(Clone)]
 pub struct Config {
@@ -412,24 +417,48 @@ impl Endpoint {
         let signal_observation = observation.child("connect.signaling");
         let result = async {
             let mut events = self.dht().subscribe();
-            let session = self
-                .dht()
-                .signal_via(records, encode(socket.candidates(), false)?)
-                .await?;
-            let candidates = loop {
-                match next_event(&mut events).await? {
-                    Event::Answered(signal)
-                        if signal.envelope.session == session && signal.envelope.author == peer =>
-                    {
-                        break decode(&signal.payload, true)?;
+            let payload = encode(socket.candidates(), false)?;
+            // A relayed offer or answer that is lost leaves nothing to retransmit, so a
+            // single loss used to cost the whole signal lifetime. Offer again, as a new
+            // session, every `SIGNAL_RESEND` until one is answered; any answer will do.
+            let mut sessions = vec![self.dht().signal_via(records, payload.clone()).await?];
+            let mut resend = tokio::time::interval_at(
+                tokio::time::Instant::now() + SIGNAL_RESEND,
+                SIGNAL_RESEND,
+            );
+            let mut offered = 1;
+            loop {
+                tokio::select! {
+                    event = next_event(&mut events) => match event? {
+                        Event::Answered(signal)
+                            if sessions.contains(&signal.envelope.session)
+                                && signal.envelope.author == peer =>
+                        {
+                            break Ok::<_, Error>((
+                                signal.envelope.session,
+                                decode(&signal.payload, true)?,
+                            ));
+                        }
+                        Event::SignalTimedOut(id) if sessions.contains(&id) => {
+                            sessions.retain(|session| *session != id);
+                            if sessions.is_empty() && offered == SIGNAL_OFFERS {
+                                return Err(Error::SignalingTimedOut);
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ = resend.tick(), if offered < SIGNAL_OFFERS => {
+                        offered += 1;
+                        match self.dht().signal_via(records, payload.clone()).await {
+                            Ok(session) => sessions.push(session),
+                            // Out of signaling slots: keep waiting on the offers already out.
+                            Err(driver::next::Error::Core(dht_next::Error::Capacity))
+                                if !sessions.is_empty() => {}
+                            Err(error) => return Err(error.into()),
+                        }
                     }
-                    Event::SignalTimedOut(id) if id == session => {
-                        return Err(Error::SignalingTimedOut)
-                    }
-                    _ => {}
                 }
-            };
-            Ok::<_, Error>((session, candidates))
+            }
         }
         .await;
         signal_observation.finish(result.as_ref().err().map(Error::code).unwrap_or(""));
@@ -1387,6 +1416,61 @@ mod tests {
         assert_eq!(&bytes[..len], b"after coordinator loss");
         listener.close().await;
         for node in [&a, &b, server.dht(), client.dht()] {
+            let _ = node.shutdown().await;
+        }
+    }
+
+    /// A lost relayed offer used to cost the whole signal lifetime (20s) and then fail.
+    /// The first offer is discarded here, as if the coordinator's forward were lost.
+    #[tokio::test]
+    async fn a_lost_offer_is_resent_instead_of_timing_out() {
+        let router = router(131).await;
+        let server = endpoint(132, "[::]").await;
+        let client = endpoint(133, "[::]").await;
+        let seeds = [contact(&router)];
+        let mut events = server.dht().subscribe();
+        let mut listener = server.listen(&seeds).await.unwrap();
+        loop {
+            if let Event::Registered(_) =
+                tokio::time::timeout(Duration::from_secs(5), next_event(&mut events))
+                    .await
+                    .unwrap()
+                    .unwrap()
+            {
+                break;
+            }
+        }
+        let started = tokio::time::Instant::now();
+        // Bounded well under the 20s signal lifetime: without a resend, the client times
+        // out and the listener waits forever for an offer that never comes.
+        let (outgoing, incoming) = tokio::time::timeout(Duration::from_secs(12), async {
+            tokio::join!(client.connect(server.public_key(), &seeds), async {
+                let (_, _, lost) = listener.incoming.recv().await.unwrap().unwrap();
+                let incoming = listener.accept().await;
+                (lost.envelope.session, incoming)
+            })
+        })
+        .await
+        .expect("a lost offer must be resent, not waited out");
+        let (lost, incoming) = incoming;
+        let outgoing = outgoing.unwrap();
+        let incoming = incoming.unwrap();
+        assert_eq!(outgoing.session(), incoming.session());
+        assert_ne!(outgoing.session(), lost, "connected through a resent offer");
+        let took = started.elapsed();
+        assert!(
+            took < SIGNAL_RESEND * 2,
+            "{took:?}: a lost offer should cost one resend interval, not the signal lifetime"
+        );
+        outgoing.send(b"after a lost offer").await.unwrap();
+        let mut bytes = [0; 64];
+        let len = tokio::time::timeout(Duration::from_secs(2), incoming.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..len], b"after a lost offer");
+        listener.close().await;
+        for node in [&router, server.dht(), client.dht()] {
             let _ = node.shutdown().await;
         }
     }

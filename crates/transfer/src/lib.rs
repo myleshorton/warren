@@ -61,7 +61,7 @@ use sync::{BlobDownload, FeedDownload, FeedWindow, Message, SyncError};
 pub use sync::WindowData;
 use thiserror::Error;
 use tokio::task::JoinSet;
-use tokio::time::{sleep, timeout, Instant};
+use tokio::time::{sleep_until, timeout, Instant};
 
 pub use frame::MAX_MESSAGE;
 pub use noise::NoiseLink;
@@ -832,6 +832,11 @@ async fn fetch_haveset<L: Link>(
 /// or a timeout) is retired (`alive = false`). Advances the `cursor` so the next
 /// round on this channel keeps ids monotonic and preserves the straggler
 /// watermark.
+///
+/// The requests are **pipelined** (see [`pipeline_chunks`]), so the batch costs
+/// about one round trip rather than one per chunk. Whatever the pipeline can't
+/// settle unambiguously is then fetched stop-and-wait with [`exchange`], which
+/// carries the full repair and liveness logic.
 async fn download_chunks<L: Link>(
     channel: &mut L,
     wanted: &[Hash],
@@ -841,7 +846,17 @@ async fn download_chunks<L: Link>(
     let mut wire = Wire::new(channel, cfg.initial_rtt, cfg.request_timeout, *cursor);
     let mut fetched = Vec::new();
     let mut alive = true;
-    for &hash in wanted {
+    let unsettled = match pipeline_chunks(&mut wire, wanted, cfg, &mut fetched).await {
+        Ok(unsettled) => unsettled,
+        Err(_) => {
+            alive = false;
+            Vec::new()
+        }
+    };
+    for hash in unsettled {
+        if !alive {
+            break;
+        }
         match exchange(&mut wire, &Message::GetChunk { hash }, cfg).await {
             Ok(Message::Chunk { data }) if crypto::hash(&data) == hash => {
                 fetched.push((hash, data));
@@ -850,14 +865,80 @@ async fn download_chunks<L: Link>(
             // didn't give us this chunk (perhaps a straggler) — try another.
             Ok(_) => {}
             // The channel timed out or broke: stop and retire this provider.
-            Err(_) => {
-                alive = false;
-                break;
-            }
+            Err(_) => alive = false,
         }
     }
     *cursor = wire.cursor();
     ChunkOutcome { fetched, alive }
+}
+
+/// Send a `GetChunk` for every hash in `wanted` at once and collect the replies,
+/// so a batch's round trips overlap instead of queuing one behind another. The
+/// server answers requests one at a time, in order, with one reply each; the
+/// caller bounds the batch (at most [`STEAL_BATCH`]).
+///
+/// A `Chunk` reply names its request by its hash. Any other reply (`Absent`, or
+/// bytes that aren't one of the wanted chunks) can't be pinned to a request, so
+/// it's only counted: once every chunk still outstanding is matched by some
+/// reply, nothing more is coming. Returns the chunks it didn't receive — those
+/// answered with something else, a reply lost outright, or everything left when
+/// the peer goes quiet — for the caller to re-ask one at a time, where the
+/// answer is unambiguous. A stalled partial reply is repaired by NACK as in
+/// [`exchange`]; a stall with nothing partial hands off at once.
+async fn pipeline_chunks<L: Link>(
+    wire: &mut Wire<'_, L>,
+    wanted: &[Hash],
+    cfg: &Config,
+    fetched: &mut Vec<(Hash, Vec<u8>)>,
+) -> Result<Vec<Hash>, TransferError> {
+    let mut outstanding: Vec<Hash> = Vec::with_capacity(wanted.len());
+    for (i, &hash) in wanted.iter().enumerate() {
+        wire.send(&Message::GetChunk { hash }).await?;
+        if i == 0 {
+            wire.time_reply();
+        }
+        outstanding.push(hash);
+    }
+    let mut unattributed = 0;
+    let mut stalls = 0;
+    while outstanding.len() > unattributed {
+        let progress_from = wire.stored();
+        let deadline = Instant::now() + cfg.request_timeout;
+        let reply = loop {
+            match wire.recv(deadline).await? {
+                Some(Recv::Message(message)) if !message.is_request() => break Some(message),
+                Some(_) => continue,
+                None => break None,
+            }
+        };
+        match reply {
+            Some(Message::Chunk { data }) => {
+                let hash = crypto::hash(&data);
+                if let Some(at) = outstanding.iter().position(|h| *h == hash) {
+                    outstanding.remove(at);
+                    fetched.push((hash, data));
+                } else if !wanted.contains(&hash) {
+                    unattributed += 1;
+                }
+                // A wanted chunk that's no longer outstanding is a duplicate reply:
+                // it answers a request already settled, so it's ignored.
+                stalls = 0;
+            }
+            Some(_) => {
+                unattributed += 1;
+                stalls = 0;
+            }
+            None if wire.stored() > progress_from => stalls = 0,
+            None => match wire.missing() {
+                Some(missing) if stalls < cfg.retries => {
+                    wire.nack(missing.id, &missing.indices).await?;
+                    stalls += 1;
+                }
+                _ => break,
+            },
+        }
+    }
+    Ok(outstanding)
 }
 
 /// Serve feed sync requests on `channel` from a local [`feed::Log`] until the
@@ -919,6 +1000,7 @@ async fn exchange<L: Link>(
     cfg: &Config,
 ) -> Result<Message, TransferError> {
     wire.send(request).await?;
+    wire.time_reply();
     let mut stalls = 0;
     loop {
         let progress_from = wire.stored();
@@ -952,6 +1034,8 @@ async fn exchange<L: Link>(
             Some(missing) => wire.nack(missing.id, &missing.indices).await?,
             None => {
                 wire.retries += 1;
+                // Karn: a reply to a re-ask can't be timed against either send.
+                wire.reply_sent_at = None;
                 wire.send(request).await?;
             }
         }
@@ -1007,7 +1091,8 @@ async fn serve<L: Link>(
         // next request (its implicit ack).
         let mut last_reply_at: Option<Instant> = None;
         loop {
-            match wire.recv(deadline).await? {
+            let (received, queued) = wire.recv_noting_queued(deadline).await;
+            match received? {
                 // Answer only genuine requests. A response-type message (peer
                 // confusion, or a delayed packet) is ignored — replying `Absent` to
                 // it would inject terminal traffic at the client.
@@ -1025,9 +1110,12 @@ async fn serve<L: Link>(
                             // A different request → the client accepted the last reply
                             // cleanly: grow, and take a clean RTT sample (the gap since
                             // we finished that reply). A repaired reply's timing is
-                            // muddied by the stall+NACK, so we skip it there.
+                            // muddied by the stall+NACK, so we skip it there. So is a
+                            // pipelined request that was already waiting when the
+                            // reply finished: it was sent before the reply arrived, and
+                            // timing it would drive the estimate toward zero.
                             wire.on_delivered();
-                            if let Some(sent_at) = last_reply_at {
+                            if let (Some(sent_at), false) = (last_reply_at, queued) {
                                 wire.rtt_sample(sent_at.elapsed());
                             }
                         }
@@ -1111,9 +1199,11 @@ enum Recv {
 /// Frames sync messages onto a datagram [`Link`]: fragments each outgoing message
 /// (remembering the last one, to honor a NACK), reassembles incoming ones, and
 /// carries NACKs for selective repair (see `frame`). One `Wire` serves a whole
-/// transfer or server session — a single message is in flight per direction — so
-/// it holds one monotonic outbound id counter (ids let the peer's reassembler
-/// follow the newest attempt) and one inbound reassembler.
+/// transfer or server session, so it holds one monotonic outbound id counter (ids
+/// let the peer's reassembler follow the newest attempt) and one inbound
+/// reassembler. A client may pipeline several one-fragment requests (see
+/// [`pipeline_chunks`]), but the server answers them one at a time, so a single
+/// multi-fragment message is in flight toward the client at once.
 struct Wire<'a, L: Link> {
     observation: Option<driver::diagnostics::Operation>,
     sent_fragments: std::sync::atomic::AtomicU64,
@@ -1132,6 +1222,9 @@ struct Wire<'a, L: Link> {
     /// loop from NACK feedback, and the smoothed RTT to pace it over.
     cong: Congestion,
     rtt: Rtt,
+    /// When a client sent the request whose reply it is timing, so the first
+    /// fragment back yields an RTT sample (see [`Wire::time_reply`]).
+    reply_sent_at: Option<Instant>,
 }
 
 impl<L: Link> Drop for Wire<'_, L> {
@@ -1186,6 +1279,7 @@ impl<'a, L: Link> Wire<'a, L> {
             last_sent: None,
             cong: Congestion::new(),
             rtt: Rtt::new(initial_rtt, max_rtt),
+            reply_sent_at: None,
         }
     }
 
@@ -1212,16 +1306,26 @@ impl<'a, L: Link> Wire<'a, L> {
         self.cong.on_loss();
     }
 
+    /// Time the reply to the request just sent: the first fragment to arrive
+    /// yields an RTT sample. The client's own estimate never paces anything (its
+    /// requests are single fragments); it's what `rtt_us` reports for the path.
+    fn time_reply(&mut self) {
+        self.reply_sent_at = Some(Instant::now());
+    }
+
     /// Fold a round-trip sample into the RTT estimate used to pace sends.
     fn rtt_sample(&mut self, sample: Duration) {
         self.rtt.sample(sample);
     }
 
     /// Send `fragments` paced to spread a window (`cwnd`) across one RTT — a
-    /// fragment every `srtt / cwnd`. Sub-millisecond intervals are accumulated
-    /// and paid in one pause (timer granularity), so a short-RTT path bursts and
+    /// fragment every `srtt / cwnd`. Fragment `i` is due `i` intervals after the
+    /// first, and the pacer pauses only once it's at least [`MIN_PACING_SLEEP`]
+    /// ahead of that schedule (timer granularity), so a short-RTT path bursts and
     /// a long-RTT path spaces out; a message small relative to the rate goes out
-    /// with no pause at all.
+    /// with no pause at all. Pacing against the schedule, rather than sleeping
+    /// each accumulated interval, keeps a timer that overshoots (tokio rounds a
+    /// sleep up to its next millisecond tick) from compounding into a slower rate.
     ///
     /// The pause is taken *before* each fragment after the first — never after
     /// the last — so a message doesn't end on a dead pause. That matters beyond
@@ -1233,14 +1337,11 @@ impl<'a, L: Link> Wire<'a, L> {
         fragments: impl Iterator<Item = Vec<u8>>,
     ) -> Result<(), TransferError> {
         let per_fragment = self.rtt.get() / self.cong.window() as u32;
-        let mut owed = Duration::ZERO;
+        let start = Instant::now();
         for (i, fragment) in fragments.enumerate() {
-            if i > 0 {
-                owed += per_fragment;
-                if owed >= MIN_PACING_SLEEP {
-                    sleep(owed).await;
-                    owed = Duration::ZERO;
-                }
+            let due = start + per_fragment * i as u32;
+            if due.saturating_duration_since(Instant::now()) >= MIN_PACING_SLEEP {
+                sleep_until(due).await;
             }
             self.link.send(&fragment).await?;
             self.sent_fragments
@@ -1340,6 +1441,9 @@ impl<'a, L: Link> Wire<'a, L> {
                         count,
                         payload,
                     }) => {
+                        if let Some(sent_at) = self.reply_sent_at.take() {
+                            self.rtt.sample(sent_at.elapsed());
+                        }
                         if let Some((mid, bytes)) =
                             self.inbound.push_data(id, index, count, payload)
                         {
@@ -1365,6 +1469,25 @@ impl<'a, L: Link> Wire<'a, L> {
                 Ok(Err(e)) => return Err(TransferError::Io(e)),
                 Err(_) => return Ok(None), // deadline elapsed
             }
+        }
+    }
+
+    /// [`recv`](Self::recv), also reporting whether its result was already
+    /// waiting — ready on the first poll, without waiting on the peer at all. The
+    /// first poll runs outside tokio's cooperative budget, so an exhausted budget
+    /// can't make a queued datagram look like one still to come.
+    async fn recv_noting_queued(
+        &mut self,
+        deadline: Instant,
+    ) -> (Result<Option<Recv>, TransferError>, bool) {
+        let mut recv = std::pin::pin!(self.recv(deadline));
+        let first = tokio::task::unconstrained(std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(recv.as_mut(), cx))
+        }))
+        .await;
+        match first {
+            std::task::Poll::Ready(received) => (received, true),
+            std::task::Poll::Pending => (recv.await, false),
         }
     }
 }
@@ -2118,5 +2241,245 @@ mod tests {
 
         author_task.abort();
         mirror_task.abort();
+    }
+
+    /// One end of an in-memory link with a fixed one-way delay: each datagram is
+    /// delivered `delay` after it was sent, in order, with no loss — a clean path
+    /// whose round trip is `2 * delay`. The client end also tracks how many
+    /// requests are awaiting their reply, to observe pipelining.
+    struct DelayLink {
+        tx: mpsc::UnboundedSender<(Instant, Vec<u8>)>,
+        rx: Mutex<mpsc::UnboundedReceiver<(Instant, Vec<u8>)>>,
+        delay: Duration,
+        in_flight: Option<Arc<InFlight>>,
+        observer: driver::diagnostics::Observer,
+    }
+
+    #[derive(Default)]
+    struct InFlight {
+        now: AtomicUsize,
+        max: AtomicUsize,
+    }
+
+    impl Link for DelayLink {
+        fn observation(&self, name: &'static str) -> driver::diagnostics::Operation {
+            self.observer.operation(name)
+        }
+        async fn send(&self, data: &[u8]) -> io::Result<usize> {
+            if let Some(counter) = &self.in_flight {
+                // Every client datagram on a lossless path is a one-fragment request.
+                let now = counter.now.fetch_add(1, Ordering::SeqCst) + 1;
+                counter.max.fetch_max(now, Ordering::SeqCst);
+            }
+            let _ = self.tx.send((Instant::now() + self.delay, data.to_vec()));
+            Ok(data.len())
+        }
+        async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
+            let Some((due, d)) = self.rx.lock().await.recv().await else {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "link closed"));
+            };
+            tokio::time::sleep_until(due).await;
+            if let Some(counter) = &self.in_flight {
+                // The last fragment of a reply settles one outstanding request.
+                if let Some(Packet::Data { index, count, .. }) = Packet::decode(&d) {
+                    if index + 1 == count {
+                        counter.now.fetch_sub(1, Ordering::SeqCst);
+                    }
+                }
+            }
+            let n = d.len().min(buf.len());
+            buf[..n].copy_from_slice(&d[..n]);
+            Ok(n)
+        }
+        fn max_payload(&self) -> usize {
+            FRAGMENT
+        }
+        fn authenticated(&self) -> bool {
+            false
+        }
+    }
+
+    fn delay_pair(delay: Duration) -> (DelayLink, DelayLink, Arc<InFlight>) {
+        let (to_server, at_server) = mpsc::unbounded_channel();
+        let (to_client, at_client) = mpsc::unbounded_channel();
+        let in_flight = Arc::new(InFlight::default());
+        let client = DelayLink {
+            tx: to_server,
+            rx: Mutex::new(at_client),
+            delay,
+            in_flight: Some(in_flight.clone()),
+            observer: Default::default(),
+        };
+        let server = DelayLink {
+            tx: to_client,
+            rx: Mutex::new(at_server),
+            delay,
+            in_flight: None,
+            observer: Default::default(),
+        };
+        (client, server, in_flight)
+    }
+
+    /// A store serving `data` split into `chunk_size` chunks, plus its manifest.
+    fn chunked_store(data: &[u8], chunk_size: usize) -> (Hash, blob::Store) {
+        let (manifest, chunks) = blob::split_with(data, chunk_size);
+        let mut store = blob::Store::new();
+        for chunk in chunks {
+            store.put(chunk);
+        }
+        store.put(manifest.encode());
+        (manifest.id(), store)
+    }
+
+    /// What [`stream_over_delay`] measured.
+    struct Streamed {
+        elapsed: Duration,
+        max_in_flight: usize,
+        /// The `rtt_us` each side's transport reported for its chunk traffic.
+        client_rtt: Duration,
+        server_rtt: Duration,
+    }
+
+    /// Stream `chunks` chunks of `chunk_size` bytes from one provider across a
+    /// `delay`-each-way link with the app's window of 16, checking the bytes and
+    /// playback order.
+    async fn stream_over_delay(chunks: usize, chunk_size: usize, delay: Duration) -> Streamed {
+        use driver::diagnostics::Value;
+        let data: Vec<u8> = (0..chunks * chunk_size).map(|i| (i % 251) as u8).collect();
+        let (id, store) = chunked_store(&data, chunk_size);
+        let (mut client, mut server, in_flight) = delay_pair(delay);
+        let observer = driver::diagnostics::Observer::new();
+        let mut events = observer.subscribe().unwrap();
+        client.observer = observer.clone();
+        server.observer = observer;
+        let cfg = Config::default();
+        let server_task = tokio::spawn(async move { serve_blob(&mut server, &store, &cfg).await });
+
+        let mut got = Vec::new();
+        let mut order = Vec::new();
+        let started = Instant::now();
+        download_blob_stream(vec![client], id, &cfg, 16, |index, bytes| {
+            order.push(index);
+            got.extend_from_slice(bytes);
+        })
+        .await
+        .unwrap();
+        let elapsed = started.elapsed();
+        server_task.abort();
+        let _ = server_task.await;
+        assert_eq!(
+            order,
+            (0..chunks).collect::<Vec<_>>(),
+            "delivered in playback order"
+        );
+        assert_eq!(got, data);
+
+        // The last transport each side dropped: the client's final chunk batch, and
+        // the server's whole session.
+        let (mut client_rtt, mut server_rtt) = (Duration::ZERO, Duration::ZERO);
+        while let Ok(event) = events.try_recv() {
+            if event.name != "transfer.transport" {
+                continue;
+            }
+            let field = |name| {
+                event.fields.iter().find_map(|(n, v)| match v {
+                    Value::Count(c) if *n == name => Some(*c),
+                    _ => None,
+                })
+            };
+            let rtt = Duration::from_micros(field("rtt_us").unwrap());
+            // Only the serving transport sends more fragments than there are chunks.
+            if field("sent_fragments").unwrap() > chunks as u64 {
+                server_rtt = rtt;
+            } else {
+                client_rtt = rtt;
+            }
+        }
+        Streamed {
+            elapsed,
+            max_in_flight: in_flight.max.load(Ordering::SeqCst),
+            client_rtt,
+            server_rtt,
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_pipelines_chunk_requests_to_a_single_provider() {
+        // One provider on a 20 ms-RTT path, 64 single-fragment chunks. Stop-and-wait
+        // costs a full round trip per chunk (64 × RTT ≈ 1.3 s); with a batch's
+        // requests pipelined, its round trips overlap.
+        const CHUNKS: usize = 64;
+        let delay = Duration::from_millis(10);
+        let rtt = delay * 2;
+        let run = stream_over_delay(CHUNKS, 1000, delay).await;
+        eprintln!(
+            "streamed {CHUNKS} small chunks in {:?}, max {} requests in flight",
+            run.elapsed, run.max_in_flight
+        );
+        assert!(
+            run.max_in_flight >= STEAL_BATCH,
+            "a provider should have a whole batch of requests in flight, saw {}",
+            run.max_in_flight
+        );
+        assert!(
+            run.elapsed < rtt * CHUNKS as u32 / 2,
+            "{:?} is no better than one round trip per chunk ({:?})",
+            run.elapsed,
+            rtt * CHUNKS as u32
+        );
+    }
+
+    #[tokio::test]
+    async fn pipelined_requests_keep_both_rtt_estimates_honest() {
+        // Full-size (64 KiB, ~55-fragment) chunks, so the server paces its replies
+        // over its RTT estimate. A pipelined request is already waiting when the
+        // previous reply finishes, which says nothing about the path: timing it
+        // would drive the server's estimate toward zero and switch pacing off. And
+        // the client's estimate must come from the path, not sit at the default.
+        const CHUNKS: usize = 24;
+        let delay = Duration::from_millis(10);
+        let rtt = delay * 2;
+        let run = stream_over_delay(CHUNKS, blob::CHUNK_SIZE, delay).await;
+        eprintln!(
+            "streamed {CHUNKS} full chunks in {:?}, max {} in flight, client rtt {:?}, server rtt {:?}",
+            run.elapsed, run.max_in_flight, run.client_rtt, run.server_rtt
+        );
+        assert!(run.max_in_flight >= STEAL_BATCH);
+        assert!(
+            run.server_rtt >= rtt / 2,
+            "server RTT estimate {:?} collapsed below the {rtt:?} path",
+            run.server_rtt
+        );
+        assert!(
+            run.client_rtt >= rtt && run.client_rtt < Config::default().initial_rtt,
+            "client RTT estimate {:?} should track the {rtt:?} path",
+            run.client_rtt
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pipelined_batch_recovers_lost_requests_and_replies() {
+        // Six 3-fragment chunks. Client sends: 0 GetManifest, 1 GetHave, then the
+        // first batch's GetChunks at 2..=5 — drop 3, so chunk 1 is never asked.
+        // Server sends: 0 manifest, 1 have, then chunk 0 at 2..=4, chunk 2 at 5..=7,
+        // chunk 3 at 8..=10 — drop 3 (chunk 0's reply is superseded by chunk 2's
+        // before it can be repaired) and 10 (the batch's last reply, NACK-repaired).
+        let data: Vec<u8> = (0..6 * 3000).map(|i| (i % 251) as u8).collect();
+        let (id, store) = chunked_store(&data, 3000);
+        let (client, mut server) = lossy_pair(&[3], &[3, 10]);
+        let cfg = fast_cfg();
+        let server_task = tokio::spawn(async move { serve_blob(&mut server, &store, &cfg).await });
+
+        let mut got = Vec::new();
+        let mut order = Vec::new();
+        download_blob_stream(vec![client], id, &cfg, 16, |index, bytes| {
+            order.push(index);
+            got.extend_from_slice(bytes);
+        })
+        .await
+        .unwrap();
+        server_task.abort();
+        assert_eq!(order, (0..6).collect::<Vec<_>>());
+        assert_eq!(got, data);
     }
 }

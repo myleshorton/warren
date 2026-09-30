@@ -623,7 +623,7 @@ pub struct Connection {
     network_task: Option<JoinHandle<()>>,
     network: Option<(
         tokio::sync::watch::Receiver<driver::next::NetworkState>,
-        u64,
+        driver::next::NetworkState,
     )>,
 }
 impl Drop for Connection {
@@ -688,12 +688,12 @@ impl Connection {
         mut self,
         network: tokio::sync::watch::Receiver<driver::next::NetworkState>,
     ) -> Self {
-        let generation = network.borrow().generation;
+        let started = *network.borrow();
         let mut changes = network.clone();
         let receiver = self.receiver.abort_handle();
         self.network_task = Some(tokio::spawn(async move {
             loop {
-                if changes.borrow().generation != generation {
+                if moved(&changes.borrow(), &started) {
                     receiver.abort();
                     break;
                 }
@@ -702,14 +702,14 @@ impl Connection {
                 }
             }
         }));
-        self.network = Some((network, generation));
+        self.network = Some((network, started));
         self
     }
     async fn network_changed(&self) {
-        if let Some((network, generation)) = &self.network {
+        if let Some((network, started)) = &self.network {
             let mut network = network.clone();
             loop {
-                if network.borrow().generation != *generation {
+                if moved(&network.borrow(), started) {
                     return;
                 }
                 if network.changed().await.is_err() {
@@ -726,6 +726,15 @@ impl Connection {
         self.session
     }
 }
+/// Whether the endpoint has moved off the address a connection was made on, so its
+/// path is gone. A rebind on the same IP (a fresh DHT socket after iOS defuncts one, or
+/// a path report that changed nothing) leaves the connection's own data socket and
+/// path intact: aborting it there would kill working transfers, and a socket that did
+/// die fails its sends and heartbeat by itself.
+fn moved(now: &driver::next::NetworkState, started: &driver::next::NetworkState) -> bool {
+    now.generation != started.generation && now.address.ip() != started.address.ip()
+}
+
 // These frames are inside Noise; punch controls cannot reset this deadline.
 const KEEPALIVE: Duration = Duration::from_secs(15);
 const DEAD_PEER: Duration = Duration::from_secs(90);
@@ -974,6 +983,51 @@ mod tests {
     }
     fn contact(node: &Node) -> Contact {
         Contact::new(node.id(), node.local_addr())
+    }
+
+    /// A rebind on the same IP (the heal after iOS defuncts the DHT socket, or a path
+    /// report that changed nothing) must not abort connections on their own sockets.
+    #[tokio::test]
+    async fn connections_survive_a_same_ip_rebind() {
+        let router = router(141).await;
+        let server = endpoint(142, "127.0.0.1").await;
+        let client = endpoint(143, "127.0.0.1").await;
+        let seeds = [contact(&router)];
+        let mut listener = server.listen(&seeds).await.unwrap();
+        let (outgoing, incoming) = tokio::join!(
+            client.connect(server.public_key(), &seeds),
+            listener.accept()
+        );
+        let (outgoing, incoming) = (outgoing.unwrap(), incoming.unwrap());
+        for node in [&client, &server] {
+            let before = *node.dht().network().borrow();
+            let fresh = SocketAddr::new(before.address.ip(), 0);
+            node.network_changed(fresh, &seeds).await.unwrap();
+            let after = *node.dht().network().borrow();
+            assert_eq!(after.generation, before.generation + 1);
+            assert_ne!(
+                after.address.port(),
+                before.address.port(),
+                "a fresh DHT socket"
+            );
+        }
+        let mut bytes = [0; 64];
+        outgoing.send(b"client after rebind").await.unwrap();
+        let len = tokio::time::timeout(Duration::from_secs(2), incoming.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..len], b"client after rebind");
+        incoming.send(b"server after rebind").await.unwrap();
+        let len = tokio::time::timeout(Duration::from_secs(2), outgoing.recv(&mut bytes))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&bytes[..len], b"server after rebind");
+        listener.close().await;
+        for node in [&router, server.dht(), client.dht()] {
+            let _ = node.shutdown().await;
+        }
     }
 
     #[tokio::test]
